@@ -175,6 +175,8 @@ pub const Viewer = struct {
     /// Allocator used for all internal state.
     alloc: Allocator,
 
+    options: Options,
+
     /// Current state of the state machine.
     state: State,
 
@@ -212,6 +214,14 @@ pub const Viewer = struct {
 
     pub const CommandQueue = CircBuf(QueuedCommand, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
+
+    pub const Options = struct {
+        /// Maximum history rows requested when a pane is first discovered.
+        /// Null captures all available history; zero skips the history
+        /// capture. This is independent of Terminal's byte-based scrollback
+        /// storage limit.
+        history_line_limit: ?usize = null,
+    };
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -327,13 +337,17 @@ pub const Viewer = struct {
     ///
     /// The given allocator is used for all internal state. You must
     /// call deinit when you're done with the viewer to free it.
-    pub fn init(alloc: Allocator) Allocator.Error!Viewer {
+    pub fn init(
+        alloc: Allocator,
+        options: Options,
+    ) Allocator.Error!Viewer {
         // Create our initial command queue
         var command_queue: CommandQueue = try .init(alloc, COMMAND_QUEUE_INITIAL);
         errdefer command_queue.deinit(alloc);
 
         return .{
             .alloc = alloc,
+            .options = options,
             .state = .startup_block,
             // The default value here is meaningless. We don't get started
             // until we receive a session-changed notification which will
@@ -721,7 +735,10 @@ pub const Viewer = struct {
             }
         }
         if (added_count > 0) {
-            const command_count = 1 + 4 * added_count;
+            const capture_history = self.options.history_line_limit == null or
+                self.options.history_line_limit.? > 0;
+            const commands_per_pane: usize = if (capture_history) 4 else 3;
+            const command_count = 1 + commands_per_pane * added_count;
             try self.command_queue.ensureUnusedCapacity(self.alloc, command_count);
             self.command_queue.appendAssumeCapacity(.{
                 .command = .pane_state,
@@ -735,8 +752,11 @@ pub const Viewer = struct {
                 if (self.panes.contains(pane_id)) continue;
                 added_index += 1;
 
-                self.command_queue.appendAssumeCapacity(.{
-                    .command = .{ .pane_history = pane_id },
+                if (capture_history) self.command_queue.appendAssumeCapacity(.{
+                    .command = .{ .pane_history = .{
+                        .id = pane_id,
+                        .line_limit = self.options.history_line_limit,
+                    } },
                     .group_end = false,
                 });
                 self.command_queue.appendAssumeCapacity(.{
@@ -803,7 +823,7 @@ pub const Viewer = struct {
         session_id: usize,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
-        var replacement: Viewer = try .init(self.alloc);
+        var replacement: Viewer = try .init(self.alloc, self.options);
         errdefer replacement.deinit();
 
         // Our actions must start out empty so we don't mix arenas
@@ -892,7 +912,7 @@ pub const Viewer = struct {
                 content,
             ),
 
-            .pane_history => |id| try self.receivedPaneHistory(id, content),
+            .pane_history => |capture| try self.receivedPaneHistory(capture.id, content),
 
             .pane_saved_visible => |id| try self.receivedPaneSavedVisible(id, content),
 
@@ -1468,7 +1488,7 @@ const Command = union(enum) {
     list_windows,
 
     /// Capture history for the given pane ID.
-    pane_history: usize,
+    pane_history: CaptureHistory,
 
     /// Capture the primary screen saved behind an active alternate screen.
     pane_saved_visible: usize,
@@ -1489,6 +1509,11 @@ const Command = union(enum) {
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
+
+    const CaptureHistory = struct {
+        id: usize,
+        line_limit: ?usize,
+    };
 
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
@@ -1529,18 +1554,22 @@ const Command = union(enum) {
                 .{comptime Format.list_windows.comptimeFormat()},
             )),
 
-            .pane_history => |id| try writer.print(
-                // -p = output to stdout instead of buffer
-                // -e = output escape sequences for SGR
-                // -N = preserve trailing cells and their styles
-                // -q = quiet, don't error if alternate screen doesn't exist
-                // -S - = start at the top of history ("-")
-                // -E -1 = end at the last line of history (1 before the
-                //   visible area is -1).
-                // -t %{d} = target a specific pane ID
-                "capture-pane -p -e -N -q -S - -E -1 -t %{d}\n",
-                .{id},
-            ),
+            .pane_history => |capture| {
+                // -S - starts at the oldest retained row. A negative number
+                // requests at most that many rows before the visible area.
+                if (capture.line_limit) |limit| {
+                    assert(limit > 0);
+                    try writer.print(
+                        "capture-pane -p -e -N -q -S -{d} -E -1 -t %{d}\n",
+                        .{ limit, capture.id },
+                    );
+                } else {
+                    try writer.print(
+                        "capture-pane -p -e -N -q -S - -E -1 -t %{d}\n",
+                        .{capture.id},
+                    );
+                }
+            },
 
             .pane_saved_visible => |id| try writer.print(
                 // -p = output to stdout instead of buffer
@@ -1745,7 +1774,7 @@ test "minimum tmux version" {
 }
 
 test "unsupported tmux exits before topology hydration" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1771,8 +1800,44 @@ test "unsupported tmux exits before topology hydration" {
     });
 }
 
+test "zero history limit omits initial history capture" {
+    var viewer = try Viewer.init(testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "no-history",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.1" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$1 @0 83 44 b7dd,83x44,0,0,0",
+            } },
+            .check_command = (struct {
+                fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    try testing.expect(std.mem.startsWith(u8, command, "list-panes -s"));
+                    try testing.expectEqual(3, std.mem.count(u8, command, "capture-pane"));
+                    try testing.expectEqual(3, std.mem.count(u8, command, " ; "));
+                    try testing.expectEqual(3, std.mem.count(u8, command, "-t %0"));
+                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, " -S "));
+                }
+            }).check,
+        },
+    });
+}
+
 test "immediate exit" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1792,7 +1857,9 @@ test "immediate exit" {
 }
 
 test "session changed resets state" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{
+        .history_line_limit = 2_000,
+    });
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1853,6 +1920,7 @@ test "session changed resets state" {
                     try testing.expectEqual(0, v.panes.count());
                     // Version should still be preserved
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
+                    try testing.expectEqual(2_000, v.options.history_line_limit.?);
                 }
             }).check,
         },
@@ -1883,7 +1951,9 @@ test "session changed resets state" {
 }
 
 test "initial flow" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{
+        .history_line_limit = 2_000,
+    });
     defer viewer.deinit();
     var pre_topology_prefix = [_]u8{0xE2};
 
@@ -1951,6 +2021,7 @@ test "initial flow" {
                     try testing.expectEqual(4, std.mem.count(u8, command, "-t %0"));
                     try testing.expectEqual(4, std.mem.count(u8, command, "-t %1"));
                     try testing.expectEqual(6, std.mem.count(u8, command, " -N"));
+                    try testing.expectEqual(2, std.mem.count(u8, command, " -S -2000 "));
                 }
             }).check,
         },
@@ -2052,7 +2123,7 @@ test "initial flow" {
 }
 
 test "untracked UTF-8 allocation failure exits the viewer" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2073,7 +2144,7 @@ test "untracked UTF-8 allocation failure exits the viewer" {
 }
 
 test "live output preserves UTF-8 split across notifications" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2100,7 +2171,7 @@ test "live output preserves UTF-8 split across notifications" {
 }
 
 test "live output preserves CSI split across notifications" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2130,7 +2201,7 @@ test "live output preserves CSI split across notifications" {
 }
 
 test "hydration seeds pending VT state before live output" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2159,7 +2230,7 @@ test "hydration seeds pending VT state before live output" {
 }
 
 test "hydration carries split UTF-8 past an empty pending capture" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2191,7 +2262,7 @@ test "hydration carries split UTF-8 past an empty pending capture" {
 }
 
 test "hydration command errors do not become terminal content" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2204,7 +2275,10 @@ test "hydration command errors do not become terminal content" {
         return err;
     };
 
-    try viewer.queueCommands(&.{.{ .pane_history = 1 }});
+    try viewer.queueCommands(&.{.{ .pane_history = .{
+        .id = 1,
+        .line_limit = null,
+    } }});
     var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     _ = try viewer.nextCommandAction(arena.allocator());
@@ -2219,7 +2293,7 @@ test "hydration command errors do not become terminal content" {
 }
 
 test "layout change" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     var undiscovered_prefix = [_]u8{0xE2};
 
@@ -2300,7 +2374,7 @@ test "layout change" {
 }
 
 test "layout_change does not return command when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2361,7 +2435,7 @@ test "layout_change does not return command when queue not empty" {
 }
 
 test "layout_change returns command when queue was empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2428,7 +2502,7 @@ test "layout_change returns command when queue was empty" {
 }
 
 test "window_add queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2489,7 +2563,7 @@ test "window_add queues list_windows when queue empty" {
 }
 
 test "window_add queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2545,7 +2619,7 @@ test "window_add queues list_windows when queue not empty" {
 }
 
 test "alternate pane hydration restores canonical screens" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -2595,7 +2669,7 @@ test "alternate pane hydration restores canonical screens" {
 }
 
 test "visible snapshot preserves styled trailing cells" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 

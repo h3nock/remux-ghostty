@@ -17,11 +17,15 @@ pub const ControlClient = struct {
     viewer: Viewer,
 
     pub const Action = Viewer.Action;
+    pub const Options = Viewer.Options;
 
-    pub fn init(alloc: Allocator) Allocator.Error!ControlClient {
+    pub fn init(
+        alloc: Allocator,
+        options: Options,
+    ) Allocator.Error!ControlClient {
         return .{
             .parser = .{ .buffer = .init(alloc) },
-            .viewer = try .init(alloc),
+            .viewer = try .init(alloc, options),
         };
     }
 
@@ -47,7 +51,7 @@ pub const ControlClient = struct {
 test "control client raw startup preserves action order" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator);
+    var client = try ControlClient.init(testing.allocator, .{});
     defer client.deinit();
 
     const expected = [_]enum { display_message, list_windows, windows, hydrate_panes }{
@@ -101,10 +105,15 @@ test "control client raw startup preserves action order" {
                         .display_message
                     else if (std.mem.startsWith(u8, command, "list-windows"))
                         .list_windows
-                    else if (std.mem.startsWith(u8, command, "list-panes -s"))
-                        .hydrate_panes
-                    else
-                        return error.UnexpectedCommand;
+                    else if (std.mem.startsWith(u8, command, "list-panes -s")) hydrate: {
+                        try testing.expect(std.mem.containsAtLeast(
+                            u8,
+                            command,
+                            1,
+                            " -S - -E -1 ",
+                        ));
+                        break :hydrate .hydrate_panes;
+                    } else return error.UnexpectedCommand;
                 },
             }
             actual_len += 1;
@@ -120,7 +129,7 @@ test "control client raw startup preserves action order" {
 test "control client raw exit" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator);
+    var client = try ControlClient.init(testing.allocator, .{});
     defer client.deinit();
 
     var exits: usize = 0;
@@ -140,7 +149,7 @@ test "control client raw exit" {
 test "control client malformed stream exits" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator);
+    var client = try ControlClient.init(testing.allocator, .{});
     defer client.deinit();
 
     const actions = try client.put('x');
@@ -152,7 +161,7 @@ test "control client malformed stream exits" {
 test "control client propagates parser buffer failure" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator);
+    var client = try ControlClient.init(testing.allocator, .{});
     defer client.deinit();
     client.parser.max_bytes = 1;
 
