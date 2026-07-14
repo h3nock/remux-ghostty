@@ -241,6 +241,11 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
+        /// A pane's canonical terminal became live or received live output.
+        /// The pane exists in `Viewer.panes` and is already updated when this
+        /// action is emitted.
+        pane_changed: usize,
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -503,6 +508,26 @@ pub const Viewer = struct {
         // handle it by ignoring any command output. That's okay!
         assert(self.state == .command_queue);
 
+        // If commands are queued between Viewer calls, their current group is
+        // already in flight. Pane output therefore never needs to dispatch a
+        // command and can bypass the action arena entirely.
+        switch (n) {
+            .output => |out| {
+                const pane_id = self.receivedOutput(out) catch |err| {
+                    log.warn(
+                        "failed to process output for pane id={}, becoming defunct: {}",
+                        .{ out.pane_id, err },
+                    );
+                    return self.defunct();
+                };
+                return if (pane_id) |id|
+                    self.singleAction(.{ .pane_changed = id })
+                else
+                    &.{};
+            },
+            else => {},
+        }
+
         // Clear our prior arena so it is ready to be used for any
         // actions immediately.
         {
@@ -535,13 +560,7 @@ pub const Viewer = struct {
                 can_send_command = self.in_flight_responses == 0;
             },
 
-            .output => |out| self.receivedOutput(out) catch |err| {
-                log.warn(
-                    "failed to process output for pane id={}, becoming defunct: {}",
-                    .{ out.pane_id, err },
-                );
-                return self.defunct();
-            },
+            .output => unreachable,
 
             // Session changed means we switched to a different tmux session.
             // We need to reset our state and start fresh with list-windows.
@@ -959,7 +978,9 @@ pub const Viewer = struct {
 
             .pane_visible => |id| try self.receivedPaneVisible(id, content),
 
-            .pane_pending => |id| try self.receivedPanePending(id, content),
+            .pane_pending => |id| if (try self.receivedPanePending(id, content)) {
+                try actions.append(arena_alloc, .{ .pane_changed = id });
+            },
 
             .tmux_version => try self.receivedTmuxVersion(content),
         }
@@ -1344,10 +1365,10 @@ pub const Viewer = struct {
         self: *Viewer,
         id: usize,
         content: []const u8,
-    ) !void {
+    ) !bool {
         const pane = self.panes.get(id) orelse {
             log.info("received pending pane content for untracked pane id={}", .{id});
-            return;
+            return false;
         };
 
         const t = &pane.terminal;
@@ -1365,12 +1386,13 @@ pub const Viewer = struct {
 
         pane.utf8_carry.clear();
         pane.phase = .live;
+        return true;
     }
 
     fn receivedOutput(
         self: *Viewer,
         out: control.Notification.Output,
-    ) !void {
+    ) !?usize {
         const entry = self.panes.getEntry(out.pane_id) orelse {
             var carry = self.untracked_utf8.get(out.pane_id) orelse Utf8Carry{};
             carry.update(out.data);
@@ -1379,14 +1401,20 @@ pub const Viewer = struct {
             } else {
                 try self.untracked_utf8.put(self.alloc, out.pane_id, carry);
             }
-            return;
+            return null;
         };
         const pane: *Pane = entry.value_ptr.*;
         const data = control.decodeEscapedOutput(out.data);
-        switch (pane.phase) {
-            .hydrating => pane.utf8_carry.update(data),
-            .live => pane.stream.nextSlice(data),
-        }
+        return switch (pane.phase) {
+            .hydrating => hydrating: {
+                pane.utf8_carry.update(data);
+                break :hydrating null;
+            },
+            .live => live: {
+                pane.stream.nextSlice(data);
+                break :live out.pane_id;
+            },
+        };
     }
 
     const PaneGeometry = struct {
@@ -2154,11 +2182,16 @@ test "initial flow" {
         "first visible row",
         "",
     };
-    for (remaining_responses) |response| {
-        try testing.expectEqual(
-            0,
-            viewer.next(.{ .tmux = .{ .block_end = response } }).len,
-        );
+    const expected_changes = [_]?usize{ null, 0, null, null, null, 1 };
+    for (remaining_responses, expected_changes) |response, expected_change| {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = response } });
+        if (expected_change) |id| {
+            try testing.expectEqual(1, actions.len);
+            try testing.expectEqual(id, actions[0].pane_changed);
+            try testing.expectEqual(Viewer.Pane.Phase.live, viewer.panes.get(id).?.phase);
+        } else {
+            try testing.expectEqual(0, actions.len);
+        }
     }
 
     try testing.expect(viewer.command_queue.empty());
@@ -2174,10 +2207,13 @@ test "initial flow" {
     try testing.expect(std.mem.containsAtLeast(u8, history, 1, "Hello, world!"));
 
     var new_output = "new\\134output".*;
-    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+    const changed = viewer.next(.{ .tmux = .{ .output = .{
         .pane_id = 0,
         .data = &new_output,
-    } } }).len);
+    } } });
+    try testing.expectEqual(1, changed.len);
+    try testing.expectEqual(0, changed[0].pane_changed);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     const active = try pane.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
@@ -2198,10 +2234,12 @@ test "initial flow" {
     try testing.expectEqualStrings("first visible row", fresh_active);
 
     var pre_topology_suffix = [_]u8{ 0x82, 0xAC };
-    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+    const fresh_changed = viewer.next(.{ .tmux = .{ .output = .{
         .pane_id = 1,
         .data = &pre_topology_suffix,
-    } } }).len);
+    } } });
+    try testing.expectEqual(1, fresh_changed.len);
+    try testing.expectEqual(1, fresh_changed[0].pane_changed);
     const fresh_after_suffix = try fresh_pane.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
@@ -2265,6 +2303,39 @@ test "live output preserves UTF-8 split across notifications" {
     try testing.expectEqualStrings("€", actual);
 }
 
+test "live output action does not allocate" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    pane.phase = .live;
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    const original_alloc = viewer.alloc;
+    viewer.alloc = failing.allocator();
+    defer viewer.alloc = original_alloc;
+
+    var bytes = "X".*;
+    const actions = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &bytes,
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expectEqual(1, actions[0].pane_changed);
+    const actual = try pane.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("X", actual);
+}
+
 test "live output preserves CSI split across notifications" {
     var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
@@ -2309,7 +2380,7 @@ test "hydration seeds pending VT state before live output" {
         return err;
     };
 
-    try viewer.receivedPanePending(1, "\\033[1");
+    try testing.expect(try viewer.receivedPanePending(1, "\\033[1"));
     var suffix = "mX".*;
     _ = viewer.next(.{ .tmux = .{ .output = .{
         .pane_id = 1,
@@ -2343,7 +2414,7 @@ test "hydration carries split UTF-8 past an empty pending capture" {
         .pane_id = 1,
         .data = &prefix,
     } } });
-    try viewer.receivedPanePending(1, "");
+    try testing.expect(try viewer.receivedPanePending(1, ""));
 
     var suffix = [_]u8{ 0x82, 0xAC };
     _ = viewer.next(.{ .tmux = .{ .output = .{
@@ -2422,11 +2493,19 @@ test "zoomed geometry follows visible layout" {
         },
     });
 
-    for (0..9) |_| {
-        try testing.expectEqual(
-            0,
-            viewer.next(.{ .tmux = .{ .block_end = "" } }).len,
-        );
+    for (0..9) |index| {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = "" } });
+        const expected_change: ?usize = switch (index) {
+            4 => 0,
+            8 => 1,
+            else => null,
+        };
+        if (expected_change) |id| {
+            try testing.expectEqual(1, actions.len);
+            try testing.expectEqual(id, actions[0].pane_changed);
+        } else {
+            try testing.expectEqual(0, actions.len);
+        }
     }
 
     const pane_0 = viewer.panes.get(0).?;
@@ -2778,6 +2857,23 @@ test "window_add queues list_windows when queue not empty" {
                 }
             }).check,
         },
+        // Finish the in-flight hydration group. The final pending response
+        // publishes readiness before dispatching the queued window refresh.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, actions.len);
+                    try testing.expectEqual(0, actions[0].pane_changed);
+                    try testing.expect(actions[1] == .command);
+                }
+            }).check,
+        },
         .{
             .input = .{ .tmux = .exit },
             .contains_tags = &.{.exit},
@@ -2809,7 +2905,7 @@ test "alternate pane hydration restores canonical screens" {
     try viewer.receivedPaneVisible(7, "alternate\nsecond");
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
-    try viewer.receivedPanePending(7, "");
+    try testing.expect(try viewer.receivedPanePending(7, ""));
 
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.alternate, pane.active_screen);
@@ -2850,7 +2946,7 @@ test "visible snapshot preserves styled trailing cells" {
     };
 
     try viewer.receivedPaneVisible(1, "\x1b[41mABC  ");
-    try viewer.receivedPanePending(1, "");
+    try testing.expect(try viewer.receivedPanePending(1, ""));
 
     const screen = pane.terminal.screens.active;
     const first = screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;

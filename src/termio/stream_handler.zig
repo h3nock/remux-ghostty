@@ -461,6 +461,8 @@ pub const StreamHandler = struct {
                         .windows => {
                             // TODO
                         },
+
+                        .pane_changed => {},
                     }
                 }
             },

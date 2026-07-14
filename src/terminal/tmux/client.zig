@@ -54,11 +54,12 @@ test "control client raw startup preserves action order" {
     var client = try ControlClient.init(testing.allocator, .{});
     defer client.deinit();
 
-    const expected = [_]enum { display_message, list_windows, windows, hydrate_panes }{
+    const expected = [_]enum { display_message, list_windows, windows, hydrate_panes, pane_changed }{
         .display_message,
         .list_windows,
         .windows,
         .hydrate_panes,
+        .pane_changed,
     };
     var actual: [expected.len]@TypeOf(expected[0]) = undefined;
     var actual_len: usize = 0;
@@ -94,6 +95,14 @@ test "control client raw startup preserves action order" {
                     try testing.expectEqual(1, windows.len);
                     try testing.expectEqual(0, windows[0].id);
                     actual[actual_len] = .windows;
+                },
+                .pane_changed => |id| {
+                    try testing.expectEqual(0, id);
+                    try testing.expectEqual(
+                        Viewer.Pane.Phase.live,
+                        client.viewer.panes.get(id).?.phase,
+                    );
+                    actual[actual_len] = .pane_changed;
                 },
                 .command => |command| {
                     try testing.expect(std.mem.endsWith(u8, command, "\n"));
