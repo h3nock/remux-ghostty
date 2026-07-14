@@ -488,6 +488,69 @@ pub const Parser = struct {
     }
 };
 
+/// Decode tmux control-mode octal escaping in place. Tmux encodes
+/// non-printable bytes and `\` as `\ooo` in `%output` notifications. The
+/// decoded output never exceeds the input length, so the parser buffer can be
+/// compacted without another allocation.
+pub fn decodeEscapedOutput(data: []u8) []const u8 {
+    var read_idx: usize = 0;
+    var write_idx: usize = 0;
+
+    while (std.mem.indexOfScalarPos(u8, data, read_idx, '\\')) |slash_idx| {
+        const plain = data[read_idx..slash_idx];
+        if (plain.len > 0) {
+            if (write_idx != read_idx) {
+                std.mem.copyForwards(
+                    u8,
+                    data[write_idx .. write_idx + plain.len],
+                    plain,
+                );
+            }
+            write_idx += plain.len;
+        }
+        read_idx = slash_idx;
+
+        if (read_idx + 3 < data.len and
+            isOctalDigit(data[read_idx + 1]) and
+            isOctalDigit(data[read_idx + 2]) and
+            isOctalDigit(data[read_idx + 3]) and
+            data[read_idx + 1] <= '3')
+        {
+            data[write_idx] =
+                ((data[read_idx + 1] - '0') << 6) |
+                ((data[read_idx + 2] - '0') << 3) |
+                (data[read_idx + 3] - '0');
+            read_idx += 4;
+            write_idx += 1;
+            continue;
+        }
+
+        // Tmux should never emit a malformed escape. Preserve it literally
+        // rather than inventing replacement bytes.
+        data[write_idx] = data[read_idx];
+        read_idx += 1;
+        write_idx += 1;
+    }
+
+    const tail = data[read_idx..];
+    if (tail.len > 0) {
+        if (write_idx != read_idx) {
+            std.mem.copyForwards(
+                u8,
+                data[write_idx .. write_idx + tail.len],
+                tail,
+            );
+        }
+        write_idx += tail.len;
+    }
+
+    return data[0..write_idx];
+}
+
+fn isOctalDigit(byte: u8) bool {
+    return byte >= '0' and byte <= '7';
+}
+
 /// Possible notification types from tmux control mode. These are documented
 /// in tmux(1). A lot of the simple documentation was copied from that man
 /// page here.
@@ -512,11 +575,9 @@ pub const Notification = union(enum) {
     block_end: []const u8,
     block_err: []const u8,
 
-    /// Raw output from a pane.
-    output: struct {
-        pane_id: usize,
-        data: []const u8, // unescaped
-    },
+    /// Raw tmux-escaped output from a pane. Consumers that feed a terminal
+    /// must decode `data` exactly once with `decodeEscapedOutput`.
+    output: Output,
 
     /// The client is now attached to the session with ID session-id, which is
     /// named name.
@@ -566,6 +627,11 @@ pub const Notification = union(enum) {
         session_id: usize,
         name: []const u8,
     },
+
+    pub const Output = struct {
+        pane_id: usize,
+        data: []u8,
+    };
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
         const T = Notification;
@@ -735,6 +801,61 @@ test "tmux output" {
     try testing.expect(n == .output);
     try testing.expectEqual(42, n.output.pane_id);
     try testing.expectEqualStrings("foo bar baz", n.output.data);
+}
+
+test "tmux output accepts non-utf8 payload" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%output %42 ") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put(0xE2) == null);
+    const n = (try c.put('\n')).?;
+
+    try testing.expect(n == .output);
+    try testing.expectEqual(42, n.output.pane_id);
+    try testing.expectEqualSlices(u8, &.{0xE2}, n.output.data);
+}
+
+test "tmux decode escaped output" {
+    const testing = std.testing;
+
+    var input = "a\\033plain\\134tail".*;
+    const got = decodeEscapedOutput(input[0..]);
+
+    try testing.expectEqualStrings("a\x1bplain\\tail", got);
+}
+
+test "tmux decode escaped output preserves plain and malformed bytes" {
+    const testing = std.testing;
+
+    var plain = "plain output without escapes".*;
+    try testing.expectEqualStrings(
+        "plain output without escapes",
+        decodeEscapedOutput(plain[0..]),
+    );
+
+    var malformed = "\\0x3\\400\\12".*;
+    try testing.expectEqualStrings(
+        "\\0x3\\400\\12",
+        decodeEscapedOutput(malformed[0..]),
+    );
+}
+
+test "tmux parser leaves output escaped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%output %42 \\134040") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const n = (try c.put('\n')).?;
+
+    try testing.expect(n == .output);
+    try testing.expectEqualStrings("\\134040", n.output.data);
 }
 
 test "tmux session-changed" {
