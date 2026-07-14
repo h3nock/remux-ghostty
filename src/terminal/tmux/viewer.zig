@@ -848,8 +848,9 @@ pub const Viewer = struct {
         actions: *std.ArrayList(Action),
         content: []const u8,
     ) !void {
-        // If there is an error, reset our actions to what it was before.
-        errdefer actions.shrinkRetainingCapacity(actions.items.len);
+        // Reserve the action before mutating our model so a failure can't
+        // publish new state without its corresponding notification.
+        try actions.ensureUnusedCapacity(arena_alloc, 1);
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
@@ -893,12 +894,12 @@ pub const Viewer = struct {
             });
         }
 
-        // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
-
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
+
+        // Publish the Viewer-owned slice. `windows` is temporary and its
+        // backing allocation is freed when this function returns.
+        actions.appendAssumeCapacity(.{ .windows = self.windows.items });
     }
 
     fn receivedPaneState(
@@ -1640,6 +1641,19 @@ test "initial flow" {
             } },
             .contains_tags = &.{ .windows, .command },
             .contains_command = "capture-pane",
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| switch (action) {
+                        .windows => |windows| {
+                            try testing.expectEqual(v.windows.items.ptr, windows.ptr);
+                            try testing.expectEqual(v.windows.items.len, windows.len);
+                            return;
+                        },
+                        else => {},
+                    };
+                    return error.MissingWindowsAction;
+                }
+            }).check,
             // pane_history for pane 0 (primary)
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
