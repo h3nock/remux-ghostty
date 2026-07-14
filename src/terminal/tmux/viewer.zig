@@ -9,6 +9,7 @@ const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Terminal = @import("../Terminal.zig");
+const TerminalStream = @import("../stream_terminal.zig").Stream;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
@@ -191,7 +192,7 @@ pub const Viewer = struct {
     action_single: [1]Action,
 
     pub const CommandQueue = CircBuf(Command, undefined);
-    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
+    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -255,9 +256,26 @@ pub const Viewer = struct {
 
     pub const Pane = struct {
         terminal: Terminal,
+        stream: TerminalStream,
+
+        fn init(
+            alloc: Allocator,
+            terminal_opts: Terminal.Options,
+        ) Allocator.Error!*Pane {
+            const self = try alloc.create(Pane);
+            errdefer alloc.destroy(self);
+
+            self.terminal = try .init(alloc, terminal_opts);
+            errdefer self.terminal.deinit(alloc);
+
+            self.stream = self.terminal.vtStream();
+            return self;
+        }
 
         pub fn deinit(self: *Pane, alloc: Allocator) void {
+            self.stream.deinit();
             self.terminal.deinit(alloc);
+            alloc.destroy(self);
         }
     };
 
@@ -298,7 +316,7 @@ pub const Viewer = struct {
         }
         {
             var it = self.panes.iterator();
-            while (it.next()) |kv| kv.value_ptr.deinit(self.alloc);
+            while (it.next()) |kv| kv.value_ptr.*.deinit(self.alloc);
             self.panes.deinit(self.alloc);
         }
         if (self.tmux_version.len > 0) {
@@ -630,7 +648,7 @@ pub const Viewer = struct {
             var panes_it = panes.iterator();
             while (panes_it.next()) |kv| {
                 if (!self.panes.contains(kv.key_ptr.*)) {
-                    kv.value_ptr.deinit(self.alloc);
+                    kv.value_ptr.*.deinit(self.alloc);
                 }
             }
             panes.deinit(self.alloc);
@@ -701,8 +719,7 @@ pub const Viewer = struct {
             for (removed.items) |id| if (self.panes.fetchSwapRemove(
                 id,
             )) |entry_const| {
-                var entry = entry_const;
-                entry.value.deinit(self.alloc);
+                entry_const.value.deinit(self.alloc);
             };
             // We can now deinit self.panes because the existing
             // entries are preserved.
@@ -922,7 +939,7 @@ pub const Viewer = struct {
                 log.info("received pane state for untracked pane id={}", .{data.pane_id});
                 continue;
             };
-            const pane: *Pane = entry.value_ptr;
+            const pane: *Pane = entry.value_ptr.*;
             const t: *Terminal = &pane.terminal;
 
             // Determine which screen to use based on alternate_on
@@ -1041,7 +1058,7 @@ pub const Viewer = struct {
             log.info("received pane history for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
         const screen: *Screen = t.screens.active;
@@ -1081,7 +1098,7 @@ pub const Viewer = struct {
             log.info("received pane visible for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
 
@@ -1103,13 +1120,9 @@ pub const Viewer = struct {
             log.info("received output for untracked pane id={}", .{out.pane_id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
-        const t: *Terminal = &pane.terminal;
+        const pane: *Pane = entry.value_ptr.*;
         const data = control.decodeEscapedOutput(out.data);
-
-        var stream = t.vtStream();
-        defer stream.deinit();
-        stream.nextSlice(data);
+        pane.stream.nextSlice(data);
     }
 
     fn initLayout(
@@ -1147,15 +1160,10 @@ pub const Viewer = struct {
                 // TODO: We need to gracefully handle overflow of our
                 // max cols/width here. In practice we shouldn't hit this
                 // so we cast but its not safe.
-                var t: Terminal = try .init(gpa_alloc, .{
+                gop.value_ptr.* = try Pane.init(gpa_alloc, .{
                     .cols = @intCast(layout.width),
                     .rows = @intCast(layout.height),
                 });
-                errdefer t.deinit(gpa_alloc);
-
-                gop.value_ptr.* = .{
-                    .terminal = t,
-                };
             },
         }
     }
@@ -1678,7 +1686,7 @@ test "initial flow" {
             }).check,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -1773,7 +1781,7 @@ test "initial flow" {
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
@@ -1799,6 +1807,61 @@ test "initial flow" {
     });
 
     try testing.expectEqualStrings("ignored\\134output", &ignored_output);
+}
+
+test "live output preserves UTF-8 split across notifications" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    var first = [_]u8{0xE2};
+    var second = [_]u8{0x82};
+    var third = [_]u8{0xAC};
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &first } } });
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &second } } });
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &third } } });
+
+    const actual = try pane.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("€", actual);
+}
+
+test "live output preserves CSI split across notifications" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    var first = [_]u8{0x1B};
+    var second = "[1".*;
+    var third = "mX".*;
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &first } } });
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &second } } });
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &third } } });
+
+    const cell = pane.terminal.screens.active.pages.getCell(.{
+        .screen = .{ .x = 0, .y = 0 },
+    }).?.cell;
+    try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
+    try testing.expect(cell.style_id != 0);
+    try testing.expect(pane.terminal.screens.active.cursor.style.flags.bold);
 }
 
 test "layout change" {
@@ -2181,7 +2244,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2224,7 +2287,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2262,7 +2325,7 @@ test "two pane flow with pane state" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     // Pane 0: cursor at (42, 0), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(42, screen.cursor.x);
@@ -2276,7 +2339,7 @@ test "two pane flow with pane state" {
                     }
                     // Pane 4: cursor at (10, 5), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(10, screen.cursor.x);
