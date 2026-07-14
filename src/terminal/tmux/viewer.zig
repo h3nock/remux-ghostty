@@ -275,8 +275,10 @@ pub const Viewer = struct {
         id: usize,
         width: usize,
         height: usize,
+        is_zoomed: bool,
         layout_arena: ArenaAllocator.State,
         layout: Layout,
+        visible_layout: Layout,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
             self.layout_arena.promote(alloc).deinit();
@@ -561,6 +563,7 @@ pub const Viewer = struct {
                 &actions,
                 info.window_id,
                 info.layout,
+                info.visible_layout,
             ) catch {
                 // Note: in the future, we can probably handle a failure
                 // here with a fallback to remove this one window, list
@@ -632,6 +635,7 @@ pub const Viewer = struct {
         actions: *std.ArrayList(Action),
         window_id: usize,
         layout_str: []const u8,
+        visible_layout_str: []const u8,
     ) !void {
         // Find the window this layout change is for.
         const window: *Window = window: for (self.windows.items) |*w| {
@@ -641,12 +645,13 @@ pub const Viewer = struct {
             return;
         };
 
-        // Clear our prior window arena and setup our layout
-        window.layout = layout: {
+        // Clear our prior window arena and parse both topology and canonical
+        // visible geometry from the same notification.
+        {
             var arena = window.layout_arena.promote(self.alloc);
             defer window.layout_arena = arena.state;
             _ = arena.reset(.retain_capacity);
-            break :layout Layout.parseWithChecksum(
+            const layout = Layout.parseWithChecksum(
                 arena.allocator(),
                 layout_str,
             ) catch |err| {
@@ -656,7 +661,26 @@ pub const Viewer = struct {
                 );
                 return err;
             };
-        };
+            const is_zoomed = !std.mem.eql(u8, layout_str, visible_layout_str);
+            const visible_layout = if (is_zoomed)
+                Layout.parseWithChecksum(
+                    arena.allocator(),
+                    visible_layout_str,
+                ) catch |err| {
+                    log.info(
+                        "failed to parse visible window layout id={} layout={s}",
+                        .{ window_id, visible_layout_str },
+                    );
+                    return err;
+                }
+            else
+                layout;
+            window.width = layout.width;
+            window.height = layout.height;
+            window.is_zoomed = is_zoomed;
+            window.layout = layout;
+            window.visible_layout = visible_layout;
+        }
 
         // Reset our arena so we can build up actions.
         var arena = self.action_arena.promote(self.alloc);
@@ -701,12 +725,29 @@ pub const Viewer = struct {
             }
             panes.deinit(self.alloc);
         }
-        for (windows) |window| try initLayout(
-            self.alloc,
-            &self.panes,
-            &panes,
-            window.layout,
-        );
+        for (windows) |window| {
+            var visible_found = false;
+            const visible_pane: ?PaneGeometry = if (window.is_zoomed) switch (window.visible_layout.content) {
+                .pane => |id| .{
+                    .id = id,
+                    .width = window.visible_layout.width,
+                    .height = window.visible_layout.height,
+                },
+                .horizontal, .vertical => return error.InvalidVisibleLayout,
+            } else null;
+
+            try initLayout(
+                self.alloc,
+                &self.panes,
+                &panes,
+                window.layout,
+                visible_pane,
+                &visible_found,
+            );
+            if (visible_pane != null and !visible_found) {
+                return error.InvalidVisibleLayout;
+            }
+        }
 
         // Build up the list of removed panes.
         var removed: std.ArrayList(usize) = removed: {
@@ -1029,13 +1070,33 @@ pub const Viewer = struct {
                 );
                 return err;
             };
+            const is_zoomed = !std.mem.eql(
+                u8,
+                data.window_layout,
+                data.window_visible_layout,
+            );
+            const visible_layout: Layout = if (is_zoomed)
+                Layout.parseWithChecksum(
+                    window_alloc,
+                    data.window_visible_layout,
+                ) catch |err| {
+                    log.info(
+                        "failed to parse visible window layout id={} layout={s}",
+                        .{ data.window_id, data.window_visible_layout },
+                    );
+                    return err;
+                }
+            else
+                layout;
 
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .width = data.window_width,
                 .height = data.window_height,
+                .is_zoomed = is_zoomed,
                 .layout_arena = arena.state,
                 .layout = layout,
+                .visible_layout = visible_layout,
             });
         }
 
@@ -1328,11 +1389,19 @@ pub const Viewer = struct {
         }
     }
 
+    const PaneGeometry = struct {
+        id: usize,
+        width: usize,
+        height: usize,
+    };
+
     fn initLayout(
         gpa_alloc: Allocator,
         panes_old: *const PanesMap,
         panes_new: *PanesMap,
         layout: Layout,
+        visible_pane: ?PaneGeometry,
+        visible_found: *bool,
     ) !void {
         switch (layout.content) {
             // Nested layouts, continue going.
@@ -1343,12 +1412,39 @@ pub const Viewer = struct {
                         panes_old,
                         panes_new,
                         l,
+                        visible_pane,
+                        visible_found,
                     );
                 }
             },
 
             // A leaf! Initialize.
             .pane => |id| pane: {
+                const geometry = if (visible_pane) |visible| geometry: {
+                    if (visible.id == id) {
+                        visible_found.* = true;
+                        break :geometry visible;
+                    }
+                    break :geometry PaneGeometry{
+                        .id = id,
+                        .width = layout.width,
+                        .height = layout.height,
+                    };
+                } else PaneGeometry{
+                    .id = id,
+                    .width = layout.width,
+                    .height = layout.height,
+                };
+                const cols = std.math.cast(
+                    size.CellCountInt,
+                    geometry.width,
+                ) orelse return error.InvalidPaneGeometry;
+                const rows = std.math.cast(
+                    size.CellCountInt,
+                    geometry.height,
+                ) orelse return error.InvalidPaneGeometry;
+                if (cols == 0 or rows == 0) return error.InvalidPaneGeometry;
+
                 const gop = try panes_new.getOrPut(gpa_alloc, id);
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
@@ -1356,16 +1452,14 @@ pub const Viewer = struct {
                 // If we already have this pane, it is already initialized
                 // so just copy it over.
                 if (panes_old.getEntry(id)) |entry| {
+                    try entry.value_ptr.*.terminal.resize(gpa_alloc, cols, rows);
                     gop.value_ptr.* = entry.value_ptr.*;
                     break :pane;
                 }
 
-                // TODO: We need to gracefully handle overflow of our
-                // max cols/width here. In practice we shouldn't hit this
-                // so we cast but its not safe.
                 gop.value_ptr.* = try Pane.init(gpa_alloc, .{
-                    .cols = @intCast(layout.width),
-                    .rows = @intCast(layout.height),
+                    .cols = cols,
+                    .rows = rows,
                 });
             },
         }
@@ -1666,6 +1760,7 @@ const Format = struct {
             .window_width,
             .window_height,
             .window_layout,
+            .window_visible_layout,
         },
     };
 
@@ -1821,7 +1916,7 @@ test "zero history limit omits initial history capture" {
         },
         .{
             .input = .{ .tmux = .{
-                .block_end = "$1 @0 83 44 b7dd,83x44,0,0,0",
+                .block_end = "$1 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0",
             } },
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
@@ -1881,7 +1976,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1929,7 +2024,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1995,7 +2090,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2292,6 +2387,78 @@ test "hydration command errors do not become terminal content" {
     try testing.expectEqualStrings("", actual);
 }
 
+test "zoomed geometry follows visible layout" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+
+    const full_layout = "607b,83x44,0,0[83x22,0,0,0,83x21,0,23,1]";
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "zoomed",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.1" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$1 @0 83 44 " ++ full_layout ++ " b7dd,83x44,0,0,0",
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.windows.items[0].is_zoomed);
+                    try testing.expectEqual(83, v.panes.get(0).?.terminal.cols);
+                    try testing.expectEqual(44, v.panes.get(0).?.terminal.rows);
+                    try testing.expectEqual(83, v.panes.get(1).?.terminal.cols);
+                    try testing.expectEqual(21, v.panes.get(1).?.terminal.rows);
+                }
+            }).check,
+        },
+    });
+
+    for (0..9) |_| {
+        try testing.expectEqual(
+            0,
+            viewer.next(.{ .tmux = .{ .block_end = "" } }).len,
+        );
+    }
+
+    const pane_0 = viewer.panes.get(0).?;
+    const pane_1 = viewer.panes.get(1).?;
+    const terminal_0 = &pane_0.terminal;
+    const terminal_1 = &pane_1.terminal;
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
+
+    const actions = viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = full_layout,
+        .visible_layout = "b7de,83x44,0,0,1",
+        .raw_flags = "*",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expect(viewer.windows.items[0].is_zoomed);
+    try testing.expectEqual(83, viewer.windows.items[0].width);
+    try testing.expectEqual(44, viewer.windows.items[0].height);
+    try testing.expectEqual(83, viewer.panes.get(0).?.terminal.cols);
+    try testing.expectEqual(22, viewer.panes.get(0).?.terminal.rows);
+    try testing.expectEqual(83, viewer.panes.get(1).?.terminal.cols);
+    try testing.expectEqual(44, viewer.panes.get(1).?.terminal.rows);
+    try testing.expectEqual(pane_0, viewer.panes.get(0).?);
+    try testing.expectEqual(pane_1, viewer.panes.get(1).?);
+    try testing.expectEqual(terminal_0, &viewer.panes.get(0).?.terminal);
+    try testing.expectEqual(terminal_1, &viewer.panes.get(1).?.terminal);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
+}
+
 test "layout change" {
     var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
@@ -2316,7 +2483,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2396,7 +2563,7 @@ test "layout_change does not return command when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2457,7 +2624,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2524,7 +2691,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2585,7 +2752,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },

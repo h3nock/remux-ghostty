@@ -169,6 +169,9 @@ pub const Variable = enum {
     /// encodes pane dimensions as `WxH,X,Y[,ID]` with `{...}` for horizontal
     /// splits and `[...]` for vertical splits.
     window_layout,
+    /// Layout currently visible to the client. This equals window_layout when
+    /// unzoomed and contains the zoomed pane at full size when zoomed.
+    window_visible_layout,
     /// Pane wrap flag.
     wrap_flag,
 
@@ -220,6 +223,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_visible_layout,
             => value,
         };
     }
@@ -262,6 +266,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_visible_layout,
             => []const u8,
         };
     }
@@ -360,6 +365,13 @@ test "parse window layout" {
     try testing.expectEqualStrings("abc123", try Variable.parse(.window_layout, "abc123"));
     try testing.expectEqualStrings("", try Variable.parse(.window_layout, ""));
     try testing.expectEqualStrings("a]b,c{d}e(f)", try Variable.parse(.window_layout, "a]b,c{d}e(f)"));
+}
+
+test "parse visible window layout" {
+    try testing.expectEqualStrings(
+        "b7dd,83x44,0,0,0",
+        try Variable.parse(.window_visible_layout, "b7dd,83x44,0,0,0"),
+    );
 }
 
 test "parse cursor_flag" {
@@ -596,5 +608,5 @@ test "format empty variables" {
 }
 
 test "format all variables" {
-    try testFormat(&.{ .session_id, .window_id, .window_width, .window_height, .window_layout }, ' ', "#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout}");
+    try testFormat(&.{ .session_id, .window_id, .window_width, .window_height, .window_layout, .window_visible_layout }, ' ', "#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}");
 }
