@@ -210,35 +210,31 @@ pub const Parser = struct {
             self.state = .block;
             self.buffer.clearRetainingCapacity();
             return null;
+        } else if (std.mem.eql(u8, cmd, "%exit")) {
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .exit;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
-            var re = oni.Regex.init(
-                "^%output %([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
+            // Pane output is an opaque byte stream. Tmux may split UTF-8
+            // sequences across notifications, so only parse the ASCII header.
+            const prefix = "%output %";
+            if (!std.mem.startsWith(u8, line, prefix)) {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            }
 
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            const rest = line[prefix.len..];
+            const id_end = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
+            const id = std.fmt.parseInt(usize, rest[0..id_end], 10) catch {
+                log.warn("failed to parse output pane id line=\"{s}\"", .{line});
+                break :cmd;
+            };
+            const data = rest[id_end + 1 ..];
 
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const data = line[@intCast(starts[2])..@intCast(ends[2])];
-
-            // Important: do not clear buffer here since name points to it
+            // Important: do not clear the buffer because data points into it.
             self.state = .idle;
             return .{ .output = .{ .pane_id = id, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%session-changed")) cmd: {
@@ -607,6 +603,23 @@ test "tmux begin/end empty" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
     try testing.expectEqualStrings("", n.block_end);
+}
+
+test "tmux exit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_][]const u8{ "%exit\n", "%exit detached\r\n" }) |input| {
+        var c: Parser = .{ .buffer = .init(alloc) };
+        defer c.deinit();
+
+        var notification: ?Notification = null;
+        for (input) |byte| {
+            if (try c.put(byte)) |value| notification = value;
+        }
+
+        try testing.expect(notification.? == .exit);
+    }
 }
 
 test "tmux begin/error empty" {
