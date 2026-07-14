@@ -123,6 +123,8 @@ pub const Variable = enum {
     cursor_y,
     /// 1 if focus reporting is enabled.
     focus_flag,
+    /// Number of lines currently retained in pane history.
+    history_size,
     /// Pane insert flag.
     insert_flag,
     /// Pane keypad cursor flag.
@@ -195,6 +197,7 @@ pub const Variable = enum {
             .alternate_saved_y,
             .cursor_x,
             .cursor_y,
+            .history_size,
             .scroll_region_lower,
             .scroll_region_upper,
             => try std.fmt.parseInt(usize, value, 10),
@@ -245,6 +248,7 @@ pub const Variable = enum {
             .alternate_saved_y,
             .cursor_x,
             .cursor_y,
+            .history_size,
             .scroll_region_lower,
             .scroll_region_upper,
             .session_id,
@@ -293,6 +297,12 @@ test "parse cursor_y" {
     try testing.expectEqual(0, try Variable.parse(.cursor_y, "0"));
     try testing.expectEqual(23, try Variable.parse(.cursor_y, "23"));
     try testing.expectError(error.InvalidCharacter, Variable.parse(.cursor_y, "abc"));
+}
+
+test "parse history_size" {
+    try testing.expectEqual(0, try Variable.parse(.history_size, "0"));
+    try testing.expectEqual(10_000, try Variable.parse(.history_size, "10000"));
+    try testing.expectError(error.InvalidCharacter, Variable.parse(.history_size, "abc"));
 }
 
 test "parse scroll_region_upper" {

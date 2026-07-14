@@ -50,11 +50,11 @@ test "control client raw startup preserves action order" {
     var client = try ControlClient.init(testing.allocator);
     defer client.deinit();
 
-    const expected = [_]enum { display_message, list_windows, windows, capture_pane }{
+    const expected = [_]enum { display_message, list_windows, windows, hydrate_panes }{
         .display_message,
         .list_windows,
         .windows,
-        .capture_pane,
+        .hydrate_panes,
     };
     var actual: [expected.len]@TypeOf(expected[0]) = undefined;
     var actual_len: usize = 0;
@@ -68,7 +68,18 @@ test "control client raw startup preserves action order" {
         "%end 2 2 1\n" ++
         "%begin 3 3 1\n" ++
         "$0 @0 83 44 b7dd,83x44,0,0,0\n" ++
-        "%end 3 3 1\n";
+        "%end 3 3 1\n" ++
+        "%begin 4 4 1\n" ++
+        "%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
+        "%end 4 4 1\n" ++
+        "%begin 5 5 1\n" ++
+        "%end 5 5 1\n" ++
+        "%begin 6 6 1\n" ++
+        "%end 6 6 1\n" ++
+        "%begin 7 7 1\n" ++
+        "%end 7 7 1\n" ++
+        "%begin 8 8 1\n" ++
+        "%end 8 8 1\n";
 
     for (input) |byte| {
         for (try client.put(byte)) |action| {
@@ -90,8 +101,8 @@ test "control client raw startup preserves action order" {
                         .display_message
                     else if (std.mem.startsWith(u8, command, "list-windows"))
                         .list_windows
-                    else if (std.mem.startsWith(u8, command, "capture-pane"))
-                        .capture_pane
+                    else if (std.mem.startsWith(u8, command, "list-panes -s"))
+                        .hydrate_panes
                     else
                         return error.UnexpectedCommand;
                 },
@@ -102,6 +113,8 @@ test "control client raw startup preserves action order" {
 
     try testing.expectEqual(expected.len, actual_len);
     try testing.expectEqualSlices(@TypeOf(expected[0]), &expected, &actual);
+    try testing.expectEqual(Viewer.Pane.Phase.live, client.viewer.panes.get(0).?.phase);
+    try testing.expect(client.viewer.command_queue.empty());
 }
 
 test "control client raw exit" {

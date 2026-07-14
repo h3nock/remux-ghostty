@@ -16,11 +16,98 @@ const output = @import("output.zig");
 
 const log = std.log.scoped(.terminal_tmux_viewer);
 
+/// An incomplete UTF-8 sequence at the end of ignored hydration output.
+/// A valid sequence can have at most three bytes before its final byte.
+const Utf8Carry = struct {
+    bytes: [3]u8 = undefined,
+    len: u2 = 0,
+
+    fn update(self: *Utf8Carry, data: []const u8) void {
+        var tail: [6]u8 = undefined;
+        var tail_len: usize = 0;
+
+        if (data.len < self.bytes.len) {
+            const carry = self.slice();
+            @memcpy(tail[0..carry.len], carry);
+            tail_len = carry.len;
+        }
+
+        const data_tail = data[data.len -| self.bytes.len..];
+        @memcpy(tail[tail_len..][0..data_tail.len], data_tail);
+        tail_len += data_tail.len;
+
+        const suffix = incompleteUtf8Suffix(tail[0..tail_len]);
+        @memcpy(self.bytes[0..suffix.len], suffix);
+        self.len = @intCast(suffix.len);
+    }
+
+    fn slice(self: *const Utf8Carry) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    fn clear(self: *Utf8Carry) void {
+        self.len = 0;
+    }
+
+    fn incompleteUtf8Suffix(data: []const u8) []const u8 {
+        if (data.len == 0) return &.{};
+
+        var start = data.len - 1;
+        while (start > 0 and isContinuation(data[start])) start -= 1;
+
+        const expected_len: usize = switch (data[start]) {
+            0xC2...0xDF => 2,
+            0xE0...0xEF => 3,
+            0xF0...0xF4 => 4,
+            else => return &.{},
+        };
+        const actual_len = data.len - start;
+        if (actual_len >= expected_len) return &.{};
+        for (data[start + 1 ..]) |byte| {
+            if (!isContinuation(byte)) return &.{};
+        }
+
+        return data[start..];
+    }
+
+    fn isContinuation(byte: u8) bool {
+        return byte >= 0x80 and byte <= 0xBF;
+    }
+};
+
+/// Terminal state that must not affect replay of a captured grid.
+const SnapshotReplayState = struct {
+    modes: @FieldType(Terminal, "modes"),
+    scrolling_region: Terminal.ScrollingRegion,
+
+    fn begin(terminal: *Terminal) SnapshotReplayState {
+        const saved: SnapshotReplayState = .{
+            .modes = terminal.modes,
+            .scrolling_region = terminal.scrolling_region,
+        };
+        terminal.modes.set(.insert, false);
+        terminal.modes.set(.origin, false);
+        terminal.modes.set(.linefeed, true);
+        terminal.modes.set(.wraparound, true);
+        terminal.modes.set(.enable_left_and_right_margin, false);
+        terminal.scrolling_region = .{
+            .top = 0,
+            .bottom = terminal.rows - 1,
+            .left = 0,
+            .right = terminal.cols - 1,
+        };
+        return saved;
+    }
+
+    fn restore(self: SnapshotReplayState, terminal: *Terminal) void {
+        terminal.modes = self.modes;
+        terminal.scrolling_region = self.scrolling_region;
+    }
+};
+
 // TODO: A list of TODOs as I think about them.
 // - We need to make startup more robust so session and block can happen
 //   out of order.
-// - We need to ignore `output` for panes that aren't yet initialized
-//   (until capture-panes are complete).
 // - We should note what the active window pane is on the tmux side;
 //   we can use this at least for initial focus.
 
@@ -55,94 +142,19 @@ const COMMAND_QUEUE_INITIAL = 8;
 ///
 /// ## Viewer Lifecycle
 ///
-/// The viewer progresses through several states from initial connection
-/// to steady-state operation. Here is the full flow:
+/// The viewer waits for tmux's initial response and session notification,
+/// then enters its command queue. It queries the tmux version and the complete
+/// window layout. Every newly discovered pane is hydrated by one ordered
+/// command group:
 ///
 /// ```
-///                              ┌─────────────────────────────────────────────┐
-///                              │           TMUX CONTROL MODE START           │
-///                              │         (DCS 1000p received by host)        │
-///                              └─────────────────┬───────────────────────────┘
-///                                                │
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │            startup_block                    │
-///                              │                                             │
-///                              │  Wait for initial %begin/%end block from    │
-///                              │  tmux. This is the response to the initial  │
-///                              │  command (e.g., "attach -t 0").             │
-///                              └─────────────────┬───────────────────────────┘
-///                                                │ %end / %error
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │           startup_session                   │
-///                              │                                             │
-///                              │  Wait for %session-changed notification     │
-///                              │  to get the initial session ID.             │
-///                              └─────────────────┬───────────────────────────┘
-///                                                │ %session-changed
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │           command_queue                     │
-///                              │                                             │
-///                              │  Main operating state. Process commands     │
-///                              │  sequentially and handle notifications.     │
-///                              └─────────────────────────────────────────────┘
-///                                                │
-///                    ┌───────────────────────────┼───────────────────────────┐
-///                    │                           │                           │
-///                    ▼                           ▼                           ▼
-///     ┌──────────────────────────┐ ┌──────────────────────────┐ ┌────────────────────────┐
-///     │     tmux_version         │ │     list_windows         │ │   %output / %layout-   │
-///     │                          │ │                          │ │   change / etc.        │
-///     │  Query tmux version for  │ │  Get all windows in the  │ │                        │
-///     │  compatibility checks.   │ │  current session.        │ │  Handle live updates   │
-///     └──────────────────────────┘ └────────────┬─────────────┘ │  from tmux server.     │
-///                                               │               └────────────────────────┘
-///                                               ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │          syncLayouts                        │
-///                              │                                             │
-///                              │  For each window, parse layout and sync     │
-///                              │  panes. New panes trigger capture commands. │
-///                              └─────────────────┬───────────────────────────┘
-///                                                │
-///                    ┌───────────────────────────┴───────────────────────────┐
-///                    │                  For each new pane:                   │
-///                    ▼                                                       ▼
-///     ┌──────────────────────────┐                            ┌──────────────────────────┐
-///     │     pane_history         │                            │     pane_visible         │
-///     │     (primary screen)     │                            │     (primary screen)     │
-///     │                          │                            │                          │
-///     │  Capture scrollback      │                            │  Capture visible area    │
-///     │  history into terminal.  │                            │  into terminal.          │
-///     └──────────────────────────┘                            └──────────────────────────┘
-///                    │                                                       │
-///                    ▼                                                       ▼
-///     ┌──────────────────────────┐                            ┌──────────────────────────┐
-///     │     pane_history         │                            │     pane_visible         │
-///     │     (alternate screen)   │                            │     (alternate screen)   │
-///     └──────────────────────────┘                            └──────────────────────────┘
-///                    │                                                       │
-///                    └───────────────────────────┬───────────────────────────┘
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │          pane_state                         │
-///                              │                                             │
-///                              │  Query cursor position, cursor style,       │
-///                              │  and alternate screen mode for all panes.   │
-///                              └─────────────────────────────────────────────┘
-///                                                │
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │        READY FOR OPERATION                  │
-///                              │                                             │
-///                              │  Panes are populated with content. The      │
-///                              │  viewer handles %output for live updates,   │
-///                              │  %layout-change for pane changes, and       │
-///                              │  %session-changed for session switches.     │
-///                              └─────────────────────────────────────────────┘
+/// pane state -> primary history -> saved primary -> current screen -> pending
 /// ```
+///
+/// Tmux returns one FIFO response block for each command. Output received
+/// before a pane's final pending response is covered by the snapshots and is
+/// not rendered independently. The pane becomes live only after its canonical
+/// screen, cursors, modes, and retained VT parser state are restored.
 ///
 /// ## Error Handling
 ///
@@ -157,6 +169,9 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// session.
 ///
 pub const Viewer = struct {
+    /// Oldest tmux release with every command required by pane hydration.
+    pub const minimum_tmux_version = "3.1";
+
     /// Allocator used for all internal state.
     alloc: Allocator,
 
@@ -171,16 +186,20 @@ pub const Viewer = struct {
     /// versions as necessary.
     tmux_version: []const u8,
 
-    /// The list of commands we've sent that we want to send and wait
-    /// for a response for. We only send one command at a time just
-    /// to avoid any possible confusion around ordering.
+    /// Commands waiting for their FIFO-correlated response blocks.
     command_queue: CommandQueue,
+
+    /// Response blocks still expected for the command group already sent.
+    in_flight_responses: usize,
 
     /// The windows in the current session.
     windows: std.ArrayList(Window),
 
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
+
+    /// Incomplete UTF-8 prefixes received before their pane is discovered.
+    untracked_utf8: std.AutoArrayHashMapUnmanaged(usize, Utf8Carry),
 
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
@@ -191,7 +210,7 @@ pub const Viewer = struct {
     /// errors on single-action returns, especially those such as `.exit`.
     action_single: [1]Action,
 
-    pub const CommandQueue = CircBuf(Command, undefined);
+    pub const CommandQueue = CircBuf(QueuedCommand, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     pub const Action = union(enum) {
@@ -257,6 +276,28 @@ pub const Viewer = struct {
     pub const Pane = struct {
         terminal: Terminal,
         stream: TerminalStream,
+        phase: Phase = .hydrating,
+        active_screen: ScreenSet.Key = .primary,
+        has_history: bool = false,
+        cursor: ?CursorPosition = null,
+        saved_primary_cursor: ?CursorPosition = null,
+        utf8_carry: Utf8Carry = .{},
+
+        pub const Phase = enum {
+            hydrating,
+            live,
+        };
+
+        const CursorPosition = struct {
+            x: size.CellCountInt,
+            y: size.CellCountInt,
+        };
+
+        fn restoreCursor(screen: *Screen, position: ?CursorPosition) void {
+            const pos = position orelse return;
+            if (pos.x >= screen.pages.cols or pos.y >= screen.pages.rows) return;
+            screen.cursorAbsolute(pos.x, pos.y);
+        }
 
         fn init(
             alloc: Allocator,
@@ -265,7 +306,10 @@ pub const Viewer = struct {
             const self = try alloc.create(Pane);
             errdefer alloc.destroy(self);
 
-            self.terminal = try .init(alloc, terminal_opts);
+            self.* = .{
+                .terminal = try .init(alloc, terminal_opts),
+                .stream = undefined,
+            };
             errdefer self.terminal.deinit(alloc);
 
             self.stream = self.terminal.vtStream();
@@ -297,8 +341,10 @@ pub const Viewer = struct {
             .session_id = 0,
             .tmux_version = "",
             .command_queue = command_queue,
+            .in_flight_responses = 0,
             .windows = .empty,
             .panes = .empty,
+            .untracked_utf8 = .empty,
             .action_arena = .{},
             .action_single = undefined,
         };
@@ -311,7 +357,7 @@ pub const Viewer = struct {
         }
         {
             var it = self.command_queue.iterator(.forward);
-            while (it.next()) |command| command.deinit(self.alloc);
+            while (it.next()) |queued| queued.command.deinit(self.alloc);
             self.command_queue.deinit(self.alloc);
         }
         {
@@ -319,6 +365,7 @@ pub const Viewer = struct {
             while (it.next()) |kv| kv.value_ptr.*.deinit(self.alloc);
             self.panes.deinit(self.alloc);
         }
+        self.untracked_utf8.deinit(self.alloc);
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
@@ -451,10 +498,8 @@ pub const Viewer = struct {
         // Setup our empty actions list that commands can populate.
         var actions: std.ArrayList(Action) = .empty;
 
-        // Track whether the in-flight command slot is available. Starts true
-        // if queue is empty (no command in flight). Set to true when a command
-        // completes (block_end/block_err) or the queue is reset (session_changed).
-        var command_consumed = self.command_queue.empty();
+        // A group can be sent only after every response for the prior group.
+        var can_send_command = self.in_flight_responses == 0;
 
         switch (n) {
             .enter => unreachable,
@@ -471,17 +516,15 @@ pub const Viewer = struct {
                     log.warn("failed to process command output, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                // Command is consumed since a block end/err is the output
-                // from a command.
-                command_consumed = true;
+                can_send_command = self.in_flight_responses == 0;
             },
 
             .output => |out| self.receivedOutput(out) catch |err| {
                 log.warn(
-                    "failed to process output for pane id={}: {}",
+                    "failed to process output for pane id={}, becoming defunct: {}",
                     .{ out.pane_id, err },
                 );
+                return self.defunct();
             },
 
             // Session changed means we switched to a different tmux session.
@@ -496,9 +539,7 @@ pub const Viewer = struct {
                     return self.defunct();
                 };
 
-                // Command is consumed because sessionChanged resets
-                // our entire viewer.
-                command_consumed = true;
+                can_send_command = true;
             },
 
             // Layout changed of a single window.
@@ -544,27 +585,20 @@ pub const Viewer = struct {
         // execute if we have one. We do this last because command
         // processing may itself queue more commands. We only emit a
         // command if a prior command was consumed (or never existed).
-        if (self.state == .command_queue and command_consumed) {
-            if (self.command_queue.first()) |next_command| {
+        if (self.state == .command_queue and can_send_command) {
+            var arena = self.action_arena.promote(self.alloc);
+            defer self.action_arena = arena.state;
+            const arena_alloc = arena.allocator();
+            if (self.nextCommandAction(arena_alloc) catch return self.defunct()) |action| {
                 // We should not have any commands, because our nextCommand
                 // always queues them.
                 if (comptime std.debug.runtime_safety) {
-                    for (actions.items) |action| {
-                        if (action == .command) assert(false);
+                    for (actions.items) |existing_action| {
+                        if (existing_action == .command) assert(false);
                     }
                 }
 
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                const arena_alloc = arena.allocator();
-
-                var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-                next_command.formatCommand(&builder.writer) catch
-                    return self.defunct();
-                actions.append(
-                    arena_alloc,
-                    .{ .command = builder.writer.buffered() },
-                ) catch return self.defunct();
+                actions.append(arena_alloc, action) catch return self.defunct();
             }
         }
 
@@ -677,27 +711,59 @@ pub const Viewer = struct {
         // Ensure we can add the windows
         try self.windows.ensureTotalCapacity(self.alloc, windows.len);
 
-        // Get our list of added panes and setup our command queue
-        // to populate them.
-        // TODO: errdefer cleanup
+        // Hydrate all newly discovered panes in one explicit command group.
+        // Reserve exactly once before changing the queue.
+        var added_count: usize = 0;
         {
             var panes_it = panes.iterator();
-            var added: bool = false;
             while (panes_it.next()) |kv| {
-                const pane_id: usize = kv.key_ptr.*;
+                if (!self.panes.contains(kv.key_ptr.*)) added_count += 1;
+            }
+        }
+        if (added_count > 0) {
+            const command_count = 1 + 4 * added_count;
+            try self.command_queue.ensureUnusedCapacity(self.alloc, command_count);
+            self.command_queue.appendAssumeCapacity(.{
+                .command = .pane_state,
+                .group_end = false,
+            });
+
+            var added_index: usize = 0;
+            var panes_it = panes.iterator();
+            while (panes_it.next()) |kv| {
+                const pane_id = kv.key_ptr.*;
                 if (self.panes.contains(pane_id)) continue;
-                added = true;
-                try self.queueCommands(&.{
-                    .{ .pane_history = .{ .id = pane_id, .screen_key = .primary } },
-                    .{ .pane_visible = .{ .id = pane_id, .screen_key = .primary } },
-                    .{ .pane_history = .{ .id = pane_id, .screen_key = .alternate } },
-                    .{ .pane_visible = .{ .id = pane_id, .screen_key = .alternate } },
+                added_index += 1;
+
+                self.command_queue.appendAssumeCapacity(.{
+                    .command = .{ .pane_history = pane_id },
+                    .group_end = false,
+                });
+                self.command_queue.appendAssumeCapacity(.{
+                    .command = .{ .pane_saved_visible = pane_id },
+                    .group_end = false,
+                });
+                self.command_queue.appendAssumeCapacity(.{
+                    .command = .{ .pane_visible = pane_id },
+                    .group_end = false,
+                });
+                self.command_queue.appendAssumeCapacity(.{
+                    .command = .{ .pane_pending = pane_id },
+                    .group_end = added_index == added_count,
                 });
             }
+        }
 
-            // If we added any panes, then we also want to resync the pane
-            // state (terminal modes and cursor positions and so on).
-            if (added) try self.queueCommands(&.{.pane_state});
+        // Transfer only the bounded UTF-8 suffixes that belong to newly
+        // discovered panes in this topology snapshot.
+        {
+            var panes_it = panes.iterator();
+            while (panes_it.next()) |kv| {
+                if (self.panes.contains(kv.key_ptr.*)) continue;
+                if (self.untracked_utf8.fetchSwapRemove(kv.key_ptr.*)) |entry| {
+                    kv.value_ptr.*.utf8_carry = entry.value;
+                }
+            }
         }
 
         // No more errors after this point. We're about to replace all
@@ -777,11 +843,16 @@ pub const Viewer = struct {
         content: []const u8,
         is_err: bool,
     ) !void {
+        if (self.in_flight_responses == 0) {
+            log.info("unexpected block output err={}", .{is_err});
+            return;
+        }
+
         // Get the command we're expecting output for. We need to get the
         // non-pointer value because we are deleting it from the circular
         // buffer immediately. This shallow copy is all we need since
         // all the memory in Command is owned by GPA.
-        const command: Command = if (self.command_queue.first()) |ptr| switch (ptr.*) {
+        const command: Command = if (self.command_queue.first()) |ptr| switch (ptr.command) {
             // I truly can't explain this. A simple `ptr.*` copy will cause
             // our memory to become undefined when deleteOldest is called
             // below. I logged all the pointers and they don't match so I
@@ -798,7 +869,10 @@ pub const Viewer = struct {
             return;
         };
         self.command_queue.deleteOldest(1);
+        self.in_flight_responses -= 1;
         defer command.deinit(self.alloc);
+
+        if (is_err and command.isHydration()) return error.HydrationFailed;
 
         // We'll use our arena for the return value here so we can
         // easily accumulate actions.
@@ -818,17 +892,13 @@ pub const Viewer = struct {
                 content,
             ),
 
-            .pane_history => |cap| try self.receivedPaneHistory(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_history => |id| try self.receivedPaneHistory(id, content),
 
-            .pane_visible => |cap| try self.receivedPaneVisible(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_saved_visible => |id| try self.receivedPaneSavedVisible(id, content),
+
+            .pane_visible => |id| try self.receivedPaneVisible(id, content),
+
+            .pane_pending => |id| try self.receivedPanePending(id, content),
 
             .tmux_version => try self.receivedTmuxVersion(content),
         }
@@ -850,10 +920,51 @@ pub const Viewer = struct {
             return err;
         };
 
+        if (!supportsTmuxVersion(data.version)) {
+            log.warn(
+                "unsupported tmux version={s}; minimum supported version={s}",
+                .{ data.version, minimum_tmux_version },
+            );
+            return error.UnsupportedTmuxVersion;
+        }
+
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+    }
+
+    fn supportsTmuxVersion(version_raw: []const u8) bool {
+        const version = parseTmuxVersion(version_raw) orelse return false;
+        const minimum = parseTmuxVersion(minimum_tmux_version).?;
+        return version.major > minimum.major or
+            (version.major == minimum.major and version.minor >= minimum.minor);
+    }
+
+    const TmuxVersion = struct {
+        major: usize,
+        minor: usize,
+    };
+
+    fn parseTmuxVersion(version_raw: []const u8) ?TmuxVersion {
+        var version = std.mem.trim(u8, version_raw, " \t\r\n");
+        if (std.mem.startsWith(u8, version, "next-")) version = version[5..];
+
+        const dot = std.mem.indexOfScalar(u8, version, '.') orelse return null;
+        const major = std.fmt.parseInt(usize, version[0..dot], 10) catch return null;
+
+        var minor_end = dot + 1;
+        while (minor_end < version.len and std.ascii.isDigit(version[minor_end])) {
+            minor_end += 1;
+        }
+        if (minor_end == dot + 1) return null;
+        const minor = std.fmt.parseInt(
+            usize,
+            version[dot + 1 .. minor_end],
+            10,
+        ) catch return null;
+
+        return .{ .major = major, .minor = minor };
     }
 
     fn receivedListWindows(
@@ -911,6 +1022,11 @@ pub const Viewer = struct {
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
 
+        // A complete list-windows response is the authoritative topology cut.
+        // Carries not claimed by one of its panes cannot belong to this
+        // session. Partial layout-change notifications must not clear them.
+        self.untracked_utf8.clearRetainingCapacity();
+
         // Publish the Viewer-owned slice. `windows` is temporary and its
         // backing allocation is freed when this function returns.
         actions.appendAssumeCapacity(.{ .windows = self.windows.items });
@@ -940,59 +1056,61 @@ pub const Viewer = struct {
                 continue;
             };
             const pane: *Pane = entry.value_ptr.*;
+            if (pane.phase == .live) continue;
             const t: *Terminal = &pane.terminal;
 
-            // Determine which screen to use based on alternate_on
-            const screen_key: ScreenSet.Key = if (data.alternate_on) .alternate else .primary;
+            pane.active_screen = if (data.alternate_on) .alternate else .primary;
+            pane.has_history = data.history_size > 0;
+            _ = try t.switchScreen(pane.active_screen);
 
             // Set cursor position on the appropriate screen (tmux uses 0-based)
-            if (t.screens.get(screen_key)) |screen| {
-                cursor: {
-                    const cursor_x = std.math.cast(
-                        size.CellCountInt,
-                        data.cursor_x,
-                    ) orelse break :cursor;
-                    const cursor_y = std.math.cast(
-                        size.CellCountInt,
-                        data.cursor_y,
-                    ) orelse break :cursor;
-                    if (cursor_x >= screen.pages.cols or
-                        cursor_y >= screen.pages.rows) break :cursor;
-                    screen.cursorAbsolute(cursor_x, cursor_y);
+            const screen = t.screens.active;
+            pane.cursor = position: {
+                const x = std.math.cast(
+                    size.CellCountInt,
+                    data.cursor_x,
+                ) orelse break :position null;
+                const y = std.math.cast(
+                    size.CellCountInt,
+                    data.cursor_y,
+                ) orelse break :position null;
+                if (x >= screen.pages.cols or y >= screen.pages.rows) {
+                    break :position null;
                 }
+                break :position .{ .x = x, .y = y };
+            };
 
-                // Set cursor shape on this screen
-                if (data.cursor_shape.len > 0) {
-                    if (std.mem.eql(u8, data.cursor_shape, "block")) {
-                        screen.cursor.cursor_style = .block;
-                    } else if (std.mem.eql(u8, data.cursor_shape, "underline")) {
-                        screen.cursor.cursor_style = .underline;
-                    } else if (std.mem.eql(u8, data.cursor_shape, "bar")) {
-                        screen.cursor.cursor_style = .bar;
-                    }
-                }
-                // "default" or unknown: leave as-is
+            // Set cursor shape on the canonical screen.
+            if (std.mem.eql(u8, data.cursor_shape, "block")) {
+                screen.cursor.cursor_style = .block;
+            } else if (std.mem.eql(u8, data.cursor_shape, "underline")) {
+                screen.cursor.cursor_style = .underline;
+            } else if (std.mem.eql(u8, data.cursor_shape, "bar")) {
+                screen.cursor.cursor_style = .bar;
             }
 
-            // Set alternate screen saved cursor position
-            if (t.screens.get(.alternate)) |alt_screen| cursor: {
-                const alt_x = std.math.cast(
+            // Tmux's alternate_saved coordinates are the primary cursor
+            // saved while the alternate screen is active.
+            const primary = t.screens.get(.primary).?;
+            pane.saved_primary_cursor = position: {
+                const x = std.math.cast(
                     size.CellCountInt,
                     data.alternate_saved_x,
-                ) orelse break :cursor;
-                const alt_y = std.math.cast(
+                ) orelse break :position null;
+                const y = std.math.cast(
                     size.CellCountInt,
                     data.alternate_saved_y,
-                ) orelse break :cursor;
+                ) orelse break :position null;
 
                 // If our coordinates are outside our screen we ignore it.
                 // tmux actually sends MAX_INT for when there isn't a set
                 // cursor position, so this isn't theoretical.
-                if (alt_x >= alt_screen.pages.cols or
-                    alt_y >= alt_screen.pages.rows) break :cursor;
+                if (x >= primary.pages.cols or y >= primary.pages.rows) {
+                    break :position null;
+                }
 
-                alt_screen.cursorAbsolute(alt_x, alt_y);
-            }
+                break :position .{ .x = x, .y = y };
+            };
 
             // Set cursor visibility
             t.modes.set(.cursor_visible, data.cursor_flag);
@@ -1049,7 +1167,6 @@ pub const Viewer = struct {
 
     fn receivedPaneHistory(
         self: *Viewer,
-        screen_key: ScreenSet.Key,
         id: usize,
         content: []const u8,
     ) !void {
@@ -1059,8 +1176,11 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
+        if (!pane.has_history) return;
         const t: *Terminal = &pane.terminal;
-        _ = try t.switchScreen(screen_key);
+        const replay_state = SnapshotReplayState.begin(t);
+        defer replay_state.restore(t);
+        _ = try t.switchScreen(.primary);
         const screen: *Screen = t.screens.active;
 
         // Get a VT stream from the terminal so we can send data as-is into
@@ -1087,7 +1207,32 @@ pub const Viewer = struct {
         }
     }
 
+    fn receivedPaneSavedVisible(
+        self: *Viewer,
+        id: usize,
+        content: []const u8,
+    ) !void {
+        const pane = self.panes.get(id) orelse {
+            log.info("received saved pane content for untracked pane id={}", .{id});
+            return;
+        };
+        if (pane.active_screen != .alternate) return;
+        try self.receivedPaneVisibleOnScreen(.primary, id, content);
+    }
+
     fn receivedPaneVisible(
+        self: *Viewer,
+        id: usize,
+        content: []const u8,
+    ) !void {
+        const pane = self.panes.get(id) orelse {
+            log.info("received pane visible for untracked pane id={}", .{id});
+            return;
+        };
+        try self.receivedPaneVisibleOnScreen(pane.active_screen, id, content);
+    }
+
+    fn receivedPaneVisibleOnScreen(
         self: *Viewer,
         screen_key: ScreenSet.Key,
         id: usize,
@@ -1100,6 +1245,8 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
+        const replay_state = SnapshotReplayState.begin(t);
+        defer replay_state.restore(t);
         _ = try t.switchScreen(screen_key);
 
         // Erase the active area and reset the cursor to the top-left
@@ -1112,17 +1259,53 @@ pub const Viewer = struct {
         stream.nextSlice(content);
     }
 
+    fn receivedPanePending(
+        self: *Viewer,
+        id: usize,
+        content: []const u8,
+    ) !void {
+        const pane = self.panes.get(id) orelse {
+            log.info("received pending pane content for untracked pane id={}", .{id});
+            return;
+        };
+
+        const t = &pane.terminal;
+        Pane.restoreCursor(t.screens.get(.primary).?, pane.saved_primary_cursor);
+        _ = try t.switchScreen(pane.active_screen);
+        Pane.restoreCursor(t.screens.active, pane.cursor);
+
+        if (content.len > 0) {
+            const encoded = try self.alloc.dupe(u8, content);
+            defer self.alloc.free(encoded);
+            pane.stream.nextSlice(control.decodeEscapedOutput(encoded));
+        } else {
+            pane.stream.nextSlice(pane.utf8_carry.slice());
+        }
+
+        pane.utf8_carry.clear();
+        pane.phase = .live;
+    }
+
     fn receivedOutput(
         self: *Viewer,
         out: control.Notification.Output,
     ) !void {
         const entry = self.panes.getEntry(out.pane_id) orelse {
-            log.info("received output for untracked pane id={}", .{out.pane_id});
+            var carry = self.untracked_utf8.get(out.pane_id) orelse Utf8Carry{};
+            carry.update(out.data);
+            if (carry.len == 0) {
+                _ = self.untracked_utf8.swapRemove(out.pane_id);
+            } else {
+                try self.untracked_utf8.put(self.alloc, out.pane_id, carry);
+            }
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
         const data = control.decodeEscapedOutput(out.data);
-        pane.stream.nextSlice(data);
+        switch (pane.phase) {
+            .hydrating => pane.utf8_carry.update(data),
+            .live => pane.stream.nextSlice(data),
+        }
     }
 
     fn initLayout(
@@ -1174,23 +1357,16 @@ pub const Viewer = struct {
         self: *Viewer,
         arena_alloc: Allocator,
         commands: []const Command,
-    ) Allocator.Error![]const Action {
+    ) (Allocator.Error || std.Io.Writer.Error)![]const Action {
         assert(self.state != .command_queue);
         assert(commands.len > 0);
 
-        // Build our command string to send for the action.
-        var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-        commands[0].formatCommand(&builder.writer) catch return error.OutOfMemory;
-        const action: Action = .{ .command = builder.writer.buffered() };
-
-        // Add our commands
-        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
-        for (commands) |cmd| self.command_queue.appendAssumeCapacity(cmd);
+        try self.queueCommands(commands);
 
         // Move into the command queue state
         self.state = .command_queue;
 
-        return self.singleAction(action);
+        return self.singleAction((try self.nextCommandAction(arena_alloc)).?);
     }
 
     /// Queue multiple commands to execute. This doesn't add anything
@@ -1206,8 +1382,37 @@ pub const Viewer = struct {
             commands.len,
         );
         for (commands) |command| {
-            self.command_queue.appendAssumeCapacity(command);
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = true,
+            });
         }
+    }
+
+    /// Format and mark the next explicit command group as in flight.
+    fn nextCommandAction(
+        self: *Viewer,
+        arena_alloc: Allocator,
+    ) std.Io.Writer.Error!?Action {
+        assert(self.in_flight_responses == 0);
+        if (self.command_queue.empty()) return null;
+
+        var builder: std.Io.Writer.Allocating = .init(arena_alloc);
+        var response_count: usize = 0;
+        var it = self.command_queue.iterator(.forward);
+        while (it.next()) |queued| {
+            try queued.command.formatCommand(&builder.writer);
+            response_count += 1;
+            if (queued.group_end) break;
+
+            const buffered = builder.writer.buffered();
+            assert(buffered.len > 0 and buffered[buffered.len - 1] == '\n');
+            builder.writer.undo(1);
+            try builder.writer.writeAll(" ; ");
+        }
+
+        self.in_flight_responses = response_count;
+        return .{ .command = builder.writer.buffered() };
     }
 
     /// Helper to return a single action. The input action may use the arena
@@ -1253,15 +1458,26 @@ const State = enum {
     command_queue,
 };
 
+const QueuedCommand = struct {
+    command: Command,
+    group_end: bool,
+};
+
 const Command = union(enum) {
     /// List all windows so we can sync our window state.
     list_windows,
 
     /// Capture history for the given pane ID.
-    pane_history: CapturePane,
+    pane_history: usize,
 
-    /// Capture visible area for the given pane ID.
-    pane_visible: CapturePane,
+    /// Capture the primary screen saved behind an active alternate screen.
+    pane_saved_visible: usize,
+
+    /// Capture the current visible area for the given pane ID.
+    pane_visible: usize,
+
+    /// Capture output queued while the pane snapshots were taken.
+    pane_pending: usize,
 
     /// Capture the pane terminal state as best we can. The pane ID(s)
     /// are part of the output so we can map it back to our panes.
@@ -1274,20 +1490,29 @@ const Command = union(enum) {
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
 
-    const CapturePane = struct {
-        id: usize,
-        screen_key: ScreenSet.Key,
-    };
-
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
             .pane_history,
+            .pane_saved_visible,
             .pane_visible,
+            .pane_pending,
             .pane_state,
             .tmux_version,
             => {},
             .user => |v| alloc.free(v),
+        };
+    }
+
+    fn isHydration(self: Command) bool {
+        return switch (self) {
+            .pane_state,
+            .pane_history,
+            .pane_saved_visible,
+            .pane_visible,
+            .pane_pending,
+            => true,
+            .list_windows, .tmux_version, .user => false,
         };
     }
 
@@ -1304,38 +1529,44 @@ const Command = union(enum) {
                 .{comptime Format.list_windows.comptimeFormat()},
             )),
 
-            .pane_history => |cap| try writer.print(
+            .pane_history => |id| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
-                // -a = capture alternate screen (only valid for alternate)
+                // -N = preserve trailing cells and their styles
                 // -q = quiet, don't error if alternate screen doesn't exist
                 // -S - = start at the top of history ("-")
                 // -E -1 = end at the last line of history (1 before the
                 //   visible area is -1).
                 // -t %{d} = target a specific pane ID
-                "capture-pane -p -e -q {s}-S - -E -1 -t %{d}\n",
-                .{
-                    if (cap.screen_key == .alternate) "-a " else "",
-                    cap.id,
-                },
+                "capture-pane -p -e -N -q -S - -E -1 -t %{d}\n",
+                .{id},
             ),
 
-            .pane_visible => |cap| try writer.print(
+            .pane_saved_visible => |id| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
-                // -a = capture alternate screen (only valid for alternate)
-                // -q = quiet, don't error if alternate screen doesn't exist
-                // -t %{d} = target a specific pane ID
-                // (no -S/-E = capture visible area only)
-                "capture-pane -p -e -q {s}-t %{d}\n",
-                .{
-                    if (cap.screen_key == .alternate) "-a " else "",
-                    cap.id,
-                },
+                // -N = preserve trailing cells and their styles
+                // -a = capture the saved primary screen behind alternate
+                // -q = return empty if no saved screen exists
+                "capture-pane -p -e -N -a -q -t %{d}\n",
+                .{id},
+            ),
+
+            .pane_visible => |id| try writer.print(
+                // -N preserves styled trailing cells in the current grid.
+                "capture-pane -p -e -N -q -t %{d}\n",
+                .{id},
+            ),
+
+            .pane_pending => |id| try writer.print(
+                // -P = pending output not yet written to the pane
+                // -C = octal-escape non-printable bytes
+                "capture-pane -p -P -C -t %{d}\n",
+                .{id},
             ),
 
             .pane_state => try writer.writeAll(std.fmt.comptimePrint(
-                "list-panes -F '{s}'\n",
+                "list-panes -s -F '{s}'\n",
                 .{comptime Format.list_panes.comptimeFormat()},
             )),
 
@@ -1389,6 +1620,7 @@ const Format = struct {
             // Focus & special features
             .focus_flag,
             .bracketed_paste,
+            .history_size,
             // Scroll region
             .scroll_region_upper,
             .scroll_region_lower,
@@ -1497,6 +1729,46 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
             return err;
         };
     }
+}
+
+test "minimum tmux version" {
+    try testing.expect(!Viewer.supportsTmuxVersion("2.9a"));
+    try testing.expect(!Viewer.supportsTmuxVersion("3.0a"));
+    try testing.expect(Viewer.supportsTmuxVersion("3.1"));
+    try testing.expect(Viewer.supportsTmuxVersion("3.1c"));
+    try testing.expect(Viewer.supportsTmuxVersion("3.2a"));
+    try testing.expect(Viewer.supportsTmuxVersion("next-3.1"));
+    try testing.expect(Viewer.supportsTmuxVersion("4.0"));
+    try testing.expect(!Viewer.supportsTmuxVersion("3"));
+    try testing.expect(!Viewer.supportsTmuxVersion("3.x"));
+    try testing.expect(!Viewer.supportsTmuxVersion("unknown"));
+}
+
+test "unsupported tmux exits before topology hydration" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "old",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.0a" } },
+            .contains_tags = &.{.exit},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(State.defunct, v.state);
+                    try testing.expectEqualStrings("", v.tmux_version);
+                }
+            }).check,
+        },
+    });
 }
 
 test "immediate exit" {
@@ -1613,9 +1885,7 @@ test "session changed resets state" {
 test "initial flow" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
-
-    var new_output = "new\\134output".*;
-    var ignored_output = "ignored\\134output".*;
+    var pre_topology_prefix = [_]u8{0xE2};
 
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -1631,7 +1901,6 @@ test "initial flow" {
                 }
             }).check,
         },
-        // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "list-windows",
@@ -1642,171 +1911,165 @@ test "initial flow" {
             }).check,
         },
         .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 1,
+                .data = &pre_topology_prefix,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expectEqual(1, v.untracked_utf8.get(1).?.len);
+                }
+            }).check,
+        },
+        .{
             .input = .{ .tmux = .{
                 .block_end =
                 \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
-            .contains_command = "capture-pane",
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found_command = false;
                     for (actions) |action| switch (action) {
                         .windows => |windows| {
                             try testing.expectEqual(v.windows.items.ptr, windows.ptr);
                             try testing.expectEqual(v.windows.items.len, windows.len);
-                            return;
                         },
+                        .command => found_command = true,
                         else => {},
                     };
-                    return error.MissingWindowsAction;
+                    try testing.expect(found_command);
                 }
             }).check,
-            // pane_history for pane 0 (primary)
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
+                    try testing.expect(std.mem.startsWith(u8, command, "list-panes -s"));
+                    try testing.expectEqual(8, std.mem.count(u8, command, "capture-pane"));
+                    try testing.expectEqual(8, std.mem.count(u8, command, " ; "));
+                    try testing.expectEqual(4, std.mem.count(u8, command, "-t %0"));
+                    try testing.expectEqual(4, std.mem.count(u8, command, "-t %1"));
+                    try testing.expectEqual(6, std.mem.count(u8, command, " -N"));
                 }
             }).check,
-        },
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\Hello, world!
-                ,
-            } },
-            // Moves on to pane_visible for pane 0 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
-                    const screen: *Screen = pane.terminal.screens.active;
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .history = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        try testing.expectEqualStrings("Hello, world!", str);
-                    }
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .active = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        try testing.expectEqualStrings("", str);
-                    }
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 0 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 0 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 1 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 1 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 1 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 1 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-        },
-        .{
-            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = new_output[0..] } } },
-            .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
-                    const screen: *Screen = pane.terminal.screens.active;
-                    const str = try screen.dumpStringAlloc(
-                        testing.allocator,
-                        .{ .active = .{} },
-                    );
-                    defer testing.allocator.free(str);
-                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "new\\output"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .output = .{ .pane_id = 999, .data = ignored_output[0..] } } },
-            .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .exit },
-            .contains_tags = &.{.exit},
         },
     });
 
+    const pane_state =
+        \\%0;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;1;0;19;8,16
+        \\%1;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+    ;
+    const first_responses = [_][]const u8{
+        pane_state,
+        "Hello, world!",
+        "",
+    };
+    for (first_responses) |response| {
+        try testing.expectEqual(
+            0,
+            viewer.next(.{ .tmux = .{ .block_end = response } }).len,
+        );
+    }
+
+    // This output predates the canonical visible snapshot, so it must not be
+    // rendered independently and duplicated by that snapshot.
+    var superseded_output = "superseded".*;
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 0,
+        .data = &superseded_output,
+    } } }).len);
+
+    const remaining_responses = [_][]const u8{
+        "snapshot",
+        "",
+        "first visible row",
+        "",
+        "first visible row",
+        "",
+    };
+    for (remaining_responses) |response| {
+        try testing.expectEqual(
+            0,
+            viewer.next(.{ .tmux = .{ .block_end = response } }).len,
+        );
+    }
+
+    try testing.expect(viewer.command_queue.empty());
+    try testing.expectEqual(0, viewer.in_flight_responses);
+    const pane = viewer.panes.get(0).?;
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expectEqual(ScreenSet.Key.primary, pane.active_screen);
+    const history = try pane.terminal.screens.active.dumpStringAlloc(
+        testing.allocator,
+        .{ .history = .{} },
+    );
+    defer testing.allocator.free(history);
+    try testing.expect(std.mem.containsAtLeast(u8, history, 1, "Hello, world!"));
+
+    var new_output = "new\\134output".*;
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 0,
+        .data = &new_output,
+    } } }).len);
+    const active = try pane.terminal.screens.active.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(active);
+    try testing.expect(!std.mem.containsAtLeast(u8, active, 1, "superseded"));
+    try testing.expect(std.mem.containsAtLeast(u8, active, 1, "new\\output"));
+
+    const fresh_pane = viewer.panes.get(1).?;
+    try testing.expect(
+        fresh_pane.terminal.screens.active.pages.getBottomRight(.history) == null,
+    );
+    const fresh_active = try fresh_pane.terminal.screens.active.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(fresh_active);
+    try testing.expectEqualStrings("first visible row", fresh_active);
+
+    var pre_topology_suffix = [_]u8{ 0x82, 0xAC };
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &pre_topology_suffix,
+    } } }).len);
+    const fresh_after_suffix = try fresh_pane.terminal.screens.active.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(fresh_after_suffix);
+    try testing.expect(std.mem.containsAtLeast(u8, fresh_after_suffix, 1, "€"));
+
+    var ignored_output = "ignored\\134output".*;
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 999,
+        .data = &ignored_output,
+    } } }).len);
     try testing.expectEqualStrings("ignored\\134output", &ignored_output);
+}
+
+test "untracked UTF-8 allocation failure exits the viewer" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    const original_alloc = viewer.alloc;
+    defer viewer.alloc = original_alloc;
+    viewer.alloc = failing.allocator();
+
+    var prefix = [_]u8{0xE2};
+    const actions = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &prefix,
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(State.defunct, viewer.state);
 }
 
 test "live output preserves UTF-8 split across notifications" {
@@ -1818,6 +2081,7 @@ test "live output preserves UTF-8 split across notifications" {
         .cols = 5,
         .rows = 1,
     });
+    pane.phase = .live;
     viewer.panes.put(testing.allocator, 1, pane) catch |err| {
         pane.deinit(testing.allocator);
         return err;
@@ -1844,6 +2108,7 @@ test "live output preserves CSI split across notifications" {
         .cols = 5,
         .rows = 1,
     });
+    pane.phase = .live;
     viewer.panes.put(testing.allocator, 1, pane) catch |err| {
         pane.deinit(testing.allocator);
         return err;
@@ -1864,9 +2129,99 @@ test "live output preserves CSI split across notifications" {
     try testing.expect(pane.terminal.screens.active.cursor.style.flags.bold);
 }
 
+test "hydration seeds pending VT state before live output" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.receivedPanePending(1, "\\033[1");
+    var suffix = "mX".*;
+    _ = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &suffix,
+    } } });
+
+    const cell = pane.terminal.screens.active.pages.getCell(.{
+        .screen = .{ .x = 0, .y = 0 },
+    }).?.cell;
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
+    try testing.expect(cell.style_id != 0);
+}
+
+test "hydration carries split UTF-8 past an empty pending capture" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    var prefix = [_]u8{0xE2};
+    _ = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &prefix,
+    } } });
+    try viewer.receivedPanePending(1, "");
+
+    var suffix = [_]u8{ 0x82, 0xAC };
+    _ = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &suffix,
+    } } });
+
+    const actual = try pane.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("€", actual);
+}
+
+test "hydration command errors do not become terminal content" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.queueCommands(&.{.{ .pane_history = 1 }});
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try viewer.nextCommandAction(arena.allocator());
+
+    const actions = viewer.next(.{ .tmux = .{ .block_err = "no such pane" } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(Viewer.Pane.Phase.hydrating, pane.phase);
+    const actual = try pane.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("", actual);
+}
+
 test "layout change" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
+    var undiscovered_prefix = [_]u8{0xE2};
 
     try testViewer(&viewer, &.{
         // Initial startup
@@ -1906,6 +2261,14 @@ test "layout change" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // A partial layout notification cannot prove that output for an
+        // undiscovered pane is stale; only a full list-windows cut can.
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 99,
+                .data = &undiscovered_prefix,
+            } } },
+        },
         // Now send a layout_change that splits into two panes
         .{
             .input = .{ .tmux = .{ .layout_change = .{
@@ -1925,6 +2288,7 @@ test "layout change" {
                     try testing.expect(v.panes.contains(2));
                     // Commands should be queued for the new pane (4 capture-pane + 1 pane_state)
                     try testing.expectEqual(5, v.command_queue.len());
+                    try testing.expectEqual(1, v.untracked_utf8.get(99).?.len);
                 }
             }).check,
         },
@@ -2180,183 +2544,76 @@ test "window_add queues list_windows when queue not empty" {
     });
 }
 
-test "two pane flow with pane state" {
+test "alternate pane hydration restores canonical screens" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
+    viewer.state = .command_queue;
 
-    try testViewer(&viewer, &.{
-        // Initial block_end from attach
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // Session changed notification
-        .{
-            .input = .{ .tmux = .{ .session_changed = .{
-                .id = 0,
-                .name = "0",
-            } } },
-            .contains_command = "display-message",
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, v.session_id);
-                }
-            }).check,
-        },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
-        // list-windows output with 2 panes in a vertical split
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
-                ,
-            } },
-            .contains_tags = &.{ .windows, .command },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(1, v.windows.items.len);
-                    const window = v.windows.items[0];
-                    try testing.expectEqual(0, window.id);
-                    try testing.expectEqual(165, window.width);
-                    try testing.expectEqual(79, window.height);
-                    try testing.expectEqual(2, v.panes.count());
-                    try testing.expect(v.panes.contains(0));
-                    try testing.expect(v.panes.contains(4));
-                }
-            }).check,
-        },
-        // capture-pane pane 0 primary history
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\prompt %
-                \\prompt %
-                ,
-            } },
-        },
-        // capture-pane pane 0 primary visible
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\prompt %
-                ,
-            } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
-                    const screen: *Screen = pane.terminal.screens.active;
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .history = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        // History has 2 lines with "prompt %" (padded to screen width)
-                        try testing.expect(std.mem.containsAtLeast(u8, str, 2, "prompt %"));
-                    }
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .active = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        try testing.expectEqualStrings("prompt %", str);
-                    }
-                }
-            }).check,
-        },
-        // capture-pane pane 0 alternate history (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // capture-pane pane 0 alternate visible (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // capture-pane pane 4 primary history
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\prompt %
-                ,
-            } },
-        },
-        // capture-pane pane 4 primary visible
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\prompt %
-                ,
-            } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
-                    const screen: *Screen = pane.terminal.screens.active;
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .history = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        try testing.expectEqualStrings("prompt %", str);
-                    }
-                    {
-                        const str = try screen.dumpStringAlloc(
-                            testing.allocator,
-                            .{ .active = .{} },
-                        );
-                        defer testing.allocator.free(str);
-                        // Active screen starts with "prompt %" at beginning
-                        try testing.expect(std.mem.startsWith(u8, str, "prompt %"));
-                    }
-                }
-            }).check,
-        },
-        // capture-pane pane 4 alternate history (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // capture-pane pane 4 alternate visible (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // list-panes output with terminal state
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                ,
-            } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // Pane 0: cursor at (42, 0), cursor visible, wraparound on
-                    {
-                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
-                        const t: *Terminal = &pane.terminal;
-                        const screen: *Screen = t.screens.get(.primary).?;
-                        try testing.expectEqual(42, screen.cursor.x);
-                        try testing.expectEqual(0, screen.cursor.y);
-                        try testing.expect(t.modes.get(.cursor_visible));
-                        try testing.expect(t.modes.get(.wraparound));
-                        try testing.expect(!t.modes.get(.insert));
-                        try testing.expect(!t.modes.get(.origin));
-                        try testing.expect(!t.modes.get(.keypad_keys));
-                        try testing.expect(!t.modes.get(.cursor_keys));
-                    }
-                    // Pane 4: cursor at (10, 5), cursor visible, wraparound on
-                    {
-                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
-                        const t: *Terminal = &pane.terminal;
-                        const screen: *Screen = t.screens.get(.primary).?;
-                        try testing.expectEqual(10, screen.cursor.x);
-                        try testing.expectEqual(5, screen.cursor.y);
-                        try testing.expect(t.modes.get(.cursor_visible));
-                        try testing.expect(t.modes.get(.wraparound));
-                        try testing.expect(!t.modes.get(.insert));
-                        try testing.expect(!t.modes.get(.origin));
-                        try testing.expect(!t.modes.get(.keypad_keys));
-                        try testing.expect(!t.modes.get(.cursor_keys));
-                    }
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .exit },
-            .contains_tags = &.{.exit},
-        },
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 4,
     });
+    viewer.panes.put(testing.allocator, 7, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.receivedPaneState(
+        "%7;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;0;;;1;1;3;8,16",
+    );
+    try testing.expectEqual(5, pane.cursor.?.x);
+    try testing.expectEqual(2, pane.cursor.?.y);
+    try viewer.receivedPaneHistory(7, "older");
+    try viewer.receivedPaneSavedVisible(7, "primary");
+    try viewer.receivedPaneVisible(7, "alternate\nsecond");
+    try testing.expectEqual(5, pane.cursor.?.x);
+    try testing.expectEqual(2, pane.cursor.?.y);
+    try viewer.receivedPanePending(7, "");
+
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expectEqual(ScreenSet.Key.alternate, pane.active_screen);
+    try testing.expectEqual(pane.terminal.screens.get(.alternate).?, pane.terminal.screens.active);
+    try testing.expectEqual(5, pane.terminal.screens.active.cursor.x);
+    try testing.expectEqual(2, pane.terminal.screens.active.cursor.y);
+    try testing.expectEqual(3, pane.terminal.screens.get(.primary).?.cursor.x);
+    try testing.expectEqual(1, pane.terminal.screens.get(.primary).?.cursor.y);
+    try testing.expect(pane.terminal.modes.get(.origin));
+
+    const primary = try pane.terminal.screens.get(.primary).?.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(primary);
+    try testing.expectEqualStrings("primary", primary);
+
+    const alternate = try pane.terminal.screens.get(.alternate).?.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(alternate);
+    try testing.expectEqualStrings("alternate\nsecond", alternate);
+}
+
+test "visible snapshot preserves styled trailing cells" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 1,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.receivedPaneVisible(1, "\x1b[41mABC  ");
+    try viewer.receivedPanePending(1, "");
+
+    const screen = pane.terminal.screens.active;
+    const first = screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
+    const last = screen.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expect(first.style_id != 0);
+    try testing.expectEqual(first.style_id, last.style_id);
 }
