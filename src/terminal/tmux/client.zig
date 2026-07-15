@@ -84,6 +84,13 @@ pub const ControlClient = struct {
         return self.channel.consumeOutbound(n);
     }
 
+    /// Borrow the canonical session name. The slice remains valid until the
+    /// next `feed` call or `deinit`. Serialize this read with all other
+    /// ControlClient calls.
+    pub fn sessionName(self: *const ControlClient) []const u8 {
+        return self.viewer.session_name;
+    }
+
     /// Retain the canonical terminal for `pane_id`, or return null if that
     /// pane is unknown. Serialize this lookup with other ControlClient calls.
     /// The caller must release the returned owner. It may outlive the pane and
@@ -341,6 +348,30 @@ test "control client sends startup commands before either response" {
             "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
         client.outboundBytes(),
     );
+}
+
+test "control client owns and replaces session name" {
+    const testing = std.testing;
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+
+    var client = try ControlClient.init(tracking.allocator(), .{});
+    var client_live = true;
+    defer if (client_live) client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openReadyTestClient(&client, &actions);
+
+    // Opening the ready client reused the parser storage that supplied the
+    // borrowed notification name.
+    try testing.expectEqualStrings("main", client.sessionName());
+
+    try client.feed("%session-changed $43 replacement\n", &actions);
+
+    try testing.expectEqualStrings("replacement", client.sessionName());
+
+    client.deinit();
+    client_live = false;
+    try testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
 }
 
 test "control client hydrates as one group and keeps later command independent" {

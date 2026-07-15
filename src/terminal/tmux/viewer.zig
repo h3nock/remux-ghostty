@@ -184,6 +184,9 @@ pub const Viewer = struct {
     /// The current session ID we're attached to.
     session_id: usize,
 
+    /// The owned name of the current session.
+    session_name: []const u8,
+
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -399,6 +402,7 @@ pub const Viewer = struct {
             // until we receive a session-changed notification which will
             // set this to a real value.
             .session_id = 0,
+            .session_name = "",
             .tmux_version = "",
             .command_queue = command_queue,
             .sent_command_count = 0,
@@ -426,6 +430,9 @@ pub const Viewer = struct {
             self.panes.deinit(self.alloc);
         }
         self.untracked_utf8.deinit(self.alloc);
+        if (self.session_name.len > 0) {
+            self.alloc.free(self.session_name);
+        }
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
@@ -527,19 +534,27 @@ pub const Viewer = struct {
             .exit => return self.defunct(),
 
             .session_changed => |info| {
-                self.session_id = info.id;
+                const session_name = self.alloc.dupe(u8, info.name) catch {
+                    log.warn("failed to retain session name, becoming defunct", .{});
+                    return self.defunct();
+                };
 
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
                 _ = arena.reset(.free_all);
 
-                return self.enterCommandQueue(
+                const actions = self.enterCommandQueue(
                     arena.allocator(),
                     &.{ .tmux_version, .list_windows },
                 ) catch {
+                    self.alloc.free(session_name);
                     log.warn("failed to queue command, becoming defunct", .{});
                     return self.defunct();
                 };
+
+                self.session_id = info.id;
+                self.session_name = session_name;
+                return actions;
             },
 
             else => return &.{},
@@ -628,6 +643,7 @@ pub const Viewer = struct {
                 self.sessionChanged(
                     &actions,
                     info.id,
+                    info.name,
                 ) catch {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
@@ -1005,10 +1021,17 @@ pub const Viewer = struct {
         self: *Viewer,
         actions: *std.ArrayList(Action),
         session_id: usize,
+        session_name: []const u8,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
         var replacement: Viewer = try .init(self.alloc, self.options);
         errdefer replacement.deinit();
+
+        replacement.session_name = try replacement.alloc.dupe(
+            u8,
+            session_name,
+        );
+        replacement.session_id = session_id;
 
         // Our actions must start out empty so we don't mix arenas
         assert(actions.items.len == 0);
@@ -1034,9 +1057,6 @@ pub const Viewer = struct {
         errdefer comptime unreachable;
         self.deinit();
         self.* = replacement;
-
-        // Set our session ID and jump directly to the list
-        self.session_id = session_id;
 
         assert(self.state == .command_queue);
     }
@@ -2381,6 +2401,7 @@ test "session changed resets state" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.session_id);
+                    try testing.expectEqualStrings("first", v.session_name);
                     try testing.expectEqual(1, v.windows.items.len);
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
@@ -2417,6 +2438,7 @@ test "session changed resets state" {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     // Session ID should be updated
                     try testing.expectEqual(2, v.session_id);
+                    try testing.expectEqualStrings("second", v.session_name);
                     // Windows should be cleared (empty windows action sent)
                     var found_empty_windows = false;
                     for (actions) |action| {
@@ -2485,6 +2507,30 @@ test "session changed with pending commands fails closed" {
     try testing.expectEqual(State.defunct, viewer.state);
 }
 
+test "initial session name allocation failure is atomic" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var viewer = try Viewer.init(failing.allocator(), .{});
+    var viewer_live = true;
+    defer if (viewer_live) viewer.deinit();
+
+    _ = viewer.next(.handshake_ok);
+    failing.fail_index = failing.alloc_index;
+    const actions = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 42,
+        .name = "not-retained",
+    } } });
+
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(State.defunct, viewer.state);
+    try testing.expectEqual(0, viewer.session_id);
+    try testing.expectEqualStrings("", viewer.session_name);
+
+    viewer.deinit();
+    viewer_live = false;
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
 test "initial flow" {
     var viewer = try Viewer.init(testing.allocator, .{
         .history_line_limit = 2_000,
@@ -2503,6 +2549,7 @@ test "initial flow" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(42, v.session_id);
+                    try testing.expectEqualStrings("main", v.session_name);
                 }
             }).check,
         },
