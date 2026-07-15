@@ -17,6 +17,7 @@ pub const CommandToken = enum(u64) { _ };
 pub const CommandSource = enum {
     host,
     viewer,
+    input,
 };
 
 pub const CommandFailure = union(enum) {

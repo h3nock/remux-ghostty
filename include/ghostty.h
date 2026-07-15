@@ -521,6 +521,7 @@ typedef enum {
   GHOSTTY_TMUX_ACTION_TOPOLOGY,
   GHOSTTY_TMUX_ACTION_PANE_CHANGED,
   GHOSTTY_TMUX_ACTION_COMMAND_COMPLETE,
+  GHOSTTY_TMUX_ACTION_INPUT_FAILED,
 } ghostty_tmux_action_tag_e;
 
 typedef enum {
@@ -584,6 +585,7 @@ typedef union {
   ghostty_tmux_topology_action_s topology;
   uint64_t pane_id;
   ghostty_tmux_command_completion_s command;
+  ghostty_tmux_bytes_s input_failure;
 } ghostty_tmux_action_u;
 
 typedef struct {
@@ -1219,11 +1221,11 @@ GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 
 // Sans-I/O tmux control-mode client. The host owns the transport and must
 // serialize all calls for one client. Action payloads, command response
-// bodies, session names, and topology views are borrowed only for the action
-// callback. The callback may visit topology, enqueue commands, read outbound
-// bytes, or retain a pane terminal. It must not feed, consume, or free the
-// client. Reentrant feed is rejected; consume and free are rejected while a
-// callback is active.
+// bodies, input failure bodies, session names, and topology views are borrowed
+// only for the action callback. The callback may visit topology, enqueue
+// commands, send pane input, read outbound bytes, or retain a pane terminal.
+// It must not feed, consume, or free the client. Reentrant feed is rejected;
+// consume and free are rejected while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
     const ghostty_tmux_client_config_s*,
@@ -1263,6 +1265,17 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_enqueue_command_group(
     const ghostty_tmux_bytes_s*,
     size_t,
     uint64_t*);
+
+// Sends already-encoded terminal bytes to a known pane as one standalone
+// send-keys -H command. Every byte is represented as two lowercase hex digits.
+// Empty input is a successful no-op after client and pane validation. A tmux
+// rejection is reported as GHOSTTY_TMUX_ACTION_INPUT_FAILED with a borrowed
+// error body; successful responses do not emit an action.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input(
+    ghostty_tmux_client_t,
+    uint64_t,
+    const uint8_t*,
+    size_t);
 
 // The topology view is valid only during its topology action callback. The
 // visitor receives each window followed by its panes in layout order.

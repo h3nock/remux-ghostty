@@ -36,6 +36,7 @@ pub const ControlClient = struct {
         windows: []const Viewer.Window,
         pane_changed: usize,
         command_complete: CommandCompletion,
+        input_failed: []const u8,
     };
     pub const CommandCompletion = struct {
         token: channel_pkg.CommandToken,
@@ -51,7 +52,7 @@ pub const ControlClient = struct {
     pub const PanePhase = Viewer.Pane.Phase;
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
-        error{ClientFailed};
+        error{ ClientFailed, PaneUnknown };
 
     pub fn init(
         alloc: Allocator,
@@ -72,7 +73,8 @@ pub const ControlClient = struct {
     }
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
-    /// `enqueueCommand`, `enqueueCommandGroup`, or `consumeOutbound` call.
+    /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`, or
+    /// `consumeOutbound` call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -112,6 +114,59 @@ pub const ControlClient = struct {
     ) ?*SharedTerminal {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
         return pane.retainTerminal();
+    }
+
+    /// Send already-encoded terminal bytes to one known pane as an independent
+    /// tmux command. Empty input validates admission and pane identity but
+    /// emits no command. Terminal-mode encoding remains the host's concern.
+    pub fn sendPaneInput(
+        self: *ControlClient,
+        pane_id: usize,
+        bytes: []const u8,
+    ) Error!void {
+        try self.validateCommandAdmission();
+        if (self.channel.state == .handshake) return error.NotReady;
+        if (!self.viewer.panes.contains(pane_id)) return error.PaneUnknown;
+        if (bytes.len == 0) return;
+
+        const prefix = "send-keys -H -t %";
+        var id_buffer: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buffer, "{d}", .{pane_id}) catch
+            unreachable;
+        const encoded_len = std.math.mul(usize, bytes.len, 3) catch
+            return error.OutOfMemory;
+        const command_len = std.math.add(
+            usize,
+            prefix.len + id.len,
+            encoded_len,
+        ) catch return error.OutOfMemory;
+
+        // Normal key sequences stay entirely on the stack. Larger payloads
+        // use one temporary allocation solely to preserve one atomic Channel
+        // command; Channel remains the only owner of queued outbound bytes.
+        var stack: [256]u8 = undefined;
+        const heap = command_len > stack.len;
+        const command = if (heap)
+            try self.channel.alloc.alloc(u8, command_len)
+        else
+            stack[0..command_len];
+        defer if (heap) self.channel.alloc.free(command);
+
+        var offset: usize = 0;
+        @memcpy(command[offset..][0..prefix.len], prefix);
+        offset += prefix.len;
+        @memcpy(command[offset..][0..id.len], id);
+        offset += id.len;
+        const hex = "0123456789abcdef";
+        for (bytes) |byte| {
+            command[offset] = ' ';
+            command[offset + 1] = hex[byte >> 4];
+            command[offset + 2] = hex[byte & 0x0f];
+            offset += 3;
+        }
+        std.debug.assert(offset == command.len);
+
+        _ = try self.channel.enqueueCommandFrom(.input, command);
     }
 
     /// Submit one standalone command as its own newline-delimited group.
@@ -247,6 +302,16 @@ pub const ControlClient = struct {
                         .token = token,
                         .result = host_result,
                     } }),
+                    .input => switch (host_result) {
+                        .success => {},
+                        .error_block => |body| self.emitHost(.{
+                            .input_failed = body,
+                        }),
+                        // Input is admitted only through sendPaneInput as a
+                        // standalone newline group, so it has no skipped
+                        // group members.
+                        .skipped_after_error => unreachable,
+                    },
                 }
             }
 
@@ -302,6 +367,8 @@ pub const ControlClient = struct {
 
 const TestActions = struct {
     records: std.ArrayList(Recorded) = .empty,
+    input_failure_body: [128]u8 = undefined,
+    input_failure_len: usize = 0,
 
     const Recorded = union(enum) {
         exit,
@@ -313,6 +380,7 @@ const TestActions = struct {
             token: channel_pkg.CommandToken,
             cause: channel_pkg.CommandToken,
         },
+        input_failed,
     };
 
     fn deinit(self: *TestActions) void {
@@ -335,6 +403,14 @@ const TestActions = struct {
                     .cause = cause,
                 } },
             },
+            .input_failed => |body| input_failed: {
+                if (body.len > self.input_failure_body.len) {
+                    @panic("input failure body too long");
+                }
+                @memcpy(self.input_failure_body[0..body.len], body);
+                self.input_failure_len = body.len;
+                break :input_failed .input_failed;
+            },
         };
         self.records.append(std.testing.allocator, recorded) catch @panic("OOM");
     }
@@ -355,6 +431,44 @@ fn openReadyTestClient(
         actions,
     );
     actions.records.clearRetainingCapacity();
+}
+
+fn openHydratingPaneTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+) !void {
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "%end 3 3 1\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    actions.input_failure_len = 0;
+}
+
+fn openPaneTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+) !void {
+    try openHydratingPaneTestClient(client, actions);
+    try client.feed(
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n",
+        actions,
+    );
+    actions.records.clearRetainingCapacity();
+    actions.input_failure_len = 0;
 }
 
 test "control client sends startup commands before either response" {
@@ -671,6 +785,108 @@ test "control client exposes pane phase and retained terminal lifetime" {
     const contents = try retained.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("alive", contents);
+}
+
+test "control client serializes exact binary pane input" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    try client.sendPaneInput(0, &.{ 'A', 0x00, 0x1b, 0x7f, 0x80, 0xff });
+    try testing.expectEqualStrings(
+        "send-keys -H -t %0 41 00 1b 7f 80 ff\n",
+        client.outboundBytes(),
+    );
+}
+
+test "control client pane input validates without no-op mutation" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try testing.expectError(error.NotReady, client.sendPaneInput(0, &.{}));
+    try openPaneTestClient(&client, &actions);
+
+    const next_token = client.channel.next_token;
+    try client.sendPaneInput(0, &.{});
+    try testing.expectEqual(next_token, client.channel.next_token);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try testing.expectError(error.PaneUnknown, client.sendPaneInput(99, &.{}));
+    try testing.expectEqual(next_token, client.channel.next_token);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    try client.sendPaneInput(0, "a");
+    try client.sendPaneInput(0, "\n");
+    try testing.expectEqualStrings(
+        "send-keys -H -t %0 61\n" ++
+            "send-keys -H -t %0 0a\n",
+        client.outboundBytes(),
+    );
+}
+
+test "control client pane input completion stays independently correlated" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openHydratingPaneTestClient(&client, &actions);
+
+    const before = try client.enqueueCommand("display-message -p before");
+    try client.sendPaneInput(0, "a");
+    try client.sendPaneInput(0, "b");
+    const after = try client.enqueueCommand("display-message -p after");
+    try client.feed(
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n" ++
+            "%begin 9 9 1\nbefore\n%end 9 9 1\n" ++
+            "%begin 10 10 1\n%end 10 10 1\n" ++
+            "%begin 11 11 1\npane input rejected\n%error 11 11 1\n" ++
+            "%begin 12 12 1\nafter\n%end 12 12 1\n",
+        &actions,
+    );
+
+    try testing.expectEqual(4, actions.records.items.len);
+    try testing.expectEqual(0, actions.records.items[0].pane_changed);
+    try testing.expectEqual(before, actions.records.items[1].command_success);
+    try testing.expect(actions.records.items[2] == .input_failed);
+    try testing.expectEqual(after, actions.records.items[3].command_success);
+    try testing.expectEqualStrings(
+        "pane input rejected",
+        actions.input_failure_body[0..actions.input_failure_len],
+    );
+}
+
+test "control client pane input formatting failure is allocation atomic" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+
+    var client = try ControlClient.init(failing.allocator(), .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const bytes = [_]u8{'x'} ** 128;
+    const next_token = client.channel.next_token;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        client.sendPaneInput(0, &bytes),
+    );
+    try testing.expectEqual(next_token, client.channel.next_token);
+    try testing.expectEqualStrings("", client.outboundBytes());
 }
 
 test "control client submits independent host commands in one outbound buffer" {

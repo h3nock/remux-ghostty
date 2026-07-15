@@ -49,6 +49,7 @@ pub const ActionTag = enum(c_int) {
     topology,
     pane_changed,
     command_complete,
+    input_failed,
 };
 
 pub const CommandStatus = enum(c_int) {
@@ -112,6 +113,7 @@ pub const ActionValue = extern union {
     topology: TopologyAction,
     pane_id: u64,
     command: CommandCompletion,
+    input_failure: Bytes,
 };
 
 pub const Action = extern struct {
@@ -233,6 +235,14 @@ pub const Client = struct {
                 };
                 self.emit(&value);
             },
+
+            .input_failed => |body| {
+                var value: Action = .{
+                    .tag = .input_failed,
+                    .value = .{ .input_failure = .fromSlice(body) },
+                };
+                self.emit(&value);
+            },
         }
     }
 
@@ -351,6 +361,21 @@ export fn ghostty_tmux_client_enqueue_command_group(
     return .ok;
 }
 
+export fn ghostty_tmux_client_send_pane_input(
+    client: ?*Client,
+    pane_id: u64,
+    ptr: ?[*]const u8,
+    len: usize,
+) Result {
+    const value = client orelse return .invalid_input;
+    const id = std.math.cast(usize, pane_id) orelse return .invalid_input;
+    const bytes = (Bytes{ .ptr = ptr, .len = len }).slice() catch
+        return .invalid_input;
+    value.control.sendPaneInput(id, bytes) catch |err|
+        return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_retain_pane_terminal(
     client: ?*Client,
     pane_id: u64,
@@ -441,6 +466,7 @@ fn mapClientError(err: ControlClient.Error) Result {
         error.InvalidCommand => .invalid_command,
         error.InvalidTokenCount => .invalid_input,
         error.TokenExhausted => .token_exhausted,
+        error.PaneUnknown => .pane_unknown,
     };
 }
 
@@ -465,6 +491,9 @@ const TestContext = struct {
     retain_pane_id: ?u64 = null,
     callback_retain_result: Result = .failed,
     retained_terminal: ?*SharedTerminal = null,
+    input_failure_count: usize = 0,
+    input_failure_body: [128]u8 = undefined,
+    input_failure_len: usize = 0,
 
     fn action(
         userdata: ?*anyopaque,
@@ -526,6 +555,16 @@ const TestContext = struct {
                 self.completions[self.completion_count] = value.value.command;
                 self.completion_count += 1;
             },
+            .input_failed => {
+                const body = value.value.input_failure.slice() catch
+                    @panic("invalid input failure body");
+                if (body.len > self.input_failure_body.len) {
+                    @panic("input failure body too long");
+                }
+                @memcpy(self.input_failure_body[0..body.len], body);
+                self.input_failure_len = body.len;
+                self.input_failure_count += 1;
+            },
         }
     }
 
@@ -566,6 +605,30 @@ fn consumeAllTest(client: *Client) !void {
     );
 }
 
+fn openPaneTestClient(client: *Client) !void {
+    try feedTest(
+        client,
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+    );
+    try consumeAllTest(client);
+    try feedTest(
+        client,
+        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "%end 3 3 1\n",
+    );
+    try consumeAllTest(client);
+    try feedTest(
+        client,
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n",
+    );
+}
+
 fn expectStructLayout(comptime Zig: type, comptime C: type) !void {
     try std.testing.expectEqual(@sizeOf(Zig), @sizeOf(C));
     try std.testing.expectEqual(@alignOf(Zig), @alignOf(C));
@@ -596,6 +659,7 @@ test "tmux C client public ABI matches ghostty header" {
     try testing.expectEqual(@as(c_int, @intFromEnum(Result.callback_active)), @as(c_int, c.GHOSTTY_TMUX_RESULT_CALLBACK_ACTIVE));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.exit)), @as(c_int, c.GHOSTTY_TMUX_ACTION_EXIT));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.command_complete)), @as(c_int, c.GHOSTTY_TMUX_ACTION_COMMAND_COMPLETE));
+    try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.input_failed)), @as(c_int, c.GHOSTTY_TMUX_ACTION_INPUT_FAILED));
     try testing.expectEqual(@as(c_int, @intFromEnum(CommandStatus.success)), @as(c_int, c.GHOSTTY_TMUX_COMMAND_SUCCESS));
     try testing.expectEqual(@as(c_int, @intFromEnum(CommandStatus.skipped)), @as(c_int, c.GHOSTTY_TMUX_COMMAND_SKIPPED));
     try testing.expectEqual(@as(c_int, @intFromEnum(PanePhase.hydrating)), @as(c_int, c.GHOSTTY_TMUX_PANE_HYDRATING));
@@ -808,6 +872,74 @@ test "tmux C client transport batching and callback contract" {
     try testing.expectEqual(group_tokens[1], context.completions[2].cause_token);
     try testing.expectEqual(CommandStatus.success, context.completions[3].status);
     try testing.expectEqual(later, context.completions[3].token);
+}
+
+test "tmux C client pane input validation and action mapping" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_send_pane_input(null, 0, null, 0),
+    );
+    try testing.expectEqual(
+        Result.not_ready,
+        ghostty_tmux_client_send_pane_input(&client, 0, null, 0),
+    );
+    try openPaneTestClient(&client);
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_send_pane_input(&client, 0, null, 1),
+    );
+    try testing.expectEqual(
+        Result.pane_unknown,
+        ghostty_tmux_client_send_pane_input(&client, 99, null, 0),
+    );
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_send_pane_input(&client, 0, null, 0),
+    );
+
+    var outbound: Bytes = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_outbound(&client, &outbound),
+    );
+    try testing.expectEqualStrings("", try outbound.slice());
+
+    const binary = [_]u8{ 0x00, 0x1b, 0x80, 0xff };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_send_pane_input(
+            &client,
+            0,
+            &binary,
+            binary.len,
+        ),
+    );
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_outbound(&client, &outbound),
+    );
+    try testing.expectEqualStrings(
+        "send-keys -H -t %0 00 1b 80 ff\n",
+        try outbound.slice(),
+    );
+    try consumeAllTest(&client);
+    try feedTest(
+        &client,
+        "%begin 9 9 1\npane input rejected\n%error 9 9 1\n",
+    );
+    try testing.expectEqual(0, context.completion_count);
+    try testing.expectEqual(1, context.input_failure_count);
+    try testing.expectEqualStrings(
+        "pane input rejected",
+        context.input_failure_body[0..context.input_failure_len],
+    );
 }
 
 test "tmux C client topology and retained terminal lifetime" {
