@@ -522,8 +522,11 @@ pub fn init(
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
-    // Initialize our renderer with our initialized surface.
-    try Renderer.surfaceInit(rt_surface);
+    // The renderer borrows this projection until its thread stops and joins
+    // during deinit. The application-runtime surface storage remains stable
+    // for that full lifetime.
+    const renderer_surface = apprt.rendererSurface(rt_surface);
+    try Renderer.surfaceInit(renderer_surface);
 
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
@@ -597,7 +600,7 @@ pub fn init(
         self.font_metrics = try self.render.init(.{
             .alloc = alloc,
             .config = config,
-            .rt_surface = rt_surface,
+            .rt_surface = renderer_surface,
             .terminal = &self.io.terminal,
             .mutex = mutex,
             .font_grid_set = &app.font_grid_set,

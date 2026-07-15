@@ -399,6 +399,22 @@ pub const PlatformTag = enum(c_int) {
     ios = 2,
 };
 
+/// Renderer-facing state owned by the embedded process surface. Its address
+/// remains stable until the renderer thread has stopped and joined.
+pub const RendererSurface = struct {
+    platform: Platform,
+    content_scale: apprt.ContentScale,
+    size: apprt.SurfaceSize,
+
+    pub fn getSize(self: *const RendererSurface) !apprt.SurfaceSize {
+        return self.size;
+    }
+};
+
+pub inline fn rendererSurface(surface: *Surface) *RendererSurface {
+    return &surface.renderer_surface;
+}
+
 pub const EnvVar = extern struct {
     /// The name of the environment variable.
     key: [*:0]const u8,
@@ -409,11 +425,9 @@ pub const EnvVar = extern struct {
 
 pub const Surface = struct {
     app: *App,
-    platform: Platform,
+    renderer_surface: RendererSurface,
     userdata: ?*anyopaque = null,
     core_surface: CoreSurface,
-    content_scale: apprt.ContentScale,
-    size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
@@ -467,14 +481,16 @@ pub const Surface = struct {
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         self.* = .{
             .app = app,
-            .platform = try .init(opts.platform_tag, opts.platform),
+            .renderer_surface = .{
+                .platform = try .init(opts.platform_tag, opts.platform),
+                .content_scale = .{
+                    .x = @floatCast(opts.scale_factor),
+                    .y = @floatCast(opts.scale_factor),
+                },
+                .size = .{ .width = 800, .height = 600 },
+            },
             .userdata = opts.userdata,
             .core_surface = undefined,
-            .content_scale = .{
-                .x = @floatCast(opts.scale_factor),
-                .y = @floatCast(opts.scale_factor),
-            },
-            .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
         };
 
@@ -648,11 +664,11 @@ pub const Surface = struct {
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
-        return self.content_scale;
+        return self.renderer_surface.content_scale;
     }
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
-        return self.size;
+        return self.renderer_surface.getSize();
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -782,12 +798,14 @@ pub const Surface = struct {
         const x_scaled = @max(1, if (std.math.isNan(x)) 1 else x);
         const y_scaled = @max(1, if (std.math.isNan(y)) 1 else y);
 
-        self.content_scale = .{
+        self.renderer_surface.content_scale = .{
             .x = @floatCast(x_scaled),
             .y = @floatCast(y_scaled),
         };
 
-        self.core_surface.contentScaleCallback(self.content_scale) catch |err| {
+        self.core_surface.contentScaleCallback(
+            self.renderer_surface.content_scale,
+        ) catch |err| {
             log.err("error in content scale callback err={}", .{err});
             return;
         };
@@ -798,15 +816,16 @@ pub const Surface = struct {
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
         // since resizes are expensive.
-        if (self.size.width == width and self.size.height == height) return;
+        if (self.renderer_surface.size.width == width and
+            self.renderer_surface.size.height == height) return;
 
-        self.size = .{
+        self.renderer_surface.size = .{
             .width = width,
             .height = height,
         };
 
         // Call the primary callback.
-        self.core_surface.sizeCallback(self.size) catch |err| {
+        self.core_surface.sizeCallback(self.renderer_surface.size) catch |err| {
             log.err("error in size callback err={}", .{err});
             return;
         };

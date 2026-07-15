@@ -17,4 +17,4 @@ size: renderer.Size,
 event_sink: renderer.EventSink,
 
 /// The apprt surface.
-rt_surface: *apprt.Surface,
+rt_surface: *apprt.RendererSurface,

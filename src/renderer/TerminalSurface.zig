@@ -23,7 +23,7 @@ focused: bool,
 pub const Options = struct {
     alloc: std.mem.Allocator,
     config: *const configpkg.Config,
-    rt_surface: *apprt.Surface,
+    rt_surface: *apprt.RendererSurface,
     shared: *terminal.Shared,
     font_grid_set: *font.SharedGridSet,
     font_config: *const font.SharedGridSet.DerivedConfig,
@@ -37,7 +37,7 @@ pub const Options = struct {
 };
 
 /// Initialize in stable caller-owned storage and start the renderer thread.
-/// The platform surface, font set, config, and event-sink context are borrowed.
+/// The renderer surface, font set, config, and event-sink context are borrowed.
 pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     const shared = opts.shared.retain();
     errdefer shared.release();

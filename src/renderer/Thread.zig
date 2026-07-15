@@ -76,7 +76,7 @@ cursor_c_cancel: xev.Completion = .{},
 compression: Compression = undefined,
 
 /// The surface we're rendering to.
-surface: *apprt.Surface,
+surface: *apprt.RendererSurface,
 
 /// The underlying renderer implementation.
 renderer: *rendererpkg.Renderer,
@@ -138,7 +138,7 @@ pub const InitialState = struct {
 pub fn init(
     alloc: Allocator,
     config: *const configpkg.Config,
-    surface: *apprt.Surface,
+    surface: *apprt.RendererSurface,
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
     event_sink: rendererpkg.EventSink,

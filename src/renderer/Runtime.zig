@@ -23,7 +23,7 @@ os_thread: std.Thread,
 pub const Options = struct {
     alloc: std.mem.Allocator,
     config: *const configpkg.Config,
-    rt_surface: *apprt.Surface,
+    rt_surface: *apprt.RendererSurface,
     terminal: *terminal.Terminal,
     mutex: *std.Thread.Mutex,
     font_grid_set: *font.SharedGridSet,
@@ -39,7 +39,7 @@ pub const Options = struct {
 };
 
 /// Initialize a runtime in stable caller-owned storage. The terminal, mutex,
-/// runtime surface, font-grid set, and event-sink context are borrowed and
+/// renderer surface, font-grid set, and event-sink context are borrowed and
 /// must outlive the runtime. This initializes all renderer resources but does
 /// not start the renderer OS thread.
 pub fn init(self: *Runtime, opts: Options) !font.Metrics {

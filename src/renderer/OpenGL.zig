@@ -159,7 +159,7 @@ fn prepareContext(getProcAddress: anytype) !void {
 }
 
 /// This is called early right after surface creation.
-pub fn surfaceInit(surface: *apprt.Surface) !void {
+pub fn surfaceInit(surface: *apprt.RendererSurface) !void {
     _ = surface;
 
     switch (apprt.runtime) {
@@ -188,13 +188,13 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 
 /// This is called just prior to spinning up the renderer
 /// thread for final main thread setup requirements.
-pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
+pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.RendererSurface) !void {
     _ = self;
     _ = surface;
 }
 
 /// Callback called by renderer.Thread when it begins.
-pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
+pub fn threadEnter(self: *const OpenGL, surface: *apprt.RendererSurface) !void {
     _ = self;
     _ = surface;
 

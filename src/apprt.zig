@@ -50,6 +50,21 @@ pub const runtime = switch (build_config.artifact) {
 
 pub const App = runtime.App;
 pub const Surface = runtime.Surface;
+pub const RendererSurface = if (@hasDecl(runtime, "RendererSurface"))
+    runtime.RendererSurface
+else
+    Surface;
+
+/// Project the application-runtime surface to the surface contract borrowed
+/// by the renderer. Runtimes without a dedicated renderer surface preserve
+/// their existing surface pointer unchanged.
+pub inline fn rendererSurface(surface_: *Surface) *RendererSurface {
+    if (comptime @hasDecl(runtime, "RendererSurface")) {
+        return runtime.rendererSurface(surface_);
+    }
+
+    return surface_;
+}
 
 test {
     _ = Runtime;

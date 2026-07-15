@@ -864,7 +864,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// This is called early right after surface creation.
-        pub fn surfaceInit(surface: *apprt.Surface) !void {
+        pub fn surfaceInit(surface: *apprt.RendererSurface) !void {
             // If our API has to do things here, let it.
             if (@hasDecl(GraphicsAPI, "surfaceInit")) {
                 try GraphicsAPI.surfaceInit(surface);
@@ -873,7 +873,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// This is called just prior to spinning up the renderer thread for
         /// final main thread setup requirements.
-        pub fn finalizeSurfaceInit(self: *Self, surface: *apprt.Surface) !void {
+        pub fn finalizeSurfaceInit(self: *Self, surface: *apprt.RendererSurface) !void {
             // If our API has to do things to finalize surface init, let it.
             if (@hasDecl(GraphicsAPI, "finalizeSurfaceInit")) {
                 try self.api.finalizeSurfaceInit(surface);
@@ -881,7 +881,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Callback called by renderer.Thread when it begins.
-        pub fn threadEnter(self: *const Self, surface: *apprt.Surface) !void {
+        pub fn threadEnter(self: *const Self, surface: *apprt.RendererSurface) !void {
             // If our API has to do things on thread enter, let it.
             if (@hasDecl(GraphicsAPI, "threadEnter")) {
                 try self.api.threadEnter(surface);
