@@ -156,14 +156,17 @@ pub const Channel = struct {
     /// The group controls framing and skip-on-error accounting only. It is
     /// not a transaction and does not imply rollback or liveness. Every text
     /// must independently satisfy `enqueueCommand`'s single-command contract.
+    /// Pass null when the caller does not need the per-member tokens.
     pub fn enqueueCommandGroup(
         self: *Channel,
         texts: []const []const u8,
-        tokens_out: []CommandToken,
+        tokens_out: ?[]CommandToken,
     ) EnqueueError!void {
         try self.validateEnqueue();
         if (texts.len == 0) return error.InvalidCommand;
-        if (tokens_out.len != texts.len) return error.InvalidTokenCount;
+        if (tokens_out) |tokens| {
+            if (tokens.len != texts.len) return error.InvalidTokenCount;
+        }
         try self.ensureTokens(texts.len);
 
         var wire_len: usize = 1;
@@ -183,7 +186,7 @@ pub const Channel = struct {
         try self.ensurePendingCapacity(texts.len);
         try self.ensureOutboundCapacity(wire_len);
 
-        for (texts, tokens_out, 0..) |text, *token_out, i| {
+        for (texts, 0..) |text, i| {
             if (i != 0) self.outbound.appendSliceAssumeCapacity(" ; ");
             self.outbound.appendSliceAssumeCapacity(text);
 
@@ -192,13 +195,13 @@ pub const Channel = struct {
                 .token = token,
                 .ends_group = i + 1 == texts.len,
             });
-            token_out.* = token;
+            if (tokens_out) |tokens| tokens[i] = token;
         }
         self.outbound.appendAssumeCapacity('\n');
     }
 
-    /// Bytes awaiting transport. The slice is valid until the next enqueue or
-    /// consume call.
+    /// Bytes awaiting transport. The slice is valid until the next enqueue,
+    /// feed, or consume call.
     pub fn outboundBytes(self: *const Channel) []const u8 {
         return self.outbound.items[self.outbound_head..];
     }
@@ -761,6 +764,10 @@ test "tmux channel validates enqueue inputs without mutation" {
     );
     try testing.expectEqual(0, channel.pendingCount());
     try testing.expectEqualStrings("", channel.outboundBytes());
+
+    try channel.enqueueCommandGroup(&.{ "one", "two" }, null);
+    try testing.expectEqual(2, channel.pendingCount());
+    try testing.expectEqualStrings("one ; two\n", channel.outboundBytes());
 }
 
 test "tmux channel preserves quoted semicolons in one command" {

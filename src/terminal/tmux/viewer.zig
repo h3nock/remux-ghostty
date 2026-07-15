@@ -191,8 +191,9 @@ pub const Viewer = struct {
     /// Commands waiting for their FIFO-correlated response blocks.
     command_queue: CommandQueue,
 
-    /// Response blocks still expected for the command group already sent.
-    in_flight_responses: usize,
+    /// Commands at the front of `command_queue` that have been emitted but
+    /// have not received their correlated completion yet.
+    sent_command_count: usize,
 
     /// The windows in the current session.
     windows: std.ArrayList(Window),
@@ -228,11 +229,11 @@ pub const Viewer = struct {
         /// our viewer session in some way.
         exit,
 
-        /// Send a command to tmux, e.g. `list-windows`. The caller
-        /// should not worry about parsing this or reading what command
-        /// it is; just send it to tmux as-is. This will include the
-        /// trailing newline so you can send it directly.
-        command: []const u8,
+        /// Send one explicit command group to tmux. Member text is already
+        /// serialized without transport delimiters and is borrowed until the
+        /// next Viewer input. Call `CommandGroup.write` to produce the exact
+        /// tmux wire form when using Viewer without ControlClient.
+        command: CommandGroup,
 
         /// Windows changed. This may add, remove or change windows. The
         /// caller is responsible for diffing the new window list against
@@ -259,10 +260,7 @@ pub const Viewer = struct {
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
                         const value = @field(self, u_field.name);
-                        switch (u_field.type) {
-                            []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
-                            else => try writer.print("{any}", .{value}),
-                        }
+                        try writer.print("{any}", .{value});
                     }
                 }
 
@@ -271,8 +269,40 @@ pub const Viewer = struct {
         }
     };
 
+    pub const CommandGroup = struct {
+        members: []const []const u8,
+
+        /// Serialize one tmux command line: members joined by ` ; ` and one
+        /// trailing newline. Member text itself never contains CR or LF.
+        pub fn write(
+            self: CommandGroup,
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            assert(self.members.len > 0);
+            for (self.members, 0..) |member, i| {
+                assert(member.len > 0);
+                assert(std.mem.indexOfAny(u8, member, "\r\n") == null);
+                if (i != 0) try writer.writeAll(" ; ");
+                try writer.writeAll(member);
+            }
+            try writer.writeByte('\n');
+        }
+    };
+
+    pub const CommandCompletion = union(enum) {
+        success: []const u8,
+        failure,
+    };
+
     pub const Input = union(enum) {
-        /// Data from tmux was received that needs to be processed.
+        /// The implicit control-mode attach command completed successfully.
+        handshake_ok,
+
+        /// Completion of exactly one previously emitted command member.
+        command_complete: CommandCompletion,
+
+        /// Raw tmux input. This is retained as a thin adapter for callers
+        /// using Viewer directly; ControlClient uses the canonical inputs.
         tmux: control.Notification,
     };
 
@@ -362,7 +392,7 @@ pub const Viewer = struct {
             .session_id = 0,
             .tmux_version = "",
             .command_queue = command_queue,
-            .in_flight_responses = 0,
+            .sent_command_count = 0,
             .windows = .empty,
             .panes = .empty,
             .untracked_utf8 = .empty,
@@ -402,7 +432,20 @@ pub const Viewer = struct {
         // an error occurs we must go into a defunct state or some other
         // state to gracefully handle it.
         return switch (input) {
+            .handshake_ok => self.nextHandshakeOk(),
+            .command_complete => |completion| self.nextCommandCompletion(completion),
             .tmux => self.nextTmux(input.tmux),
+        };
+    }
+
+    fn nextHandshakeOk(self: *Viewer) []const Action {
+        return switch (self.state) {
+            .startup_block => handshake: {
+                self.state = .startup_session;
+                break :handshake &.{};
+            },
+            .defunct => &.{},
+            .startup_session, .command_queue => self.defunct(),
         };
     }
 
@@ -418,7 +461,17 @@ pub const Viewer = struct {
 
             .startup_block => self.nextStartupBlock(n),
             .startup_session => self.nextStartupSession(n),
-            .command_queue => self.nextCommand(n),
+            .command_queue => switch (n) {
+                .block_end => |block| if (block.meta.isClient())
+                    self.nextCommandCompletion(.{ .success = block.data })
+                else
+                    &.{},
+                .block_err => |block| if (block.meta.isClient())
+                    self.nextDirectCommandError()
+                else
+                    &.{},
+                else => self.nextCommandNotification(n),
+            },
         };
     }
 
@@ -438,15 +491,13 @@ pub const Viewer = struct {
             // handle this without issue.
             .exit => return self.defunct(),
 
-            // Any begin and end (even error) is fine! Now we wait for
-            // session-changed to get the initial session ID. session-changed
-            // is guaranteed to come after the initial command output
-            // since if the initial command is `attach` tmux will run that,
-            // queue the notification, then do notificatins.
-            .block_end, .block_err => {
-                self.state = .startup_session;
-                return &.{};
-            },
+            // The implicit attach response is always server-originated. A
+            // client block here is unsolicited and must not advance startup.
+            .block_end => |block| return if (block.meta.flags == 0)
+                self.nextHandshakeOk()
+            else
+                self.defunct(),
+            .block_err => return self.defunct(),
 
             // I don't like catch-all else branches but startup is such
             // a special case of looking for very specific things that
@@ -486,26 +537,10 @@ pub const Viewer = struct {
         }
     }
 
-    fn nextIdle(
+    fn nextCommandNotification(
         self: *Viewer,
         n: control.Notification,
     ) []const Action {
-        assert(self.state == .idle);
-
-        switch (n) {
-            .enter => unreachable,
-            .exit => return self.defunct(),
-            else => return &.{},
-        }
-    }
-
-    fn nextCommand(
-        self: *Viewer,
-        n: control.Notification,
-    ) []const Action {
-        // We have to be in a command queue, but the command queue MAY
-        // be empty. If it is empty, then receivedCommandOutput will
-        // handle it by ignoring any command output. That's okay!
         assert(self.state == .command_queue);
 
         // If commands are queued between Viewer calls, their current group is
@@ -539,26 +574,11 @@ pub const Viewer = struct {
         // Setup our empty actions list that commands can populate.
         var actions: std.ArrayList(Action) = .empty;
 
-        // A group can be sent only after every response for the prior group.
-        var can_send_command = self.in_flight_responses == 0;
-
         switch (n) {
             .enter => unreachable,
             .exit => return self.defunct(),
 
-            inline .block_end,
-            .block_err,
-            => |block, tag| {
-                self.receivedCommandOutput(
-                    &actions,
-                    block.data,
-                    tag == .block_err,
-                ) catch {
-                    log.warn("failed to process command output, becoming defunct", .{});
-                    return self.defunct();
-                };
-                can_send_command = self.in_flight_responses == 0;
-            },
+            .block_end, .block_err => unreachable,
 
             .output => unreachable,
 
@@ -566,6 +586,18 @@ pub const Viewer = struct {
             // We need to reset our state and start fresh with list-windows.
             // This completely replaces the viewer, so treat it like a fresh start.
             .session_changed => |info| {
+                // Supported tmux releases queue this notification after the
+                // response blocks of every command that preceded the session
+                // switch. Replacing Viewer with outstanding semantic commands
+                // would silently destroy FIFO correlation, so fail closed if
+                // a future server violates that ordering.
+                if (self.sent_command_count != 0 or !self.command_queue.empty()) {
+                    log.warn(
+                        "session changed with pending commands, becoming defunct sent={} queued={}",
+                        .{ self.sent_command_count, self.command_queue.len() },
+                    );
+                    return self.defunct();
+                }
                 self.sessionChanged(
                     &actions,
                     info.id,
@@ -573,8 +605,6 @@ pub const Viewer = struct {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                can_send_command = true;
             },
 
             // Layout changed of a single window.
@@ -617,28 +647,64 @@ pub const Viewer = struct {
             => {},
         }
 
-        // After processing commands, we add our next command to
-        // execute if we have one. We do this last because command
-        // processing may itself queue more commands. We only emit a
-        // command if a prior command was consumed (or never existed).
-        if (self.state == .command_queue and can_send_command) {
-            var arena = self.action_arena.promote(self.alloc);
-            defer self.action_arena = arena.state;
-            const arena_alloc = arena.allocator();
-            if (self.nextCommandAction(arena_alloc) catch return self.defunct()) |action| {
-                // We should not have any commands, because our nextCommand
-                // always queues them.
-                if (comptime std.debug.runtime_safety) {
-                    for (actions.items) |existing_action| {
-                        if (existing_action == .command) assert(false);
-                    }
-                }
-
-                actions.append(arena_alloc, action) catch return self.defunct();
-            }
+        if (self.state == .command_queue) {
+            self.appendQueuedCommandActions(&actions) catch return self.defunct();
         }
 
         return actions.items;
+    }
+
+    fn nextCommandCompletion(
+        self: *Viewer,
+        completion: CommandCompletion,
+    ) []const Action {
+        if (self.state == .defunct) return &.{};
+        if (self.state != .command_queue) return self.defunct();
+
+        self.resetActionArena();
+        var actions: std.ArrayList(Action) = .empty;
+        self.receivedCommandCompletion(&actions, completion) catch |err| {
+            log.warn("failed to process command completion, becoming defunct: {}", .{err});
+            return self.defunct();
+        };
+        self.appendQueuedCommandActions(&actions) catch return self.defunct();
+        return actions.items;
+    }
+
+    /// Raw tmux emits only one `%error` block for a failed command group.
+    /// Consume the failed member and the remaining members of that same group
+    /// as failures. The canonical ControlClient path receives those as
+    /// separate correlated completion events from Channel instead.
+    fn nextDirectCommandError(self: *Viewer) []const Action {
+        if (self.sent_command_count == 0 or self.command_queue.empty()) {
+            log.warn("unexpected client error block, becoming defunct", .{});
+            return self.defunct();
+        }
+
+        self.resetActionArena();
+        var actions: std.ArrayList(Action) = .empty;
+        var terminal_failure = false;
+        while (true) {
+            const ends_group = self.command_queue.first().?.group_end;
+            self.receivedCommandCompletion(&actions, .failure) catch |err| switch (err) {
+                error.CommandFailed, error.HydrationFailed => terminal_failure = true,
+                else => {
+                    log.warn("failed to process command error, becoming defunct: {}", .{err});
+                    return self.defunct();
+                },
+            };
+            if (ends_group) break;
+        }
+
+        if (terminal_failure) return self.defunct();
+        self.appendQueuedCommandActions(&actions) catch return self.defunct();
+        return actions.items;
+    }
+
+    fn resetActionArena(self: *Viewer) void {
+        var arena = self.action_arena.promote(self.alloc);
+        _ = arena.reset(.free_all);
+        self.action_arena = arena.state;
     }
 
     /// When the layout changes for a single window, a pane may be added
@@ -917,16 +983,12 @@ pub const Viewer = struct {
         assert(self.state == .command_queue);
     }
 
-    fn receivedCommandOutput(
+    fn receivedCommandCompletion(
         self: *Viewer,
         actions: *std.ArrayList(Action),
-        content: []const u8,
-        is_err: bool,
+        completion: CommandCompletion,
     ) !void {
-        if (self.in_flight_responses == 0) {
-            log.info("unexpected block output err={}", .{is_err});
-            return;
-        }
+        if (self.sent_command_count == 0) return error.UnexpectedCommandCompletion;
 
         // Get the command we're expecting output for. We need to get the
         // non-pointer value because we are deleting it from the circular
@@ -944,15 +1006,22 @@ pub const Viewer = struct {
                 v,
             ),
         } else {
-            // If we have no pending commands, this is unexpected.
-            log.info("unexpected block output err={}", .{is_err});
-            return;
+            return error.UnexpectedCommandCompletion;
         };
         self.command_queue.deleteOldest(1);
-        self.in_flight_responses -= 1;
+        self.sent_command_count -= 1;
         defer command.deinit(self.alloc);
 
-        if (is_err and command.isHydration()) return error.HydrationFailed;
+        const content = switch (completion) {
+            .success => |body| body,
+            .failure => {
+                if (command.isHydration()) return error.HydrationFailed;
+                return switch (command) {
+                    .user => {},
+                    else => error.CommandFailed,
+                };
+            },
+        };
 
         // We'll use our arena for the return value here so we can
         // easily accumulate actions.
@@ -1493,8 +1562,8 @@ pub const Viewer = struct {
         }
     }
 
-    /// Enters the command queue state from any other state, queueing
-    /// the commands and returning an action to execute the first command.
+    /// Enters the command queue state from any other state, queueing and
+    /// emitting every complete command group.
     fn enterCommandQueue(
         self: *Viewer,
         arena_alloc: Allocator,
@@ -1508,13 +1577,14 @@ pub const Viewer = struct {
         // Move into the command queue state
         self.state = .command_queue;
 
-        return self.singleAction((try self.nextCommandAction(arena_alloc)).?);
+        var actions: std.ArrayList(Action) = .empty;
+        try self.appendQueuedCommandActionsWithAllocator(&actions, arena_alloc);
+        return actions.items;
     }
 
-    /// Queue multiple commands to execute. This doesn't add anything
-    /// to the actions queue or return actions or anything because the
-    /// command_queue state will automatically send the next command when
-    /// it receives output.
+    /// Queue multiple independent commands. A caller must finish its current
+    /// input by calling `appendQueuedCommandActions` so newly complete groups
+    /// are emitted immediately.
     fn queueCommands(
         self: *Viewer,
         commands: []const Command,
@@ -1531,30 +1601,53 @@ pub const Viewer = struct {
         }
     }
 
-    /// Format and mark the next explicit command group as in flight.
-    fn nextCommandAction(
+    /// Format and emit every complete group that has not already been sent.
+    fn appendQueuedCommandActions(
         self: *Viewer,
+        actions: *std.ArrayList(Action),
+    ) (Allocator.Error || std.Io.Writer.Error)!void {
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try self.appendQueuedCommandActionsWithAllocator(actions, arena.allocator());
+    }
+
+    fn appendQueuedCommandActionsWithAllocator(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
         arena_alloc: Allocator,
-    ) std.Io.Writer.Error!?Action {
-        assert(self.in_flight_responses == 0);
-        if (self.command_queue.empty()) return null;
-
-        var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-        var response_count: usize = 0;
+    ) (Allocator.Error || std.Io.Writer.Error)!void {
+        assert(self.sent_command_count <= self.command_queue.len());
         var it = self.command_queue.iterator(.forward);
-        while (it.next()) |queued| {
-            try queued.command.formatCommand(&builder.writer);
-            response_count += 1;
-            if (queued.group_end) break;
+        it.seekBy(@intCast(self.sent_command_count));
 
-            const buffered = builder.writer.buffered();
-            assert(buffered.len > 0 and buffered[buffered.len - 1] == '\n');
-            builder.writer.undo(1);
-            try builder.writer.writeAll(" ; ");
+        while (it.idx < self.command_queue.len()) {
+            var members: std.ArrayList([]const u8) = .empty;
+            var command_count: usize = 0;
+            var ended_group = false;
+            while (it.next()) |queued| {
+                var builder: std.Io.Writer.Allocating = .init(arena_alloc);
+                try queued.command.formatCommand(&builder.writer);
+                const member = builder.writer.buffered();
+                assert(member.len > 0);
+                assert(std.mem.indexOfAny(u8, member, "\r\n") == null);
+                try members.append(arena_alloc, member);
+                command_count += 1;
+                if (queued.group_end) {
+                    ended_group = true;
+                    break;
+                }
+            }
+
+            assert(members.items.len > 0);
+            assert(ended_group);
+
+            // The sent watermark advances only after both the borrowed group
+            // and its action have been built successfully.
+            try actions.append(arena_alloc, .{ .command = .{
+                .members = members.items,
+            } });
+            self.sent_command_count += command_count;
         }
-
-        self.in_flight_responses = response_count;
-        return .{ .command = builder.writer.buffered() };
     }
 
     /// Helper to return a single action. The input action may use the arena
@@ -1663,16 +1756,14 @@ const Command = union(enum) {
         };
     }
 
-    /// Format the command into the command that should be executed
-    /// by tmux. Trailing newlines are appended so this can be sent as-is
-    /// to tmux.
+    /// Format one command member without transport framing.
     pub fn formatCommand(
         self: Command,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         switch (self) {
             .list_windows => try writer.writeAll(std.fmt.comptimePrint(
-                "list-windows -F '{s}'\n",
+                "list-windows -F '{s}'",
                 .{comptime Format.list_windows.comptimeFormat()},
             )),
 
@@ -1682,12 +1773,12 @@ const Command = union(enum) {
                 if (capture.line_limit) |limit| {
                     assert(limit > 0);
                     try writer.print(
-                        "capture-pane -p -e -N -q -S -{d} -E -1 -t %{d}\n",
+                        "capture-pane -p -e -N -q -S -{d} -E -1 -t %{d}",
                         .{ limit, capture.id },
                     );
                 } else {
                     try writer.print(
-                        "capture-pane -p -e -N -q -S - -E -1 -t %{d}\n",
+                        "capture-pane -p -e -N -q -S - -E -1 -t %{d}",
                         .{capture.id},
                     );
                 }
@@ -1699,30 +1790,30 @@ const Command = union(enum) {
                 // -N = preserve trailing cells and their styles
                 // -a = capture the saved primary screen behind alternate
                 // -q = return empty if no saved screen exists
-                "capture-pane -p -e -N -a -q -t %{d}\n",
+                "capture-pane -p -e -N -a -q -t %{d}",
                 .{id},
             ),
 
             .pane_visible => |id| try writer.print(
                 // -N preserves styled trailing cells in the current grid.
-                "capture-pane -p -e -N -q -t %{d}\n",
+                "capture-pane -p -e -N -q -t %{d}",
                 .{id},
             ),
 
             .pane_pending => |id| try writer.print(
                 // -P = pending output not yet written to the pane
                 // -C = octal-escape non-printable bytes
-                "capture-pane -p -P -C -t %{d}\n",
+                "capture-pane -p -P -C -t %{d}",
                 .{id},
             ),
 
             .pane_state => try writer.writeAll(std.fmt.comptimePrint(
-                "list-panes -s -F '{s}'\n",
+                "list-panes -s -F '{s}'",
                 .{comptime Format.list_panes.comptimeFormat()},
             )),
 
             .tmux_version => try writer.writeAll(std.fmt.comptimePrint(
-                "display-message -p '{s}'\n",
+                "display-message -p '{s}'",
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
 
@@ -1825,10 +1916,22 @@ const TestStep = struct {
     fn run(self: TestStep, viewer: *Viewer) !void {
         const actions = viewer.next(self.input);
 
-        // Common mistake, forgetting the newline on a command.
+        // Member text is unframed; the group writer owns separators and the
+        // single transport newline.
         for (actions) |action| {
             if (action == .command) {
-                try testing.expect(std.mem.endsWith(u8, action.command, "\n"));
+                for (action.command.members) |member| {
+                    try testing.expect(member.len > 0);
+                    try testing.expect(std.mem.indexOfAny(u8, member, "\r\n") == null);
+                }
+                var serialized: std.Io.Writer.Allocating = .init(testing.allocator);
+                defer serialized.deinit();
+                try action.command.write(&serialized.writer);
+                try testing.expect(std.mem.endsWith(
+                    u8,
+                    serialized.writer.buffered(),
+                    "\n",
+                ));
             }
         }
 
@@ -1847,7 +1950,11 @@ const TestStep = struct {
             var found = false;
             for (actions) |action| {
                 if (action == .command and
-                    std.mem.startsWith(u8, action.command, self.contains_command))
+                    std.mem.startsWith(
+                        u8,
+                        action.command.members[0],
+                        self.contains_command,
+                    ))
                 {
                     found = true;
                     break;
@@ -1865,7 +1972,10 @@ const TestStep = struct {
             for (actions) |action| {
                 if (action == .command) {
                     found = true;
-                    try check_fn(viewer, action.command);
+                    var serialized: std.Io.Writer.Allocating = .init(testing.allocator);
+                    defer serialized.deinit();
+                    try action.command.write(&serialized.writer);
+                    try check_fn(viewer, serialized.writer.buffered());
                 }
             }
             try testing.expect(found);
@@ -1908,7 +2018,7 @@ test "unsupported tmux exits before topology hydration" {
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -1937,7 +2047,7 @@ test "zero history limit omits initial history capture" {
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -1947,7 +2057,6 @@ test "zero history limit omits initial history capture" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.1") } },
-            .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .{
@@ -1986,6 +2095,27 @@ test "immediate exit" {
     });
 }
 
+test "direct viewer accepts only the server attach block" {
+    var server_viewer = try Viewer.init(testing.allocator, .{});
+    defer server_viewer.deinit();
+    var server_block = testClientBlock("");
+    server_block.meta.flags = 0;
+    try testing.expectEqual(
+        0,
+        server_viewer.next(.{ .tmux = .{ .block_end = server_block } }).len,
+    );
+    try testing.expectEqual(State.startup_session, server_viewer.state);
+
+    var client_viewer = try Viewer.init(testing.allocator, .{});
+    defer client_viewer.deinit();
+    const actions = client_viewer.next(.{ .tmux = .{
+        .block_end = testClientBlock(""),
+    } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(State.defunct, client_viewer.state);
+}
+
 test "session changed resets state" {
     var viewer = try Viewer.init(testing.allocator, .{
         .history_line_limit = 2_000,
@@ -1994,7 +2124,7 @@ test "session changed resets state" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2005,7 +2135,6 @@ test "session changed resets state" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive window layout with two panes (same format as "initial flow" test)
         .{
@@ -2025,6 +2154,24 @@ test "session changed resets state" {
                 }
             }).check,
         },
+        // tmux queues session-change notifications after all command response
+        // blocks that preceded the switch. Drain the pane hydration group
+        // before injecting the notification below.
+        .{
+            .input = .{ .tmux = .{ .block_end = testClientBlock(
+                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;19;8,16
+                \\%1;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+                ,
+            ) } },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         // Now session changes - should reset everything but keep version
         .{
             .input = .{ .tmux = .{ .session_changed = .{
@@ -2082,6 +2229,29 @@ test "session changed resets state" {
     });
 }
 
+test "session changed with pending commands fails closed" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+
+    _ = viewer.next(.handshake_ok);
+    const startup = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 1,
+        .name = "first",
+    } } });
+    try testing.expectEqual(2, startup.len);
+    try testing.expect(startup[0] == .command);
+    try testing.expect(startup[1] == .command);
+    try testing.expectEqual(2, viewer.sent_command_count);
+
+    const actions = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 2,
+        .name = "second",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(State.defunct, viewer.state);
+}
+
 test "initial flow" {
     var viewer = try Viewer.init(testing.allocator, .{
         .history_line_limit = 2_000,
@@ -2090,7 +2260,7 @@ test "initial flow" {
     var pre_topology_prefix = [_]u8{0xE2};
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 42,
@@ -2105,7 +2275,6 @@ test "initial flow" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
@@ -2205,7 +2374,7 @@ test "initial flow" {
     }
 
     try testing.expect(viewer.command_queue.empty());
-    try testing.expectEqual(0, viewer.in_flight_responses);
+    try testing.expectEqual(0, viewer.sent_command_count);
     const pane = viewer.panes.get(0).?;
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.primary, pane.active_screen);
@@ -2457,7 +2626,11 @@ test "hydration command errors do not become terminal content" {
     } }});
     var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    _ = try viewer.nextCommandAction(arena.allocator());
+    var queued_actions: std.ArrayList(Viewer.Action) = .empty;
+    try viewer.appendQueuedCommandActionsWithAllocator(
+        &queued_actions,
+        arena.allocator(),
+    );
 
     const actions = viewer.next(.{ .tmux = .{ .block_err = testClientBlock("no such pane") } });
     try testing.expectEqual(1, actions.len);
@@ -2468,13 +2641,71 @@ test "hydration command errors do not become terminal content" {
     try testing.expectEqualStrings("", actual);
 }
 
+test "direct viewer server block does not consume a command" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+
+    _ = viewer.next(.handshake_ok);
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 1,
+        .name = "main",
+    } } });
+    try testing.expectEqual(2, viewer.sent_command_count);
+
+    var server_block = testClientBlock("server");
+    server_block.meta.flags = 0;
+    try testing.expectEqual(
+        0,
+        viewer.next(.{ .tmux = .{ .block_end = server_block } }).len,
+    );
+    try testing.expectEqual(2, viewer.sent_command_count);
+}
+
+test "direct viewer group error preserves later group" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    try viewer.command_queue.ensureUnusedCapacity(testing.allocator, 3);
+    for ([_]bool{ false, true, true }, 0..) |group_end, i| {
+        const text = try testing.allocator.dupe(
+            u8,
+            if (i == 2) "later" else "group",
+        );
+        viewer.command_queue.appendAssumeCapacity(.{
+            .command = .{ .user = text },
+            .group_end = group_end,
+        });
+    }
+    viewer.sent_command_count = 3;
+
+    try testing.expectEqual(
+        0,
+        viewer.next(.{ .tmux = .{
+            .block_err = testClientBlock("failed"),
+        } }).len,
+    );
+    try testing.expectEqual(State.command_queue, viewer.state);
+    try testing.expectEqual(1, viewer.command_queue.len());
+    try testing.expectEqual(1, viewer.sent_command_count);
+
+    try testing.expectEqual(
+        0,
+        viewer.next(.{ .tmux = .{
+            .block_end = testClientBlock("ok"),
+        } }).len,
+    );
+    try testing.expect(viewer.command_queue.empty());
+    try testing.expectEqual(0, viewer.sent_command_count);
+}
+
 test "zoomed geometry follows visible layout" {
     var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     const full_layout = "607b,83x44,0,0[83x22,0,0,0,83x21,0,23,1]";
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2484,7 +2715,6 @@ test "zoomed geometry follows visible layout" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.1") } },
-            .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .{
@@ -2555,7 +2785,7 @@ test "layout change" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2566,7 +2796,6 @@ test "layout change" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
@@ -2630,13 +2859,13 @@ test "layout change" {
     });
 }
 
-test "layout_change does not return command when queue not empty" {
+test "layout_change emits a new group while another group is pending" {
     var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2647,7 +2876,6 @@ test "layout_change does not return command when queue not empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
@@ -2664,9 +2892,8 @@ test "layout_change does not return command when queue not empty" {
                 }
             }).check,
         },
-        // Do NOT complete capture-pane commands - queue still has commands.
-        // Send a layout_change that splits into two panes.
-        // This should NOT return a command action since queue was not empty.
+        // Do NOT complete capture-pane commands. A new pane still produces an
+        // independent hydration group immediately.
         .{
             .input = .{ .tmux = .{ .layout_change = .{
                 .window_id = 0,
@@ -2674,14 +2901,12 @@ test "layout_change does not return command when queue not empty" {
                 .visible_layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
                 .raw_flags = "*",
             } } },
-            .contains_tags = &.{.windows},
+            .contains_tags = &.{ .windows, .command },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(2, v.panes.count());
-                    // Should not contain a command action
-                    for (actions) |action| {
-                        try testing.expect(action != .command);
-                    }
+                    try testing.expectEqual(2, actions.len);
+                    try testing.expectEqual(v.command_queue.len(), v.sent_command_count);
                 }
             }).check,
         },
@@ -2698,7 +2923,7 @@ test "layout_change returns command when queue was empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2709,7 +2934,6 @@ test "layout_change returns command when queue was empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
@@ -2766,7 +2990,7 @@ test "window_add queues list_windows when queue empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2777,7 +3001,6 @@ test "window_add queues list_windows when queue empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
@@ -2822,13 +3045,13 @@ test "window_add queues list_windows when queue empty" {
     });
 }
 
-test "window_add queues list_windows when queue not empty" {
+test "window_add emits list_windows while another group is pending" {
     var viewer = try Viewer.init(testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .handshake_ok },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2839,7 +3062,6 @@ test "window_add queues list_windows when queue not empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
-            .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
@@ -2857,35 +3079,30 @@ test "window_add queues list_windows when queue not empty" {
                 }
             }).check,
         },
-        // Do NOT complete capture-pane commands - queue still has commands.
-        // Send window_add - should queue list-windows but NOT return command action
+        // Do NOT complete capture-pane commands. The independent window
+        // refresh is still emitted immediately.
         .{
             .input = .{ .tmux = .{ .window_add = .{ .id = 1 } } },
+            .contains_command = "list-windows",
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // Should not contain a command action since queue was not empty
-                    for (actions) |action| {
-                        try testing.expect(action != .command);
-                    }
-                    // But list_windows should be in the queue
-                    try testing.expect(!v.command_queue.empty());
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(v.command_queue.len(), v.sent_command_count);
                 }
             }).check,
         },
-        // Finish the in-flight hydration group. The final pending response
-        // publishes readiness before dispatching the queued window refresh.
+        // Finish hydration. The already-emitted window refresh is not emitted
+        // a second time.
         .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock("") } },
-            .contains_command = "list-windows",
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(2, actions.len);
+                    try testing.expectEqual(1, actions.len);
                     try testing.expectEqual(0, actions[0].pane_changed);
-                    try testing.expect(actions[1] == .command);
                 }
             }).check,
         },
