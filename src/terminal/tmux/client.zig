@@ -48,6 +48,7 @@ pub const ControlClient = struct {
         };
     };
     pub const Options = Viewer.Options;
+    pub const PanePhase = Viewer.Pane.Phase;
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
         error{ClientFailed};
@@ -71,7 +72,7 @@ pub const ControlClient = struct {
     }
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
-    /// `enqueueCommandGroup`, or `consumeOutbound` call.
+    /// `enqueueCommand`, `enqueueCommandGroup`, or `consumeOutbound` call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -91,6 +92,16 @@ pub const ControlClient = struct {
         return self.viewer.session_name;
     }
 
+    /// Return the canonical hydration phase for `pane_id`, or null if that
+    /// pane is unknown. Serialize this read with all other ControlClient calls.
+    pub fn panePhase(
+        self: *const ControlClient,
+        pane_id: usize,
+    ) ?PanePhase {
+        const pane = self.viewer.panes.get(pane_id) orelse return null;
+        return pane.phase;
+    }
+
     /// Retain the canonical terminal for `pane_id`, or return null if that
     /// pane is unknown. Serialize this lookup with other ControlClient calls.
     /// The caller must release the returned owner. It may outlive the pane and
@@ -103,6 +114,16 @@ pub const ControlClient = struct {
         return pane.retainTerminal();
     }
 
+    /// Submit one standalone command as its own newline-delimited group.
+    /// The returned token later identifies its host completion.
+    pub fn enqueueCommand(
+        self: *ControlClient,
+        text: []const u8,
+    ) Error!channel_pkg.CommandToken {
+        try self.validateCommandAdmission();
+        return self.channel.enqueueCommand(text);
+    }
+
     /// Submit one standalone command (`members.len == 1`) or one
     /// semicolon-dependent command group. Repeated calls are independent
     /// newline groups and share Channel's contiguous outbound buffer. One
@@ -112,15 +133,21 @@ pub const ControlClient = struct {
         members: []const []const u8,
         tokens_out: []channel_pkg.CommandToken,
     ) Error!void {
+        try self.validateCommandAdmission();
+        if (tokens_out.len != members.len) return error.InvalidTokenCount;
+        if (members.len == 0) return error.InvalidCommand;
+
+        try self.channel.enqueueCommandGroup(members, tokens_out);
+    }
+
+    fn validateCommandAdmission(
+        self: *const ControlClient,
+    ) error{ ChannelClosed, ClientFailed }!void {
         switch (self.state) {
             .active => {},
             .closed => return error.ChannelClosed,
             .failed => return error.ClientFailed,
         }
-        if (tokens_out.len != members.len) return error.InvalidTokenCount;
-        if (members.len == 0) return error.InvalidCommand;
-
-        try self.channel.enqueueCommandGroup(members, tokens_out);
     }
 
     /// Process bytes received from a tmux control-mode connection.
@@ -587,7 +614,7 @@ test "control client malformed stream exits" {
     try testing.expectEqual(1, actions.records.items.len);
 }
 
-test "control client retained pane terminal outlives client" {
+test "control client exposes pane phase and retained terminal lifetime" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.allocator, .{});
@@ -596,6 +623,7 @@ test "control client retained pane terminal outlives client" {
     var actions: TestActions = .{};
     defer actions.deinit();
 
+    try testing.expect(client.panePhase(99) == null);
     try testing.expect(client.retainPaneTerminal(99) == null);
 
     try client.feed(
@@ -606,6 +634,23 @@ test "control client retained pane terminal outlives client" {
             "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
             "%end 3 3 1\n",
         &actions,
+    );
+    try testing.expectEqual(
+        ControlClient.PanePhase.hydrating,
+        client.panePhase(0).?,
+    );
+
+    try client.feed(
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n",
+        &actions,
+    );
+    try testing.expectEqual(
+        ControlClient.PanePhase.live,
+        client.panePhase(0).?,
     );
 
     const retained = client.retainPaneTerminal(0).?;
@@ -637,10 +682,8 @@ test "control client submits independent host commands in one outbound buffer" {
     defer actions.deinit();
     try openReadyTestClient(&client, &actions);
 
-    var first: [1]channel_pkg.CommandToken = undefined;
-    var second: [1]channel_pkg.CommandToken = undefined;
-    try client.enqueueCommandGroup(&.{"display-message -p one"}, &first);
-    try client.enqueueCommandGroup(&.{"display-message -p two"}, &second);
+    const first = try client.enqueueCommand("display-message -p one");
+    const second = try client.enqueueCommand("display-message -p two");
     try testing.expectEqualStrings(
         "display-message -p one\ndisplay-message -p two\n",
         client.outboundBytes(),
@@ -652,8 +695,8 @@ test "control client submits independent host commands in one outbound buffer" {
         &actions,
     );
     try testing.expectEqual(2, actions.records.items.len);
-    try testing.expectEqual(first[0], actions.records.items[0].command_success);
-    try testing.expectEqual(second[0], actions.records.items[1].command_success);
+    try testing.expectEqual(first, actions.records.items[0].command_success);
+    try testing.expectEqual(second, actions.records.items[1].command_success);
 }
 
 test "control client host group failure preserves later independent command" {
