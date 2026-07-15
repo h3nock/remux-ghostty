@@ -58,6 +58,11 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+typedef struct ghostty_terminal* ghostty_terminal_t;
+
+// Opaque handles for the sans-I/O tmux control-mode embedding API.
+typedef struct ghostty_tmux_client* ghostty_tmux_client_t;
+typedef const struct ghostty_tmux_topology_view* ghostty_tmux_topology_view_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -487,6 +492,119 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
+
+// tmux control-mode embedding types
+
+typedef enum {
+  GHOSTTY_TMUX_RESULT_OK,
+  GHOSTTY_TMUX_RESULT_INVALID_INPUT,
+  GHOSTTY_TMUX_RESULT_OUT_OF_MEMORY,
+  GHOSTTY_TMUX_RESULT_NOT_READY,
+  GHOSTTY_TMUX_RESULT_CLOSED,
+  GHOSTTY_TMUX_RESULT_CLIENT_FAILED,
+  GHOSTTY_TMUX_RESULT_REENTRANT_FEED,
+  GHOSTTY_TMUX_RESULT_INVALID_COMMAND,
+  GHOSTTY_TMUX_RESULT_TOKEN_EXHAUSTED,
+  GHOSTTY_TMUX_RESULT_INVALID_CONSUMPTION,
+  GHOSTTY_TMUX_RESULT_PANE_UNKNOWN,
+  GHOSTTY_TMUX_RESULT_CALLBACK_ACTIVE,
+} ghostty_tmux_result_e;
+
+typedef struct {
+  const uint8_t* ptr;
+  size_t len;
+} ghostty_tmux_bytes_s;
+
+typedef enum {
+  GHOSTTY_TMUX_ACTION_EXIT,
+  GHOSTTY_TMUX_ACTION_TOPOLOGY,
+  GHOSTTY_TMUX_ACTION_PANE_CHANGED,
+  GHOSTTY_TMUX_ACTION_COMMAND_COMPLETE,
+} ghostty_tmux_action_tag_e;
+
+typedef enum {
+  GHOSTTY_TMUX_COMMAND_SUCCESS,
+  GHOSTTY_TMUX_COMMAND_ERROR_BLOCK,
+  GHOSTTY_TMUX_COMMAND_SKIPPED,
+} ghostty_tmux_command_status_e;
+
+typedef enum {
+  GHOSTTY_TMUX_PANE_HYDRATING,
+  GHOSTTY_TMUX_PANE_LIVE,
+} ghostty_tmux_pane_phase_e;
+
+typedef enum {
+  GHOSTTY_TMUX_TOPOLOGY_WINDOW,
+  GHOSTTY_TMUX_TOPOLOGY_PANE,
+} ghostty_tmux_topology_record_tag_e;
+
+typedef struct {
+  uint64_t id;
+  bool active;
+  bool zoomed;
+  size_t width;
+  size_t height;
+  uint64_t active_pane_id;
+} ghostty_tmux_window_record_s;
+
+typedef struct {
+  uint64_t id;
+  uint64_t window_id;
+  size_t x;
+  size_t y;
+  size_t width;
+  size_t height;
+  ghostty_tmux_pane_phase_e phase;
+} ghostty_tmux_pane_record_s;
+
+typedef union {
+  ghostty_tmux_window_record_s window;
+  ghostty_tmux_pane_record_s pane;
+} ghostty_tmux_topology_record_u;
+
+typedef struct {
+  ghostty_tmux_topology_record_tag_e tag;
+  ghostty_tmux_topology_record_u value;
+} ghostty_tmux_topology_record_s;
+
+typedef struct {
+  uint64_t token;
+  ghostty_tmux_command_status_e status;
+  ghostty_tmux_bytes_s body;
+  uint64_t cause_token;
+} ghostty_tmux_command_completion_s;
+
+typedef struct {
+  ghostty_tmux_topology_view_t view;
+  ghostty_tmux_bytes_s session_name;
+} ghostty_tmux_topology_action_s;
+
+typedef union {
+  ghostty_tmux_topology_action_s topology;
+  uint64_t pane_id;
+  ghostty_tmux_command_completion_s command;
+} ghostty_tmux_action_u;
+
+typedef struct {
+  ghostty_tmux_action_tag_e tag;
+  ghostty_tmux_action_u value;
+} ghostty_tmux_action_s;
+
+typedef void (*ghostty_tmux_action_cb)(void*, const ghostty_tmux_action_s*);
+typedef void (*ghostty_tmux_topology_visitor_cb)(
+    void*,
+    const ghostty_tmux_topology_record_s*);
+
+typedef struct {
+  void* userdata;
+  ghostty_tmux_action_cb action_cb;
+  // Unset requests all available remote history. Set with zero skips the
+  // remote history capture.
+  bool history_line_limit_is_set;
+  size_t history_line_limit;
+  // Local terminal scrollback capacity in bytes. Zero disables scrollback.
+  size_t max_scrollback;
+} ghostty_tmux_client_config_s;
 
 // Config types
 
@@ -1066,6 +1184,69 @@ GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
+
+// Sans-I/O tmux control-mode client. The host owns the transport and must
+// serialize all calls for one client. Action payloads, command response
+// bodies, session names, and topology views are borrowed only for the action
+// callback. The callback may visit topology, enqueue commands, read outbound
+// bytes, or retain a pane terminal. It must not feed, consume, or free the
+// client. Reentrant feed is rejected; consume and free are rejected while a
+// callback is active.
+GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
+    const ghostty_tmux_client_config_s*,
+    ghostty_tmux_client_t*);
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_free(
+    ghostty_tmux_client_t);
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_feed(
+    ghostty_tmux_client_t,
+    const uint8_t*,
+    size_t);
+
+// The returned outbound bytes are borrowed until the next feed, enqueue,
+// consume, or free call. Outbound read inside an action callback is valid only
+// for that callback and is invalidated immediately by a callback enqueue; the
+// active feed may also enqueue after the callback returns. Hosts should
+// normally read outbound after feed returns. A transport may consume a
+// successfully written prefix and retrieve the remaining suffix again.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_outbound(
+    ghostty_tmux_client_t,
+    ghostty_tmux_bytes_s*);
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_consume(
+    ghostty_tmux_client_t,
+    size_t);
+
+// A standalone command is emitted as one newline-delimited command group.
+// Repeated calls share the same outbound buffer and may be written together.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_enqueue_command(
+    ghostty_tmux_client_t,
+    ghostty_tmux_bytes_s,
+    uint64_t*);
+
+// Members are joined with semicolons into one dependent tmux command group.
+// Each returned token receives an ordered completion. If one member errors,
+// later members are reported as SKIPPED with cause_token identifying it.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_enqueue_command_group(
+    ghostty_tmux_client_t,
+    const ghostty_tmux_bytes_s*,
+    size_t,
+    uint64_t*);
+
+// The topology view is valid only during its topology action callback. The
+// visitor receives each window followed by its panes in layout order.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_topology_visit(
+    ghostty_tmux_topology_view_t,
+    void*,
+    ghostty_tmux_topology_visitor_cb);
+
+// A retained pane terminal is the canonical Ghostty terminal owned by the
+// control client, not a copy. It may outlive its pane and client and must be
+// released exactly once by the caller.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_retain_pane_terminal(
+    ghostty_tmux_client_t,
+    uint64_t,
+    ghostty_terminal_t*);
+GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);

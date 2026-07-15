@@ -43,6 +43,9 @@ comptime {
     // Our benchmark API. We probably want to gate this on a build
     // config in the future but for now we always just export it.
     _ = @import("benchmark/main.zig").CApi;
+
+    // Sans-I/O tmux control-mode embedding API.
+    _ = @import("terminal/tmux/c.zig");
 }
 
 /// ghostty_info_s
