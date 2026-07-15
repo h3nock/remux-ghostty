@@ -94,7 +94,7 @@ pub const Parser = struct {
             // Return an exit notification.
             .idle => if (byte != '%') {
                 self.broken();
-                return .{ .exit = {} };
+                return .{ .exit = &.{} };
             } else {
                 self.buffer.clearRetainingCapacity();
                 self.state = .notification;
@@ -228,7 +228,7 @@ pub const Parser = struct {
             const guard = parseBlockGuard(line) orelse {
                 log.warn("invalid tmux block guard line=\"{s}\"", .{line});
                 self.broken();
-                return .exit;
+                return .{ .exit = &.{} };
             };
             assert(guard.kind == .begin);
 
@@ -239,9 +239,11 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             return null;
         } else if (std.mem.eql(u8, cmd, "%exit")) {
-            self.buffer.clearRetainingCapacity();
+            const detail = std.mem.trimLeft(u8, line[cmd.len..], " \t");
+
+            // Important: do not clear the buffer because detail points into it.
             self.state = .idle;
-            return .exit;
+            return .{ .exit = detail };
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
             // Pane output is an opaque byte stream. Tmux may split UTF-8
             // sequences across notifications, so only parse the ASCII header.
@@ -626,14 +628,9 @@ pub const Notification = union(enum) {
     /// tmux control mode is starting.
     enter,
 
-    /// Exit.
-    ///
-    /// NOTE: The tmux protocol contains a "reason" string (human friendly)
-    /// associated with this. We currently drop it because we don't need it
-    /// but this may be something we want to add later. If we do add it,
-    /// we have to consider buffer limits and how we handle those (dropping
-    /// vs truncating, etc.).
-    exit,
+    /// Exit with tmux's optional human-readable detail. The slice borrows
+    /// parser storage until the next input byte.
+    exit: []const u8,
 
     /// Dispatched at the end of a begin/end block with the raw data and the
     /// guard metadata needed to distinguish client responses from blocks
@@ -765,20 +762,28 @@ test "tmux begin/end empty" {
     );
 }
 
-test "tmux exit" {
+test "tmux exit preserves optional detail until later input" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    for ([_][]const u8{ "%exit\n", "%exit detached\r\n" }) |input| {
+    for ([_]struct { input: []const u8, detail: []const u8 }{
+        .{ .input = "%exit\n", .detail = "" },
+        .{ .input = "%exit detached\r\n", .detail = "detached" },
+    }) |case| {
         var c: Parser = .{ .buffer = .init(alloc) };
         defer c.deinit();
 
         var notification: ?Notification = null;
-        for (input) |byte| {
+        for (case.input) |byte| {
             if (try c.put(byte)) |value| notification = value;
         }
 
         try testing.expect(notification.? == .exit);
+        try testing.expectEqualStrings(case.detail, notification.?.exit);
+
+        // The next notification may reuse parser storage only after the
+        // synchronous consumer has finished with the exit detail.
+        for ("%sessions-changed\n") |byte| _ = try c.put(byte);
     }
 }
 
@@ -922,6 +927,7 @@ test "tmux malformed begin guard breaks the parser" {
     }
     const notification = (try c.put('\n')).?;
     try testing.expect(notification == .exit);
+    try testing.expectEqualStrings("", notification.exit);
     try testing.expect(c.isBroken());
     try testing.expect(try c.put('%') == null);
 }

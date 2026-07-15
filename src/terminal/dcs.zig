@@ -167,7 +167,7 @@ pub const Handler = struct {
 
             .tmux => if (comptime build_options.tmux_control_mode) tmux: {
                 self.state.deinit();
-                break :tmux .{ .tmux = .exit };
+                break :tmux .{ .tmux = .{ .exit = &.{} } };
             } else unreachable,
 
             .xtgettcap => |*list| xtgettcap: {

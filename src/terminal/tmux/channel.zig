@@ -62,7 +62,7 @@ pub const Event = union(enum) {
 
     /// The server ended control mode cleanly. Pending command failures are
     /// emitted before this terminal event.
-    exited,
+    exited: []const u8,
 
     /// The channel encountered a terminal protocol or framing failure.
     /// Pending command failures are emitted before this terminal event.
@@ -356,10 +356,10 @@ pub const Channel = struct {
         switch (notification) {
             .block_end => |block| self.dispatchBlock(block, false, notification, handler),
             .block_err => |block| self.dispatchBlock(block, true, notification, handler),
-            .exit => if (self.parser.isBroken())
+            .exit => |detail| if (self.parser.isBroken())
                 self.abort(.protocol_error, handler)
             else
-                self.exit(handler),
+                self.exit(detail, handler),
             else => switch (self.state) {
                 .handshake => {}, // Notifications open only after attach.
                 .running => handler.channelEvent(.{ .notification = notification }),
@@ -434,11 +434,15 @@ pub const Channel = struct {
         }
     }
 
-    fn exit(self: *Channel, handler: anytype) void {
+    fn exit(
+        self: *Channel,
+        detail: []const u8,
+        handler: anytype,
+    ) void {
         self.state = .exited;
         self.discardOutbound();
         self.failAllPending(handler);
-        handler.channelEvent(.exited);
+        handler.channelEvent(.{ .exited = detail });
     }
 
     fn abort(
@@ -471,6 +475,8 @@ pub const Channel = struct {
 
 const TestEvents = struct {
     items: std.ArrayList(Recorded) = .empty,
+    exit_detail: [128]u8 = undefined,
+    exit_detail_len: usize = 0,
 
     const Recorded = union(enum) {
         handshake_ok,
@@ -505,7 +511,12 @@ const TestEvents = struct {
                 } },
                 .channel_closed => .{ .command_closed = command.token },
             },
-            .exited => .exited,
+            .exited => |detail| exited: {
+                if (detail.len > self.exit_detail.len) @panic("exit detail too long");
+                @memcpy(self.exit_detail[0..detail.len], detail);
+                self.exit_detail_len = detail.len;
+                break :exited .exited;
+            },
             .aborted => |reason| .{ .aborted = std.meta.activeTag(reason) },
         };
         self.items.append(std.testing.allocator, recorded) catch @panic("oom");
@@ -771,6 +782,10 @@ test "tmux channel clean exit fails pending before terminal event" {
     try testing.expectEqual(first, events.items.items[1].command_closed);
     try testing.expectEqual(second, events.items.items[2].command_closed);
     try testing.expect(events.items.items[3] == .exited);
+    try testing.expectEqualStrings(
+        "detached",
+        events.exit_detail[0..events.exit_detail_len],
+    );
     try testing.expectEqual(Channel.State.exited, channel.state);
     try testing.expectEqualStrings("", channel.outboundBytes());
     try testing.expectError(error.ChannelClosed, channel.enqueueCommand("later"));

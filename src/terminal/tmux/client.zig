@@ -32,12 +32,13 @@ pub const ControlClient = struct {
     };
 
     pub const Action = union(enum) {
-        exit,
+        exit: ExitReason,
         windows: []const Viewer.Window,
         pane_changed: usize,
         command_complete: CommandCompletion,
         input_failed: []const u8,
     };
+    pub const ExitReason = Viewer.ExitReason;
     pub const CommandCompletion = struct {
         token: channel_pkg.CommandToken,
         result: Result,
@@ -231,6 +232,7 @@ pub const ControlClient = struct {
         };
         if (event_handler.err) |err| {
             self.state = .failed;
+            handler.controlClientAction(.{ .exit = .client_failure });
             return err;
         }
     }
@@ -283,7 +285,10 @@ pub const ControlClient = struct {
                             .{ .skipped_after_error = cause },
                         ),
                     },
-                    .exited, .aborted => try self.handleViewer(.{ .tmux = .exit }),
+                    .exited => |detail| try self.handleViewer(.{ .tmux = .{
+                        .exit = detail,
+                    } }),
+                    .aborted => self.emitHost(.{ .exit = .client_failure }),
                 }
             }
 
@@ -321,7 +326,7 @@ pub const ControlClient = struct {
             ) Error!void {
                 for (self.client.viewer.next(input)) |action| switch (action) {
                     .command => |group| try self.enqueueGroup(group),
-                    .exit => self.emitHost(.exit),
+                    .exit => |reason| self.emitHost(.{ .exit = reason }),
                     .windows => |windows| self.emitHost(.{ .windows = windows }),
                     .pane_changed => |pane_id| self.emitHost(.{
                         .pane_changed = pane_id,
@@ -367,6 +372,9 @@ pub const ControlClient = struct {
 
 const TestActions = struct {
     records: std.ArrayList(Recorded) = .empty,
+    exit_reason: ?std.meta.Tag(ControlClient.ExitReason) = null,
+    exit_detail: [128]u8 = undefined,
+    exit_detail_len: usize = 0,
     input_failure_body: [128]u8 = undefined,
     input_failure_len: usize = 0,
 
@@ -392,7 +400,19 @@ const TestActions = struct {
         action: ControlClient.Action,
     ) void {
         const recorded: Recorded = switch (action) {
-            .exit => .exit,
+            .exit => |reason| exit: {
+                self.exit_reason = std.meta.activeTag(reason);
+                const detail: []const u8 = switch (reason) {
+                    .server_exit, .unsupported_version => |value| value,
+                    .client_failure => &.{},
+                };
+                if (detail.len > self.exit_detail.len) {
+                    @panic("exit detail too long");
+                }
+                @memcpy(self.exit_detail[0..detail.len], detail);
+                self.exit_detail_len = detail.len;
+                break :exit .exit;
+            },
             .windows => |windows| .{ .windows = windows.len },
             .pane_changed => |pane_id| .{ .pane_changed = pane_id },
             .command_complete => |completion| switch (completion.result) {
@@ -489,6 +509,78 @@ test "control client sends startup commands before either response" {
             "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
         client.outboundBytes(),
     );
+}
+
+test "control client reports initial size between version and topology" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{
+        .initial_client_size = .{ .columns = 117, .rows = 41 },
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        &actions,
+    );
+    try testing.expectEqualStrings(
+        "display-message -p '#{version}'\n" ++
+            "refresh-client -C 117x41\n" ++
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+        client.outboundBytes(),
+    );
+    try testing.expectEqual(3, client.viewer.sent_command_count);
+
+    try client.feed(
+        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n%end 3 3 1\n" ++
+            "%begin 4 4 1\n%end 4 4 1\n",
+        &actions,
+    );
+    try testing.expectEqual(0, client.viewer.sent_command_count);
+    try testing.expect(client.viewer.command_queue.empty());
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+}
+
+test "control client size error stays in Viewer FIFO" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{
+        .initial_client_size = .{ .columns = 117, .rows = 41 },
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        &actions,
+    );
+    const host_token = try client.enqueueCommand("display-message -p host");
+    try client.feed(
+        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\ninvalid size\n%error 3 3 1\n",
+        &actions,
+    );
+
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .exit);
+    try testing.expectEqual(
+        std.meta.Tag(ControlClient.ExitReason).client_failure,
+        actions.exit_reason.?,
+    );
+    try testing.expectEqual(0, actions.exit_detail_len);
+    try testing.expectEqual(1, client.viewer.sent_command_count);
+    try testing.expectEqual(1, client.viewer.command_queue.len());
+    var pending = client.channel.pending.iterator(.forward);
+    try testing.expectEqual(channel_pkg.CommandSource.viewer, pending.next().?.source);
+    const host = pending.next().?;
+    try testing.expectEqual(channel_pkg.CommandSource.host, host.source);
+    try testing.expectEqual(host_token, host.token);
+    try testing.expect(pending.next() == null);
 }
 
 test "control client owns and replaces session name" {
@@ -645,7 +737,7 @@ test "control client forwards partial outbound consumption" {
     );
 }
 
-test "control client emits exit once" {
+test "control client emits borrowed server exit detail once" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.allocator, .{});
@@ -656,6 +748,14 @@ test "control client emits exit once" {
     try client.feed("%exit detached\n", &actions);
     try testing.expectEqual(1, actions.records.items.len);
     try testing.expect(actions.records.items[0] == .exit);
+    try testing.expectEqual(
+        std.meta.Tag(ControlClient.ExitReason).server_exit,
+        actions.exit_reason.?,
+    );
+    try testing.expectEqualStrings(
+        "detached",
+        actions.exit_detail[0..actions.exit_detail_len],
+    );
 
     try client.feed("%exit again\n", &actions);
     try testing.expectEqual(1, actions.records.items.len);
@@ -701,6 +801,12 @@ test "control client enqueue failure is terminal" {
 
         client.feed(input, &actions) catch |err| {
             try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(1, actions.records.items.len);
+            try testing.expect(actions.records.items[0] == .exit);
+            try testing.expectEqual(
+                std.meta.Tag(ControlClient.ExitReason).client_failure,
+                actions.exit_reason.?,
+            );
             try testing.expectError(
                 error.ClientFailed,
                 client.feed("%exit\n", &actions),
@@ -724,8 +830,38 @@ test "control client malformed stream exits" {
     try client.feed("x", &actions);
     try testing.expectEqual(1, actions.records.items.len);
     try testing.expect(actions.records.items[0] == .exit);
+    try testing.expectEqual(
+        std.meta.Tag(ControlClient.ExitReason).client_failure,
+        actions.exit_reason.?,
+    );
     try client.feed("%", &actions);
     try testing.expectEqual(1, actions.records.items.len);
+}
+
+test "control client reports unsupported tmux version detail" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        &actions,
+    );
+    try client.feed("%begin 2 2 1\n3.0a\n%end 2 2 1\n", &actions);
+
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .exit);
+    try testing.expectEqual(
+        std.meta.Tag(ControlClient.ExitReason).unsupported_version,
+        actions.exit_reason.?,
+    );
+    try testing.expectEqualStrings(
+        "3.0a",
+        actions.exit_detail[0..actions.exit_detail_len],
+    );
 }
 
 test "control client exposes pane phase and retained terminal lifetime" {

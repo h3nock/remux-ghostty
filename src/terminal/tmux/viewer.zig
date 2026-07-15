@@ -220,6 +220,11 @@ pub const Viewer = struct {
     pub const CommandQueue = CircBuf(QueuedCommand, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
+    pub const ClientSize = struct {
+        columns: size.CellCountInt,
+        rows: size.CellCountInt,
+    };
+
     pub const Options = struct {
         /// Byte limit forwarded directly to each newly created pane Terminal's
         /// local scrollback. Zero disables retained scrollback. This is
@@ -232,12 +237,22 @@ pub const Viewer = struct {
         /// capture. This is independent of Terminal's byte-based scrollback
         /// storage limit.
         history_line_limit: ?usize = null,
+
+        /// Initial control-client grid reported before the first topology
+        /// query. Null leaves sizing to tmux.
+        initial_client_size: ?ClientSize = null,
+    };
+
+    pub const ExitReason = union(enum) {
+        server_exit: []const u8,
+        unsupported_version: []const u8,
+        client_failure,
     };
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
         /// our viewer session in some way.
-        exit,
+        exit: ExitReason,
 
         /// Send one explicit command group to tmux. Member text is already
         /// serialized without transport delimiters and is borrowed until the
@@ -511,7 +526,9 @@ pub const Viewer = struct {
             // I don't think this is technically possible (reading the
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
-            .exit => return self.defunct(),
+            .exit => |detail| return self.defunctWith(.{
+                .server_exit = detail,
+            }),
 
             // The implicit attach response is always server-originated. A
             // client block here is unsolicited and must not advance startup.
@@ -537,7 +554,9 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
 
-            .exit => return self.defunct(),
+            .exit => |detail| return self.defunctWith(.{
+                .server_exit = detail,
+            }),
 
             .session_changed => |info| {
                 const session_name = self.alloc.dupe(u8, info.name) catch {
@@ -549,9 +568,13 @@ pub const Viewer = struct {
                 defer self.action_arena = arena.state;
                 _ = arena.reset(.free_all);
 
+                const commands: []const Command = if (self.options.initial_client_size) |client_size|
+                    &.{ .tmux_version, .{ .client_size = client_size }, .list_windows }
+                else
+                    &.{ .tmux_version, .list_windows };
                 const actions = self.enterCommandQueue(
                     arena.allocator(),
-                    &.{ .tmux_version, .list_windows },
+                    commands,
                 ) catch {
                     self.alloc.free(session_name);
                     log.warn("failed to queue command, becoming defunct", .{});
@@ -621,7 +644,9 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => return self.defunct(),
+            .exit => |detail| return self.defunctWith(.{
+                .server_exit = detail,
+            }),
 
             .block_end, .block_err => unreachable,
 
@@ -743,10 +768,14 @@ pub const Viewer = struct {
 
         self.resetActionArena();
         var actions: std.ArrayList(Action) = .empty;
-        self.receivedCommandCompletion(&actions, completion) catch |err| {
+        const exit_reason = self.receivedCommandCompletion(
+            &actions,
+            completion,
+        ) catch |err| {
             log.warn("failed to process command completion, becoming defunct: {}", .{err});
             return self.defunct();
         };
+        if (exit_reason) |reason| return self.defunctWith(reason);
         self.appendQueuedCommandActions(&actions) catch return self.defunct();
         return actions.items;
     }
@@ -766,7 +795,7 @@ pub const Viewer = struct {
         var terminal_failure = false;
         while (true) {
             const ends_group = self.command_queue.first().?.group_end;
-            self.receivedCommandCompletion(&actions, .failure) catch |err| switch (err) {
+            _ = self.receivedCommandCompletion(&actions, .failure) catch |err| switch (err) {
                 error.CommandFailed, error.HydrationFailed => terminal_failure = true,
                 else => {
                     log.warn("failed to process command error, becoming defunct: {}", .{err});
@@ -1072,7 +1101,7 @@ pub const Viewer = struct {
         self: *Viewer,
         actions: *std.ArrayList(Action),
         completion: CommandCompletion,
-    ) !void {
+    ) !?ExitReason {
         if (self.sent_command_count == 0) return error.UnexpectedCommandCompletion;
 
         // Get the command we're expecting output for. We need to get the
@@ -1101,10 +1130,10 @@ pub const Viewer = struct {
             .success => |body| body,
             .failure => {
                 if (command.isHydration()) return error.HydrationFailed;
-                return switch (command) {
-                    .user => {},
-                    else => error.CommandFailed,
-                };
+                switch (command) {
+                    .user => return null,
+                    else => return error.CommandFailed,
+                }
             },
         };
 
@@ -1136,16 +1165,21 @@ pub const Viewer = struct {
                 try actions.append(arena_alloc, .{ .pane_changed = id });
             },
 
-            .tmux_version => try self.receivedTmuxVersion(content),
+            .tmux_version => if (try self.receivedTmuxVersion(content)) |reason| {
+                return reason;
+            },
+
+            .client_size => {},
         }
+        return null;
     }
 
     fn receivedTmuxVersion(
         self: *Viewer,
         content: []const u8,
-    ) !void {
+    ) !?ExitReason {
         const line = std.mem.trim(u8, content, " \t\r\n");
-        if (line.len == 0) return;
+        if (line.len == 0) return null;
 
         const data = output.parseFormatStruct(
             Format.tmux_version.Struct(),
@@ -1161,13 +1195,14 @@ pub const Viewer = struct {
                 "unsupported tmux version={s}; minimum supported version={s}",
                 .{ data.version, minimum_tmux_version },
             );
-            return error.UnsupportedTmuxVersion;
+            return .{ .unsupported_version = data.version };
         }
 
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+        return null;
     }
 
     fn supportsTmuxVersion(version_raw: []const u8) bool {
@@ -1766,8 +1801,15 @@ pub const Viewer = struct {
     }
 
     fn defunct(self: *Viewer) []const Action {
+        return self.defunctWith(.client_failure);
+    }
+
+    fn defunctWith(
+        self: *Viewer,
+        reason: ExitReason,
+    ) []const Action {
         self.state = .defunct;
-        return self.singleAction(.exit);
+        return self.singleAction(.{ .exit = reason });
     }
 };
 
@@ -1828,6 +1870,9 @@ const Command = union(enum) {
     /// Get the tmux server version.
     tmux_version,
 
+    /// Report the initial control-client grid before querying topology.
+    client_size: Viewer.ClientSize,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -1846,6 +1891,7 @@ const Command = union(enum) {
             .pane_pending,
             .pane_state,
             .tmux_version,
+            .client_size,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -1859,7 +1905,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_pending,
             => true,
-            .list_windows, .tmux_version, .user => false,
+            .list_windows, .tmux_version, .client_size, .user => false,
         };
     }
 
@@ -1923,6 +1969,11 @@ const Command = union(enum) {
                 "display-message -p '{s}'",
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
+
+            .client_size => |client_size| try writer.print(
+                "refresh-client -C {d}x{d}",
+                .{ client_size.columns, client_size.rows },
+            ),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -2356,11 +2407,11 @@ test "immediate exit" {
 
     try testViewer(&viewer, &.{
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
@@ -2500,7 +2551,7 @@ test "session changed resets state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3155,7 +3206,7 @@ test "layout change" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3213,7 +3264,7 @@ test "layout_change emits a new group while another group is pending" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3280,7 +3331,7 @@ test "layout_change returns command when queue was empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3341,7 +3392,7 @@ test "window_add queues list_windows when queue empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3409,7 +3460,7 @@ test "window_add emits list_windows while another group is pending" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = "" } },
             .contains_tags = &.{.exit},
         },
     });

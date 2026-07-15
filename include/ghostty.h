@@ -525,6 +525,12 @@ typedef enum {
 } ghostty_tmux_action_tag_e;
 
 typedef enum {
+  GHOSTTY_TMUX_EXIT_SERVER,
+  GHOSTTY_TMUX_EXIT_UNSUPPORTED_VERSION,
+  GHOSTTY_TMUX_EXIT_CLIENT_FAILURE,
+} ghostty_tmux_exit_reason_e;
+
+typedef enum {
   GHOSTTY_TMUX_COMMAND_SUCCESS,
   GHOSTTY_TMUX_COMMAND_ERROR_BLOCK,
   GHOSTTY_TMUX_COMMAND_SKIPPED,
@@ -581,7 +587,15 @@ typedef struct {
   ghostty_tmux_bytes_s session_name;
 } ghostty_tmux_topology_action_s;
 
+typedef struct {
+  ghostty_tmux_exit_reason_e reason;
+  // Human-readable tmux %exit detail for SERVER, the rejected version for
+  // UNSUPPORTED_VERSION, and empty for CLIENT_FAILURE.
+  ghostty_tmux_bytes_s detail;
+} ghostty_tmux_exit_action_s;
+
 typedef union {
+  ghostty_tmux_exit_action_s exit;
   ghostty_tmux_topology_action_s topology;
   uint64_t pane_id;
   ghostty_tmux_command_completion_s command;
@@ -607,6 +621,10 @@ typedef struct {
   size_t history_line_limit;
   // Local terminal scrollback capacity in bytes. Zero disables scrollback.
   size_t max_scrollback;
+  // Optional initial control-client grid. Zero/zero leaves sizing to tmux;
+  // otherwise both dimensions must be nonzero.
+  uint16_t initial_columns;
+  uint16_t initial_rows;
 } ghostty_tmux_client_config_s;
 
 // Config types
@@ -1268,10 +1286,11 @@ GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 
 // Sans-I/O tmux control-mode client. The host owns the transport and must
-// serialize all calls for one client. Action payloads, command response
-// bodies, input failure bodies, session names, and topology views are borrowed
-// only for the action callback. The callback may visit topology, enqueue
-// commands, send pane input, read outbound bytes, or retain a pane terminal.
+// serialize all calls for one client. Action payloads, exit details, command
+// response bodies, input failure bodies, session names, and topology views are
+// borrowed only for the action callback. The callback may visit topology,
+// enqueue commands, send pane input, read outbound bytes, or retain a pane
+// terminal.
 // It must not feed, consume, or free the client. Reentrant feed is rejected;
 // consume and free are rejected while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);

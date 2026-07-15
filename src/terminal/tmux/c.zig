@@ -52,6 +52,12 @@ pub const ActionTag = enum(c_int) {
     input_failed,
 };
 
+pub const ExitReason = enum(c_int) {
+    server,
+    unsupported_version,
+    client_failure,
+};
+
 pub const CommandStatus = enum(c_int) {
     success,
     error_block,
@@ -109,7 +115,13 @@ pub const TopologyAction = extern struct {
     session_name: Bytes,
 };
 
+pub const ExitAction = extern struct {
+    reason: ExitReason,
+    detail: Bytes,
+};
+
 pub const ActionValue = extern union {
+    exit: ExitAction,
     topology: TopologyAction,
     pane_id: u64,
     command: CommandCompletion,
@@ -137,6 +149,19 @@ pub const Config = extern struct {
     history_line_limit_is_set: bool = false,
     history_line_limit: usize = 0,
     max_scrollback: usize = 10_000,
+    initial_columns: u16 = 0,
+    initial_rows: u16 = 0,
+
+    fn initialClientSize(self: Config) error{InvalidInput}!?Viewer.ClientSize {
+        if (self.initial_columns == 0 and self.initial_rows == 0) return null;
+        if (self.initial_columns == 0 or self.initial_rows == 0) {
+            return error.InvalidInput;
+        }
+        return .{
+            .columns = self.initial_columns,
+            .rows = self.initial_rows,
+        };
+    }
 };
 
 pub const TopologyView = struct {
@@ -152,7 +177,10 @@ pub const Client = struct {
     group_members: std.ArrayList([]const u8) = .empty,
     callback_active: bool = false,
 
-    fn init(alloc: Allocator, config: Config) Allocator.Error!Client {
+    fn init(
+        alloc: Allocator,
+        config: Config,
+    ) (Allocator.Error || error{InvalidInput})!Client {
         return .{
             .alloc = alloc,
             .control = try .init(alloc, .{
@@ -161,6 +189,7 @@ pub const Client = struct {
                     config.history_line_limit
                 else
                     null,
+                .initial_client_size = try config.initialClientSize(),
             }),
             .userdata = config.userdata,
             .action_cb = config.action_cb.?,
@@ -177,10 +206,24 @@ pub const Client = struct {
         action: ControlClient.Action,
     ) void {
         switch (action) {
-            .exit => {
+            .exit => |reason| {
+                const exit: ExitAction = switch (reason) {
+                    .server_exit => |detail| .{
+                        .reason = .server,
+                        .detail = .fromSlice(detail),
+                    },
+                    .unsupported_version => |version| .{
+                        .reason = .unsupported_version,
+                        .detail = .fromSlice(version),
+                    },
+                    .client_failure => .{
+                        .reason = .client_failure,
+                        .detail = .fromSlice(&.{}),
+                    },
+                };
                 var value: Action = .{
                     .tag = .exit,
-                    .value = undefined,
+                    .value = .{ .exit = exit },
                 };
                 self.emit(&value);
             },
@@ -266,11 +309,15 @@ export fn ghostty_tmux_client_new(
     out.* = null;
     const config = config_ptr orelse return .invalid_input;
     if (config.action_cb == null) return .invalid_input;
+    _ = config.initialClientSize() catch return .invalid_input;
 
     const client = state.alloc.create(Client) catch return .out_of_memory;
-    client.* = Client.init(state.alloc, config.*) catch {
+    client.* = Client.init(state.alloc, config.*) catch |err| {
         state.alloc.destroy(client);
-        return .out_of_memory;
+        return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            error.InvalidInput => .invalid_input,
+        };
     };
     out.* = client;
     return .ok;
@@ -474,6 +521,9 @@ const TestContext = struct {
     client: ?*Client = null,
     topology_count: usize = 0,
     exit_count: usize = 0,
+    exit_reason: ?ExitReason = null,
+    exit_detail: [128]u8 = undefined,
+    exit_detail_len: usize = 0,
     pane_changed_count: usize = 0,
     pane_changed_ids: [8]u64 = undefined,
     completions: [16]CommandCompletion = undefined,
@@ -501,7 +551,17 @@ const TestContext = struct {
     ) callconv(.c) void {
         const self: *TestContext = @ptrCast(@alignCast(userdata.?));
         switch (value.tag) {
-            .exit => self.exit_count += 1,
+            .exit => {
+                self.exit_count += 1;
+                self.exit_reason = value.value.exit.reason;
+                const detail = value.value.exit.detail.slice() catch
+                    @panic("invalid exit detail");
+                if (detail.len > self.exit_detail.len) {
+                    @panic("exit detail too long");
+                }
+                @memcpy(self.exit_detail[0..detail.len], detail);
+                self.exit_detail_len = detail.len;
+            },
             .topology => {
                 self.topology_count += 1;
                 self.record_count = 0;
@@ -651,6 +711,7 @@ test "tmux C client public ABI matches ghostty header" {
 
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_action_tag_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_exit_reason_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_command_status_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_pane_phase_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_tmux_topology_record_tag_e));
@@ -660,6 +721,9 @@ test "tmux C client public ABI matches ghostty header" {
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.exit)), @as(c_int, c.GHOSTTY_TMUX_ACTION_EXIT));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.command_complete)), @as(c_int, c.GHOSTTY_TMUX_ACTION_COMMAND_COMPLETE));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.input_failed)), @as(c_int, c.GHOSTTY_TMUX_ACTION_INPUT_FAILED));
+    try testing.expectEqual(@as(c_int, @intFromEnum(ExitReason.server)), @as(c_int, c.GHOSTTY_TMUX_EXIT_SERVER));
+    try testing.expectEqual(@as(c_int, @intFromEnum(ExitReason.unsupported_version)), @as(c_int, c.GHOSTTY_TMUX_EXIT_UNSUPPORTED_VERSION));
+    try testing.expectEqual(@as(c_int, @intFromEnum(ExitReason.client_failure)), @as(c_int, c.GHOSTTY_TMUX_EXIT_CLIENT_FAILURE));
     try testing.expectEqual(@as(c_int, @intFromEnum(CommandStatus.success)), @as(c_int, c.GHOSTTY_TMUX_COMMAND_SUCCESS));
     try testing.expectEqual(@as(c_int, @intFromEnum(CommandStatus.skipped)), @as(c_int, c.GHOSTTY_TMUX_COMMAND_SKIPPED));
     try testing.expectEqual(@as(c_int, @intFromEnum(PanePhase.hydrating)), @as(c_int, c.GHOSTTY_TMUX_PANE_HYDRATING));
@@ -674,6 +738,7 @@ test "tmux C client public ABI matches ghostty header" {
     try expectStructLayout(TopologyRecord, c.ghostty_tmux_topology_record_s);
     try expectStructLayout(CommandCompletion, c.ghostty_tmux_command_completion_s);
     try expectStructLayout(TopologyAction, c.ghostty_tmux_topology_action_s);
+    try expectStructLayout(ExitAction, c.ghostty_tmux_exit_action_s);
     try expectUnionLayout(ActionValue, c.ghostty_tmux_action_u);
     try expectStructLayout(Action, c.ghostty_tmux_action_s);
     try expectStructLayout(Config, c.ghostty_tmux_client_config_s);
@@ -685,6 +750,8 @@ test "tmux C client config and invalid boundaries" {
     try testing.expect(defaults.action_cb == null);
     try testing.expect(!defaults.history_line_limit_is_set);
     try testing.expectEqual(10_000, defaults.max_scrollback);
+    try testing.expectEqual(0, defaults.initial_columns);
+    try testing.expectEqual(0, defaults.initial_rows);
 
     var out: ?*Client = undefined;
     try testing.expectEqual(
@@ -697,6 +764,22 @@ test "tmux C client config and invalid boundaries" {
     try testing.expectEqual(
         Result.invalid_input,
         ghostty_tmux_client_new(&missing_callback, &out),
+    );
+    try testing.expect(out == null);
+
+    var mixed_size = missing_callback;
+    mixed_size.action_cb = TestContext.action;
+    mixed_size.initial_columns = 80;
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_new(&mixed_size, &out),
+    );
+    try testing.expect(out == null);
+    mixed_size.initial_columns = 0;
+    mixed_size.initial_rows = 24;
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_new(&mixed_size, &out),
     );
     try testing.expect(out == null);
 
@@ -872,6 +955,75 @@ test "tmux C client transport batching and callback contract" {
     try testing.expectEqual(group_tokens[1], context.completions[2].cause_token);
     try testing.expectEqual(CommandStatus.success, context.completions[3].status);
     try testing.expectEqual(later, context.completions[3].token);
+}
+
+test "tmux C client initial size and structured exits" {
+    const testing = std.testing;
+
+    {
+        var context: TestContext = .{};
+        var config = testConfig(&context);
+        config.initial_columns = 117;
+        config.initial_rows = 41;
+        var client = try Client.init(testing.allocator, config);
+        defer client.deinit();
+        context.client = &client;
+
+        try feedTest(
+            &client,
+            "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        );
+        var outbound: Bytes = undefined;
+        try testing.expectEqual(
+            Result.ok,
+            ghostty_tmux_client_outbound(&client, &outbound),
+        );
+        try testing.expectEqualStrings(
+            "display-message -p '#{version}'\n" ++
+                "refresh-client -C 117x41\n" ++
+                "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            try outbound.slice(),
+        );
+        try feedTest(
+            &client,
+            "%begin 2 2 1\n3.0a\n%end 2 2 1\n" ++
+                "%begin 3 3 1\n%end 3 3 1\n" ++
+                "%begin 4 4 1\n%end 4 4 1\n",
+        );
+        try testing.expectEqual(1, context.exit_count);
+        try testing.expectEqual(ExitReason.unsupported_version, context.exit_reason.?);
+        try testing.expectEqualStrings(
+            "3.0a",
+            context.exit_detail[0..context.exit_detail_len],
+        );
+    }
+
+    {
+        var context: TestContext = .{};
+        var client = try Client.init(testing.allocator, testConfig(&context));
+        defer client.deinit();
+        context.client = &client;
+
+        try feedTest(&client, "%exit detached\n");
+        try testing.expectEqual(1, context.exit_count);
+        try testing.expectEqual(ExitReason.server, context.exit_reason.?);
+        try testing.expectEqualStrings(
+            "detached",
+            context.exit_detail[0..context.exit_detail_len],
+        );
+    }
+
+    {
+        var context: TestContext = .{};
+        var client = try Client.init(testing.allocator, testConfig(&context));
+        defer client.deinit();
+        context.client = &client;
+
+        try feedTest(&client, "x");
+        try testing.expectEqual(1, context.exit_count);
+        try testing.expectEqual(ExitReason.client_failure, context.exit_reason.?);
+        try testing.expectEqual(0, context.exit_detail_len);
+    }
 }
 
 test "tmux C client pane input validation and action mapping" {
