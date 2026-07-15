@@ -8,6 +8,7 @@ const CircBuf = @import("../../datastruct/main.zig").CircBuf;
 const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
+const SharedTerminal = @import("../Shared.zig");
 const Terminal = @import("../Terminal.zig");
 const TerminalStream = @import("../stream_terminal.zig").Stream;
 const Layout = @import("layout.zig").Layout;
@@ -321,7 +322,7 @@ pub const Viewer = struct {
     };
 
     pub const Pane = struct {
-        terminal: Terminal,
+        terminal_owner: *SharedTerminal,
         stream: TerminalStream,
         phase: Phase = .hydrating,
         active_screen: ScreenSet.Key = .primary,
@@ -353,19 +354,25 @@ pub const Viewer = struct {
             const self = try alloc.create(Pane);
             errdefer alloc.destroy(self);
 
-            self.* = .{
-                .terminal = try .init(alloc, terminal_opts),
-                .stream = undefined,
-            };
-            errdefer self.terminal.deinit(alloc);
+            const terminal_owner = try SharedTerminal.init(alloc, terminal_opts);
+            errdefer terminal_owner.release();
 
-            self.stream = self.terminal.vtStream();
+            self.* = .{
+                .terminal_owner = terminal_owner,
+                .stream = terminal_owner.terminal.vtStream(),
+            };
             return self;
+        }
+
+        /// Retain the pane's canonical terminal for use beyond this Pane's
+        /// lifetime. The caller must release the returned owner.
+        pub fn retainTerminal(self: *const Pane) *SharedTerminal {
+            return self.terminal_owner.retain();
         }
 
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.stream.deinit();
-            self.terminal.deinit(alloc);
+            self.terminal_owner.release();
             alloc.destroy(self);
         }
     };
@@ -1228,7 +1235,10 @@ pub const Viewer = struct {
             };
             const pane: *Pane = entry.value_ptr.*;
             if (pane.phase == .live) continue;
-            const t: *Terminal = &pane.terminal;
+            const terminal_owner = pane.terminal_owner;
+            terminal_owner.mutex.lock();
+            defer terminal_owner.mutex.unlock();
+            const t: *Terminal = &terminal_owner.terminal;
 
             pane.active_screen = if (data.alternate_on) .alternate else .primary;
             pane.has_history = data.history_size > 0;
@@ -1348,7 +1358,10 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
         if (!pane.has_history) return;
-        const t: *Terminal = &pane.terminal;
+        const terminal_owner = pane.terminal_owner;
+        terminal_owner.mutex.lock();
+        defer terminal_owner.mutex.unlock();
+        const t: *Terminal = &terminal_owner.terminal;
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
         _ = try t.switchScreen(.primary);
@@ -1415,7 +1428,10 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        const t: *Terminal = &pane.terminal;
+        const terminal_owner = pane.terminal_owner;
+        terminal_owner.mutex.lock();
+        defer terminal_owner.mutex.unlock();
+        const t: *Terminal = &terminal_owner.terminal;
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
         _ = try t.switchScreen(screen_key);
@@ -1440,7 +1456,10 @@ pub const Viewer = struct {
             return false;
         };
 
-        const t = &pane.terminal;
+        const terminal_owner = pane.terminal_owner;
+        terminal_owner.mutex.lock();
+        defer terminal_owner.mutex.unlock();
+        const t = &terminal_owner.terminal;
         Pane.restoreCursor(t.screens.get(.primary).?, pane.saved_primary_cursor);
         _ = try t.switchScreen(pane.active_screen);
         Pane.restoreCursor(t.screens.active, pane.cursor);
@@ -1480,6 +1499,8 @@ pub const Viewer = struct {
                 break :hydrating null;
             },
             .live => live: {
+                pane.terminal_owner.mutex.lock();
+                defer pane.terminal_owner.mutex.unlock();
                 pane.stream.nextSlice(data);
                 break :live out.pane_id;
             },
@@ -1549,7 +1570,10 @@ pub const Viewer = struct {
                 // If we already have this pane, it is already initialized
                 // so just copy it over.
                 if (panes_old.getEntry(id)) |entry| {
-                    try entry.value_ptr.*.terminal.resize(gpa_alloc, cols, rows);
+                    const terminal_owner = entry.value_ptr.*.terminal_owner;
+                    terminal_owner.mutex.lock();
+                    defer terminal_owner.mutex.unlock();
+                    try terminal_owner.terminal.resize(gpa_alloc, cols, rows);
                     gop.value_ptr.* = entry.value_ptr.*;
                     break :pane;
                 }
@@ -2000,6 +2024,54 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
     }
 }
 
+test "retained terminal outlives concurrent pane removal" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    const Context = struct {
+        terminal: *SharedTerminal,
+        locked: std.Thread.ResetEvent = .{},
+        proceed: std.Thread.ResetEvent = .{},
+        done: std.Thread.ResetEvent = .{},
+        observed_cols: size.CellCountInt = 0,
+
+        fn run(self: *@This()) void {
+            self.terminal.mutex.lock();
+            self.locked.set();
+            self.proceed.wait();
+            self.observed_cols = self.terminal.terminal.cols;
+            self.terminal.mutex.unlock();
+            self.terminal.release();
+            self.done.set();
+        }
+    };
+    var context: Context = .{ .terminal = pane.retainTerminal() };
+    const thread = std.Thread.spawn(.{}, Context.run, .{&context}) catch |err| {
+        context.terminal.release();
+        return err;
+    };
+    defer {
+        context.proceed.set();
+        thread.join();
+    }
+
+    try context.locked.timedWait(std.time.ns_per_s);
+    try viewer.syncLayouts(&.{});
+    try testing.expectEqual(0, viewer.panes.count());
+    context.proceed.set();
+    try context.done.timedWait(std.time.ns_per_s);
+    try testing.expectEqual(10, context.observed_cols);
+}
+
 test "minimum tmux version" {
     try testing.expect(!Viewer.supportsTmuxVersion("2.9a"));
     try testing.expect(!Viewer.supportsTmuxVersion("3.0a"));
@@ -2378,7 +2450,7 @@ test "initial flow" {
     const pane = viewer.panes.get(0).?;
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.primary, pane.active_screen);
-    const history = try pane.terminal.screens.active.dumpStringAlloc(
+    const history = try pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .history = .{} },
     );
@@ -2393,7 +2465,7 @@ test "initial flow" {
     try testing.expectEqual(1, changed.len);
     try testing.expectEqual(0, changed[0].pane_changed);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
-    const active = try pane.terminal.screens.active.dumpStringAlloc(
+    const active = try pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
     );
@@ -2403,9 +2475,9 @@ test "initial flow" {
 
     const fresh_pane = viewer.panes.get(1).?;
     try testing.expect(
-        fresh_pane.terminal.screens.active.pages.getBottomRight(.history) == null,
+        fresh_pane.terminal_owner.terminal.screens.active.pages.getBottomRight(.history) == null,
     );
-    const fresh_active = try fresh_pane.terminal.screens.active.dumpStringAlloc(
+    const fresh_active = try fresh_pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
     );
@@ -2419,7 +2491,7 @@ test "initial flow" {
     } } });
     try testing.expectEqual(1, fresh_changed.len);
     try testing.expectEqual(1, fresh_changed[0].pane_changed);
-    const fresh_after_suffix = try fresh_pane.terminal.screens.active.dumpStringAlloc(
+    const fresh_after_suffix = try fresh_pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
     );
@@ -2477,7 +2549,7 @@ test "live output preserves UTF-8 split across notifications" {
     _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &second } } });
     _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &third } } });
 
-    const actual = try pane.terminal.plainString(testing.allocator);
+    const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("€", actual);
 }
@@ -2510,7 +2582,7 @@ test "live output action does not allocate" {
     } } });
     try testing.expectEqual(1, actions.len);
     try testing.expectEqual(1, actions[0].pane_changed);
-    const actual = try pane.terminal.plainString(testing.allocator);
+    const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("X", actual);
 }
@@ -2537,12 +2609,12 @@ test "live output preserves CSI split across notifications" {
     _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &second } } });
     _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &third } } });
 
-    const cell = pane.terminal.screens.active.pages.getCell(.{
+    const cell = pane.terminal_owner.terminal.screens.active.pages.getCell(.{
         .screen = .{ .x = 0, .y = 0 },
     }).?.cell;
     try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
     try testing.expect(cell.style_id != 0);
-    try testing.expect(pane.terminal.screens.active.cursor.style.flags.bold);
+    try testing.expect(pane.terminal_owner.terminal.screens.active.cursor.style.flags.bold);
 }
 
 test "hydration seeds pending VT state before live output" {
@@ -2566,7 +2638,7 @@ test "hydration seeds pending VT state before live output" {
         .data = &suffix,
     } } });
 
-    const cell = pane.terminal.screens.active.pages.getCell(.{
+    const cell = pane.terminal_owner.terminal.screens.active.pages.getCell(.{
         .screen = .{ .x = 0, .y = 0 },
     }).?.cell;
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
@@ -2601,7 +2673,7 @@ test "hydration carries split UTF-8 past an empty pending capture" {
         .data = &suffix,
     } } });
 
-    const actual = try pane.terminal.plainString(testing.allocator);
+    const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("€", actual);
 }
@@ -2636,7 +2708,7 @@ test "hydration command errors do not become terminal content" {
     try testing.expectEqual(1, actions.len);
     try testing.expect(actions[0] == .exit);
     try testing.expectEqual(Viewer.Pane.Phase.hydrating, pane.phase);
-    const actual = try pane.terminal.plainString(testing.allocator);
+    const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("", actual);
 }
@@ -2724,10 +2796,10 @@ test "zoomed geometry follows visible layout" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.windows.items[0].is_zoomed);
-                    try testing.expectEqual(83, v.panes.get(0).?.terminal.cols);
-                    try testing.expectEqual(44, v.panes.get(0).?.terminal.rows);
-                    try testing.expectEqual(83, v.panes.get(1).?.terminal.cols);
-                    try testing.expectEqual(21, v.panes.get(1).?.terminal.rows);
+                    try testing.expectEqual(83, v.panes.get(0).?.terminal_owner.terminal.cols);
+                    try testing.expectEqual(44, v.panes.get(0).?.terminal_owner.terminal.rows);
+                    try testing.expectEqual(83, v.panes.get(1).?.terminal_owner.terminal.cols);
+                    try testing.expectEqual(21, v.panes.get(1).?.terminal_owner.terminal.rows);
                 }
             }).check,
         },
@@ -2750,8 +2822,8 @@ test "zoomed geometry follows visible layout" {
 
     const pane_0 = viewer.panes.get(0).?;
     const pane_1 = viewer.panes.get(1).?;
-    const terminal_0 = &pane_0.terminal;
-    const terminal_1 = &pane_1.terminal;
+    const terminal_0 = &pane_0.terminal_owner.terminal;
+    const terminal_1 = &pane_1.terminal_owner.terminal;
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
 
@@ -2766,14 +2838,14 @@ test "zoomed geometry follows visible layout" {
     try testing.expect(viewer.windows.items[0].is_zoomed);
     try testing.expectEqual(83, viewer.windows.items[0].width);
     try testing.expectEqual(44, viewer.windows.items[0].height);
-    try testing.expectEqual(83, viewer.panes.get(0).?.terminal.cols);
-    try testing.expectEqual(22, viewer.panes.get(0).?.terminal.rows);
-    try testing.expectEqual(83, viewer.panes.get(1).?.terminal.cols);
-    try testing.expectEqual(44, viewer.panes.get(1).?.terminal.rows);
+    try testing.expectEqual(83, viewer.panes.get(0).?.terminal_owner.terminal.cols);
+    try testing.expectEqual(22, viewer.panes.get(0).?.terminal_owner.terminal.rows);
+    try testing.expectEqual(83, viewer.panes.get(1).?.terminal_owner.terminal.cols);
+    try testing.expectEqual(44, viewer.panes.get(1).?.terminal_owner.terminal.rows);
     try testing.expectEqual(pane_0, viewer.panes.get(0).?);
     try testing.expectEqual(pane_1, viewer.panes.get(1).?);
-    try testing.expectEqual(terminal_0, &viewer.panes.get(0).?.terminal);
-    try testing.expectEqual(terminal_1, &viewer.panes.get(1).?.terminal);
+    try testing.expectEqual(terminal_0, &viewer.panes.get(0).?.terminal_owner.terminal);
+    try testing.expectEqual(terminal_1, &viewer.panes.get(1).?.terminal_owner.terminal);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
 }
@@ -3141,21 +3213,21 @@ test "alternate pane hydration restores canonical screens" {
 
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.alternate, pane.active_screen);
-    try testing.expectEqual(pane.terminal.screens.get(.alternate).?, pane.terminal.screens.active);
-    try testing.expectEqual(5, pane.terminal.screens.active.cursor.x);
-    try testing.expectEqual(2, pane.terminal.screens.active.cursor.y);
-    try testing.expectEqual(3, pane.terminal.screens.get(.primary).?.cursor.x);
-    try testing.expectEqual(1, pane.terminal.screens.get(.primary).?.cursor.y);
-    try testing.expect(pane.terminal.modes.get(.origin));
+    try testing.expectEqual(pane.terminal_owner.terminal.screens.get(.alternate).?, pane.terminal_owner.terminal.screens.active);
+    try testing.expectEqual(5, pane.terminal_owner.terminal.screens.active.cursor.x);
+    try testing.expectEqual(2, pane.terminal_owner.terminal.screens.active.cursor.y);
+    try testing.expectEqual(3, pane.terminal_owner.terminal.screens.get(.primary).?.cursor.x);
+    try testing.expectEqual(1, pane.terminal_owner.terminal.screens.get(.primary).?.cursor.y);
+    try testing.expect(pane.terminal_owner.terminal.modes.get(.origin));
 
-    const primary = try pane.terminal.screens.get(.primary).?.dumpStringAlloc(
+    const primary = try pane.terminal_owner.terminal.screens.get(.primary).?.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
     );
     defer testing.allocator.free(primary);
     try testing.expectEqualStrings("primary", primary);
 
-    const alternate = try pane.terminal.screens.get(.alternate).?.dumpStringAlloc(
+    const alternate = try pane.terminal_owner.terminal.screens.get(.alternate).?.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
     );
@@ -3180,7 +3252,7 @@ test "visible snapshot preserves styled trailing cells" {
     try viewer.receivedPaneVisible(1, "\x1b[41mABC  ");
     try testing.expect(try viewer.receivedPanePending(1, ""));
 
-    const screen = pane.terminal.screens.active;
+    const screen = pane.terminal_owner.terminal.screens.active;
     const first = screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
     const last = screen.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
     try testing.expect(first.style_id != 0);
