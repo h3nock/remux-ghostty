@@ -29,6 +29,10 @@ pub const Parser = struct {
     /// exited and future data dropped).
     max_bytes: usize = 1024 * 1024,
 
+    /// Metadata from the `%begin` guard for the active block. Valid only
+    /// while `state == .block`.
+    block_meta: Notification.Block.Meta = undefined,
+
     const State = enum {
         /// Outside of any active notifications. This should drop any output
         /// unless it is '%' on the first byte of a line. The buffer will be
@@ -54,6 +58,13 @@ pub const Parser = struct {
         if (self.state == .broken) return;
 
         self.buffer.deinit();
+    }
+
+    /// True when parsing stopped because the input violated control-mode
+    /// framing. In that case the parser reports `.exit` once as the terminal
+    /// notification; a clean tmux `%exit` leaves this false.
+    pub fn isBroken(self: *const Parser) bool {
+        return self.state == .broken;
     }
 
     // Handle a byte of input.
@@ -116,7 +127,9 @@ pub const Parser = struct {
                 )) |v| v + 1 else 0;
                 const line = written[idx..];
 
-                if (parseBlockTerminator(line)) |terminator| {
+                if (parseBlockGuard(line)) |guard| if (guard.kind != .begin and
+                    std.meta.eql(guard.meta, self.block_meta))
+                {
                     const output = std.mem.trimRight(
                         u8,
                         written[0..idx],
@@ -126,14 +139,19 @@ pub const Parser = struct {
                     // Important: do not clear buffer since the notification
                     // contains it.
                     self.state = .idle;
-                    switch (terminator) {
-                        .end => return .{ .block_end = output },
+                    const block: Notification.Block = .{
+                        .data = output,
+                        .meta = guard.meta,
+                    };
+                    switch (guard.kind) {
+                        .begin => unreachable,
+                        .end => return .{ .block_end = block },
                         .err => {
                             log.warn("tmux control mode error={s}", .{output});
-                            return .{ .block_err = output };
+                            return .{ .block_err = block };
                         },
                     }
-                }
+                };
 
                 // Didn't end the block, continue accumulating.
             },
@@ -148,19 +166,26 @@ pub const Parser = struct {
 
     const ParseError = error{RegexError};
 
-    const BlockTerminator = enum { end, err };
+    const BlockGuard = struct {
+        kind: Kind,
+        meta: Notification.Block.Meta,
+
+        const Kind = enum { begin, end, err };
+    };
 
     /// Block payload is raw data, so a line only terminates a block if it
     /// exactly matches tmux's `%end`/`%error` guard-line shape.
-    fn parseBlockTerminator(line_raw: []const u8) ?BlockTerminator {
+    fn parseBlockGuard(line_raw: []const u8) ?BlockGuard {
         var line = line_raw;
         if (line.len > 0 and line[line.len - 1] == '\r') {
             line = line[0 .. line.len - 1];
         }
 
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        var fields = std.mem.splitScalar(u8, line, ' ');
         const cmd = fields.next() orelse return null;
-        const terminator: BlockTerminator = if (std.mem.eql(u8, cmd, "%end"))
+        const kind: BlockGuard.Kind = if (std.mem.eql(u8, cmd, "%begin"))
+            .begin
+        else if (std.mem.eql(u8, cmd, "%end"))
             .end
         else if (std.mem.eql(u8, cmd, "%error"))
             .err
@@ -172,15 +197,16 @@ pub const Parser = struct {
         const flags = fields.next() orelse return null;
         const extra = fields.next();
 
-        // In the future, we should compare these to the %begin block
-        // because the tmux source guarantees that these always match and
-        // that is a more robust way to match.
-        _ = std.fmt.parseInt(usize, time, 10) catch return null;
-        _ = std.fmt.parseInt(usize, command_id, 10) catch return null;
-        _ = std.fmt.parseInt(usize, flags, 10) catch return null;
         if (extra != null) return null;
 
-        return terminator;
+        return .{
+            .kind = kind,
+            .meta = .{
+                .time = std.fmt.parseInt(u64, time, 10) catch return null,
+                .number = std.fmt.parseInt(u64, command_id, 10) catch return null,
+                .flags = std.fmt.parseInt(u32, flags, 10) catch return null,
+            },
+        };
     }
 
     fn parseNotification(self: *Parser) ParseError!?Notification {
@@ -199,14 +225,16 @@ pub const Parser = struct {
         // The notification MUST exist because we guard entering the notification
         // state on seeing at least a '%'.
         if (std.mem.eql(u8, cmd, "%begin")) {
-            // We don't use the rest of the tokens for now because tmux
-            // claims to guarantee that begin/end are always in order and
-            // never intermixed. In the future, we should probably validate
-            // this.
-            // TODO(tmuxcc): do this before merge?
+            const guard = parseBlockGuard(line) orelse {
+                log.warn("invalid tmux block guard line=\"{s}\"", .{line});
+                self.broken();
+                return .exit;
+            };
+            assert(guard.kind == .begin);
 
             // Move to block state because we expect a corresponding end/error
             // and want to accumulate the data.
+            self.block_meta = guard.meta;
             self.state = .block;
             self.buffer.clearRetainingCapacity();
             return null;
@@ -569,11 +597,13 @@ pub const Notification = union(enum) {
     /// vs truncating, etc.).
     exit,
 
-    /// Dispatched at the end of a begin/end block with the raw data.
+    /// Dispatched at the end of a begin/end block with the raw data and the
+    /// guard metadata needed to distinguish client responses from blocks
+    /// produced by the server.
     /// The control mode parser can't parse the data because it is unaware
     /// of the command that was sent to trigger this output.
-    block_end: []const u8,
-    block_err: []const u8,
+    block_end: Block,
+    block_err: Block,
 
     /// Raw tmux-escaped output from a pane. Consumers that feed a terminal
     /// must decode `data` exactly once with `decodeEscapedOutput`.
@@ -633,6 +663,21 @@ pub const Notification = union(enum) {
         data: []u8,
     };
 
+    pub const Block = struct {
+        data: []const u8,
+        meta: Meta,
+
+        pub const Meta = struct {
+            time: u64,
+            number: u64,
+            flags: u32,
+
+            pub fn isClient(self: Meta) bool {
+                return self.flags & 1 != 0;
+            }
+        };
+    };
+
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
         const T = Notification;
         const info = @typeInfo(T).@"union";
@@ -668,7 +713,11 @@ test "tmux begin/end empty" {
     for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("", n.block_end);
+    try testing.expectEqualStrings("", n.block_end.data);
+    try testing.expectEqualDeep(
+        Notification.Block.Meta{ .time = 1578922740, .number = 269, .flags = 1 },
+        n.block_end.meta,
+    );
 }
 
 test "tmux exit" {
@@ -698,7 +747,7 @@ test "tmux begin/error empty" {
     for ("%error 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_err);
-    try testing.expectEqualStrings("", n.block_err);
+    try testing.expectEqualStrings("", n.block_err.data);
 }
 
 test "tmux begin/end data" {
@@ -712,7 +761,7 @@ test "tmux begin/end data" {
     for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("hello\nworld", n.block_end);
+    try testing.expectEqualStrings("hello\nworld", n.block_end.data);
 }
 
 test "tmux block payload may start with %end" {
@@ -727,7 +776,7 @@ test "tmux block payload may start with %end" {
     for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("%end not really\nhello", n.block_end);
+    try testing.expectEqualStrings("%end not really\nhello", n.block_end.data);
 }
 
 test "tmux block payload may start with %error" {
@@ -742,7 +791,7 @@ test "tmux block payload may start with %error" {
     for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("%error not really\nhello", n.block_end);
+    try testing.expectEqualStrings("%error not really\nhello", n.block_end.data);
 }
 
 test "tmux block may terminate with real %error after misleading payload" {
@@ -757,7 +806,7 @@ test "tmux block may terminate with real %error after misleading payload" {
     for ("%error 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_err);
-    try testing.expectEqualStrings("%error not really\nhello", n.block_err);
+    try testing.expectEqualStrings("%error not really\nhello", n.block_err.data);
 }
 
 test "tmux block terminator requires exact token count" {
@@ -768,11 +817,15 @@ test "tmux block terminator requires exact token count" {
     defer c.deinit();
     for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
     for ("%end 1 1 1 trailing\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1 \n") |byte| try testing.expect(try c.put(byte) == null);
     for ("hello\n") |byte| try testing.expect(try c.put(byte) == null);
     for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("%end 1 1 1 trailing\nhello", n.block_end);
+    try testing.expectEqualStrings(
+        "%end 1 1 1 trailing\n%end 1 1 1 \nhello",
+        n.block_end.data,
+    );
 }
 
 test "tmux block terminator requires numeric metadata" {
@@ -787,7 +840,45 @@ test "tmux block terminator requires numeric metadata" {
     for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("%end foo bar baz\nhello", n.block_end);
+    try testing.expectEqualStrings("%end foo bar baz\nhello", n.block_end.data);
+}
+
+test "tmux block terminator must echo begin metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 10 20 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 10 21 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 10 20 0\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 10 20 1") |byte| try testing.expect(try c.put(byte) == null);
+
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings(
+        "%end 10 21 1\n%end 10 20 0",
+        n.block_end.data,
+    );
+    try testing.expectEqualDeep(
+        Notification.Block.Meta{ .time = 10, .number = 20, .flags = 1 },
+        n.block_end.meta,
+    );
+}
+
+test "tmux malformed begin guard breaks the parser" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin missing metadata") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const notification = (try c.put('\n')).?;
+    try testing.expect(notification == .exit);
+    try testing.expect(c.isBroken());
+    try testing.expect(try c.put('%') == null);
 }
 
 test "tmux output" {

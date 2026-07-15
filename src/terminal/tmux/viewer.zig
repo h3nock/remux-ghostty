@@ -548,10 +548,10 @@ pub const Viewer = struct {
 
             inline .block_end,
             .block_err,
-            => |content, tag| {
+            => |block, tag| {
                 self.receivedCommandOutput(
                     &actions,
-                    content,
+                    block.data,
                     tag == .block_err,
                 ) catch {
                     log.warn("failed to process command output, becoming defunct", .{});
@@ -1808,6 +1808,13 @@ const Format = struct {
     }
 };
 
+fn testClientBlock(data: []const u8) control.Notification.Block {
+    return .{
+        .data = data,
+        .meta = .{ .time = 0, .number = 0, .flags = 1 },
+    };
+}
+
 const TestStep = struct {
     input: Viewer.Input,
     contains_tags: []const std.meta.Tag(Viewer.Action) = &.{},
@@ -1901,7 +1908,7 @@ test "unsupported tmux exits before topology hydration" {
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -1910,7 +1917,7 @@ test "unsupported tmux exits before topology hydration" {
             .contains_command = "display-message",
         },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.0a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.0a") } },
             .contains_tags = &.{.exit},
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
@@ -1930,7 +1937,7 @@ test "zero history limit omits initial history capture" {
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -1939,12 +1946,12 @@ test "zero history limit omits initial history capture" {
             .contains_command = "display-message",
         },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.1" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.1") } },
             .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .{
-                .block_end = "$1 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0",
+                .block_end = testClientBlock("$1 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0"),
             } },
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
@@ -1987,7 +1994,7 @@ test "session changed resets state" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -1997,15 +2004,16 @@ test "session changed resets state" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive window layout with two panes (same format as "initial flow" test)
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
-                ,
+                .block_end = testClientBlock(
+                    \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2051,9 +2059,10 @@ test "session changed resets state" {
         // Uses same pane IDs 0,1 - they should be re-created since old panes were cleared
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
-                ,
+                .block_end = testClientBlock(
+                    \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2081,7 +2090,7 @@ test "initial flow" {
     var pre_topology_prefix = [_]u8{0xE2};
 
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 42,
@@ -2095,7 +2104,7 @@ test "initial flow" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -2117,9 +2126,10 @@ test "initial flow" {
         },
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2162,7 +2172,7 @@ test "initial flow" {
     for (first_responses) |response| {
         try testing.expectEqual(
             0,
-            viewer.next(.{ .tmux = .{ .block_end = response } }).len,
+            viewer.next(.{ .tmux = .{ .block_end = testClientBlock(response) } }).len,
         );
     }
 
@@ -2184,7 +2194,7 @@ test "initial flow" {
     };
     const expected_changes = [_]?usize{ null, 0, null, null, null, 1 };
     for (remaining_responses, expected_changes) |response, expected_change| {
-        const actions = viewer.next(.{ .tmux = .{ .block_end = response } });
+        const actions = viewer.next(.{ .tmux = .{ .block_end = testClientBlock(response) } });
         if (expected_change) |id| {
             try testing.expectEqual(1, actions.len);
             try testing.expectEqual(id, actions[0].pane_changed);
@@ -2449,7 +2459,7 @@ test "hydration command errors do not become terminal content" {
     defer arena.deinit();
     _ = try viewer.nextCommandAction(arena.allocator());
 
-    const actions = viewer.next(.{ .tmux = .{ .block_err = "no such pane" } });
+    const actions = viewer.next(.{ .tmux = .{ .block_err = testClientBlock("no such pane") } });
     try testing.expectEqual(1, actions.len);
     try testing.expect(actions[0] == .exit);
     try testing.expectEqual(Viewer.Pane.Phase.hydrating, pane.phase);
@@ -2464,7 +2474,7 @@ test "zoomed geometry follows visible layout" {
 
     const full_layout = "607b,83x44,0,0[83x22,0,0,0,83x21,0,23,1]";
     try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2473,12 +2483,12 @@ test "zoomed geometry follows visible layout" {
             .contains_command = "display-message",
         },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.1" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.1") } },
             .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .{
-                .block_end = "$1 @0 83 44 " ++ full_layout ++ " b7dd,83x44,0,0,0",
+                .block_end = testClientBlock("$1 @0 83 44 " ++ full_layout ++ " b7dd,83x44,0,0,0"),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2494,7 +2504,7 @@ test "zoomed geometry follows visible layout" {
     });
 
     for (0..9) |index| {
-        const actions = viewer.next(.{ .tmux = .{ .block_end = "" } });
+        const actions = viewer.next(.{ .tmux = .{ .block_end = testClientBlock("") } });
         const expected_change: ?usize = switch (index) {
             4 => 0,
             8 => 1,
@@ -2545,7 +2555,7 @@ test "layout change" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2555,15 +2565,16 @@ test "layout change" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2576,11 +2587,11 @@ test "layout change" {
         },
         // Complete all capture-pane commands for pane 0 (primary and alternate)
         // plus pane_state
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         // A partial layout notification cannot prove that output for an
         // undiscovered pane is stale; only a full list-windows cut can.
         .{
@@ -2625,7 +2636,7 @@ test "layout_change does not return command when queue not empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2635,15 +2646,16 @@ test "layout_change does not return command when queue not empty" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2686,7 +2698,7 @@ test "layout_change returns command when queue was empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2696,26 +2708,27 @@ test "layout_change returns command when queue was empty" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
         },
         // Complete all capture-pane commands for pane 0
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         // Queue should now be empty
         .{
-            .input = .{ .tmux = .{ .block_end = "" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("") } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -2753,7 +2766,7 @@ test "window_add queues list_windows when queue empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2763,26 +2776,27 @@ test "window_add queues list_windows when queue empty" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
         },
         // Complete all capture-pane commands for pane 0
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         // Queue should now be empty
         .{
-            .input = .{ .tmux = .{ .block_end = "" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("") } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -2814,7 +2828,7 @@ test "window_add queues list_windows when queue not empty" {
 
     try testViewer(&viewer, &.{
         // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 1,
@@ -2824,15 +2838,16 @@ test "window_add queues list_windows when queue not empty" {
         },
         // Receive version response, which triggers list-windows
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("3.5a") } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
-                .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-                ,
+                .block_end = testClientBlock(
+                    \\$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    ,
+                ),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -2859,12 +2874,12 @@ test "window_add queues list_windows when queue not empty" {
         },
         // Finish the in-flight hydration group. The final pending response
         // publishes readiness before dispatching the queued window refresh.
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
+        .{ .input = .{ .tmux = .{ .block_end = testClientBlock("") } } },
         .{
-            .input = .{ .tmux = .{ .block_end = "" } },
+            .input = .{ .tmux = .{ .block_end = testClientBlock("") } },
             .contains_command = "list-windows",
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
