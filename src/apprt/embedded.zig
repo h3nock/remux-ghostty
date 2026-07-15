@@ -1612,8 +1612,8 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.render.state.mutex.lock();
+        defer core_surface.render.state.mutex.unlock();
 
         // If we don't have a selection, do nothing.
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
@@ -1632,11 +1632,11 @@ pub const CAPI = struct {
         sel: Selection,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.render.state.mutex.lock();
+        defer surface.core_surface.render.state.mutex.unlock();
 
         const core_sel = sel.core(
-            surface.core_surface.renderer_state.terminal.screens.active,
+            surface.core_surface.render.state.terminal.screens.active,
         ) orelse return false;
 
         return readTextLocked(surface, core_sel, result);
@@ -2133,11 +2133,11 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
+            _ = surface.render.thread.mailbox.push(
                 .{ .macos_display_id = display_id },
                 .{ .forever = {} },
             );
-            surface.renderer_thread.wakeup.notify() catch {};
+            surface.render.thread.wakeup.notify() catch {};
         }
 
         /// This returns a CTFontRef that should be used for quicklook
@@ -2156,7 +2156,7 @@ pub const CAPI = struct {
             // Get the shared font grid. We acquire a read lock to
             // read the font face. It should not be deferred since
             // we're loading the primary face.
-            const grid = ptr.core_surface.renderer.font_grid;
+            const grid = ptr.core_surface.render.renderer.font_grid;
             grid.lock.lockShared();
             defer grid.lock.unlockShared();
 
@@ -2195,12 +2195,12 @@ pub const CAPI = struct {
             result: *Text,
         ) bool {
             const surface = &ptr.core_surface;
-            surface.renderer_state.mutex.lock();
-            defer surface.renderer_state.mutex.unlock();
+            surface.render.state.mutex.lock();
+            defer surface.render.state.mutex.unlock();
 
             // Get our word selection
             const sel = sel: {
-                const screen: *terminal.Screen = surface.renderer_state.terminal.screens.active;
+                const screen: *terminal.Screen = surface.render.state.terminal.screens.active;
                 const pos = try ptr.getCursorPos();
                 const pt_viewport = surface.posToViewport(pos.x, pos.y);
                 const pin = screen.pages.pin(.{

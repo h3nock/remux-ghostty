@@ -41,6 +41,7 @@ pub const Renderer = switch (build_config.renderer) {
     .opengl => GenericRenderer(OpenGL),
     .webgl => WebGL,
 };
+pub const Runtime = @import("renderer/Runtime.zig");
 
 /// The health status of a renderer. These must be shared across all
 /// renderers even if some states aren't reachable so that our API users
@@ -63,6 +64,7 @@ test {
     _ = shadertoy;
     _ = size;
     _ = EventSink;
+    _ = Runtime;
     _ = Thread;
     _ = State;
 }

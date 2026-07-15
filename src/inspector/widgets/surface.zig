@@ -56,9 +56,9 @@ pub const Inspector = struct {
 
         // Draw everything that requires the terminal state mutex.
         {
-            surface.renderer_state.mutex.lock();
-            defer surface.renderer_state.mutex.unlock();
-            const t = surface.renderer_state.terminal;
+            surface.render.state.mutex.lock();
+            defer surface.render.state.mutex.unlock();
+            const t = surface.render.state.terminal;
 
             // Terminal info window
             {
@@ -371,7 +371,7 @@ fn mouseTable(
     defer cimgui.c.ImGui_EndTable();
 
     const surface_mouse = &surface.mouse;
-    const t = surface.renderer_state.terminal;
+    const t = surface.render.state.terminal;
 
     {
         const hover_point: terminal.point.Coordinate = pt: {
