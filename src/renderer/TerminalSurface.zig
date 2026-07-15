@@ -2,23 +2,56 @@
 pub const TerminalSurface = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const crash = @import("../crash/main.zig");
 const font = @import("../font/main.zig");
+const input = @import("../input.zig");
 const rendererpkg = @import("../renderer.zig");
 const sizepkg = @import("size.zig");
 const terminal = @import("../terminal/main.zig");
 
+const log = std.log.scoped(.terminal_surface);
+
+alloc: std.mem.Allocator,
 runtime: rendererpkg.Runtime,
 size: rendererpkg.Size,
 shared: *terminal.Shared,
+write_sink: ?WriteSink,
+macos_option_as_alt: input.OptionAsAlt,
+vt_kam_allowed: bool,
+selection_clear_on_typing: bool,
+scroll_to_bottom_on_keystroke: bool,
 explicit_padding: rendererpkg.Padding,
 padding_balance: sizepkg.PaddingBalance,
 /// Scheduling hint shared with terminal producers. Terminal contents remain
 /// synchronized by Shared.mutex.
 visible: std.atomic.Value(bool),
 focused: bool,
+
+/// Synchronous admission boundary for already encoded terminal input. The
+/// callback borrows `data` only until it returns and must copy or enqueue it
+/// before returning true. It runs outside Shared.mutex and must not reenter a
+/// TerminalSurface operation.
+pub const WriteSink = struct {
+    ptr: *anyopaque,
+    callback: *const fn (ptr: *anyopaque, data: []const u8) bool,
+
+    fn write(self: WriteSink, data: []const u8) bool {
+        return self.callback(self.ptr, data);
+    }
+};
+
+/// Result of terminal-aware key or paste admission.
+pub const InputResult = enum(c_int) {
+    sent,
+    consumed_no_output,
+    not_accepted,
+    unavailable,
+    invalid_input,
+    out_of_memory,
+};
 
 pub const Options = struct {
     alloc: std.mem.Allocator,
@@ -31,6 +64,8 @@ pub const Options = struct {
     explicit_padding: rendererpkg.Padding,
     padding_balance: sizepkg.PaddingBalance,
     event_sink: rendererpkg.EventSink,
+    write_sink: ?WriteSink = null,
+    macos_option_as_alt: input.OptionAsAlt = .false,
     crash_context: ?crash.sentry.ThreadState,
     visible: bool = true,
     focused: bool = true,
@@ -51,9 +86,15 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     try rendererpkg.Renderer.surfaceInit(opts.rt_surface);
 
     self.* = .{
+        .alloc = opts.alloc,
         .runtime = undefined,
         .size = undefined,
         .shared = shared,
+        .write_sink = opts.write_sink,
+        .macos_option_as_alt = opts.macos_option_as_alt,
+        .vt_kam_allowed = opts.config.@"vt-kam-allowed",
+        .selection_clear_on_typing = opts.config.@"selection-clear-on-typing",
+        .scroll_to_bottom_on_keystroke = opts.config.@"scroll-to-bottom".keystroke,
         .explicit_padding = opts.explicit_padding,
         .padding_balance = opts.padding_balance,
         .visible = .init(opts.visible),
@@ -141,7 +182,459 @@ pub fn desiredGridSize(self: *const TerminalSurface) rendererpkg.GridSize {
     return self.size.grid();
 }
 
+/// Filter modifiers for native text translation. The original modifiers must
+/// still be passed to `key` so terminal encoding can apply Alt semantics.
+pub fn keyTranslationMods(
+    self: *const TerminalSurface,
+    mods: input.Mods,
+) input.Mods {
+    return mods.translation(self.macos_option_as_alt);
+}
+
+/// Encode and synchronously admit one key event. Terminal modes are
+/// snapshotted under Shared.mutex; encoding and the write callback are
+/// lock-free. Local selection and viewport effects are applied only after the
+/// sink accepts the complete encoding.
+pub fn key(
+    self: *TerminalSurface,
+    event: input.KeyEvent,
+) InputResult {
+    const encoding_opts: input.key_encode.Options = opts: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+
+        if (self.vt_kam_allowed and
+            self.shared.terminal.modes.get(.disable_keyboard))
+        {
+            return .consumed_no_output;
+        }
+
+        var opts: input.key_encode.Options = .fromTerminal(
+            &self.shared.terminal,
+        );
+        opts.macos_option_as_alt = self.macos_option_as_alt;
+        break :opts opts;
+    };
+
+    const sink = self.write_sink orelse return .unavailable;
+
+    // This matches the established process-surface fast path and contains
+    // ordinary legacy and Kitty key encodings without allocation.
+    var stack: [38]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&stack);
+    input.key_encode.encode(&writer, event, encoding_opts) catch |err| switch (err) {
+        error.WriteFailed => return self.keyLong(sink, event, encoding_opts),
+    };
+
+    const encoded = writer.buffered();
+    if (encoded.len == 0) return .not_accepted;
+    if (!sink.write(encoded)) return .not_accepted;
+
+    self.acceptedKey(event.key);
+    return .sent;
+}
+
+fn keyLong(
+    self: *TerminalSurface,
+    sink: WriteSink,
+    event: input.KeyEvent,
+    encoding_opts: input.key_encode.Options,
+) InputResult {
+    // Count first so the rare fallback performs exactly one allocation and
+    // never resizes. Encoding has no side effects.
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    input.key_encode.encode(
+        &counter.writer,
+        event,
+        encoding_opts,
+    ) catch unreachable;
+    const len = std.math.cast(usize, counter.fullCount()) orelse
+        return .out_of_memory;
+    if (len == 0) return .not_accepted;
+
+    const encoded = self.alloc.alloc(u8, len) catch return .out_of_memory;
+    defer self.alloc.free(encoded);
+    var writer: std.Io.Writer = .fixed(encoded);
+    input.key_encode.encode(&writer, event, encoding_opts) catch unreachable;
+    std.debug.assert(writer.buffered().len == encoded.len);
+
+    if (!sink.write(encoded)) return .not_accepted;
+    self.acceptedKey(event.key);
+    return .sent;
+}
+
+/// Transform and synchronously admit one paste as a single callback payload.
+/// Empty paste is a consumed no-op. Unchanged unbracketed input is borrowed
+/// directly; framing or byte transformation performs one combined allocation.
+pub fn paste(
+    self: *TerminalSurface,
+    data: []const u8,
+) InputResult {
+    if (data.len == 0) return .consumed_no_output;
+    const sink = self.write_sink orelse return .unavailable;
+
+    const encoding_opts: input.paste.Options = opts: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+        break :opts .fromTerminal(&self.shared.terminal);
+    };
+
+    const vecs = input.paste.encode(data, encoding_opts) catch |err| switch (err) {
+        error.MutableRequired => return self.pasteAllocated(
+            sink,
+            data,
+            encoding_opts,
+        ),
+    };
+
+    // The only allocation-free contiguous representation is an unchanged,
+    // unbracketed body.
+    if (vecs[0].len == 0 and vecs[2].len == 0) {
+        if (!sink.write(vecs[1])) return .not_accepted;
+        self.acceptedPaste();
+        return .sent;
+    }
+
+    return self.pasteAllocated(sink, data, encoding_opts);
+}
+
+fn pasteAllocated(
+    self: *TerminalSurface,
+    sink: WriteSink,
+    data: []const u8,
+    encoding_opts: input.paste.Options,
+) InputResult {
+    const fence_len: usize = if (encoding_opts.bracketed) 6 else 0;
+    const framed_len = std.math.add(
+        usize,
+        data.len,
+        2 * fence_len,
+    ) catch return .out_of_memory;
+
+    const encoded = self.alloc.alloc(u8, framed_len) catch return .out_of_memory;
+    defer self.alloc.free(encoded);
+    const body = encoded[fence_len .. fence_len + data.len];
+    @memcpy(body, data);
+
+    const vecs = input.paste.encode(body, encoding_opts);
+    std.debug.assert(vecs[0].len == fence_len);
+    std.debug.assert(vecs[2].len == fence_len);
+    @memcpy(encoded[0..fence_len], vecs[0]);
+    @memcpy(encoded[fence_len + data.len ..], vecs[2]);
+
+    if (!sink.write(encoded)) return .not_accepted;
+    self.acceptedPaste();
+    return .sent;
+}
+
+fn acceptedKey(self: *TerminalSurface, key_value: input.Key) void {
+    if (key_value.modifier()) return;
+
+    var changed = false;
+    self.shared.mutex.lock();
+    const screen = self.shared.terminal.screens.active;
+    if ((self.selection_clear_on_typing or key_value == .escape) and
+        screen.selection != null)
+    {
+        screen.clearSelection();
+        changed = true;
+    }
+    if (self.scroll_to_bottom_on_keystroke and !screen.viewportIsBottom()) {
+        self.shared.terminal.scrollViewport(.bottom);
+        changed = true;
+    }
+    self.shared.mutex.unlock();
+
+    if (changed) self.inputEffectsChanged();
+}
+
+fn acceptedPaste(self: *TerminalSurface) void {
+    var changed = false;
+    self.shared.mutex.lock();
+    if (!self.shared.terminal.screens.active.viewportIsBottom()) {
+        self.shared.terminal.scrollViewport(.bottom);
+        changed = true;
+    }
+    self.shared.mutex.unlock();
+
+    if (changed) self.inputEffectsChanged();
+}
+
+fn inputEffectsChanged(self: *TerminalSurface) void {
+    self.terminalChanged() catch |err| {
+        // The sink has already accepted the bytes, so reporting failure would
+        // invite duplicate input on retry. Dirty terminal state remains
+        // available to a later draw or successful notification.
+        log.err("failed to wake renderer after accepted input err={}", .{err});
+    };
+}
+
 fn queueAndWake(self: *TerminalSurface, message: rendererpkg.Message) !void {
     _ = self.runtime.thread.mailbox.push(message, .{ .forever = {} });
     try self.runtime.thread.wakeup.notify();
+}
+
+const TestSink = struct {
+    shared: *terminal.Shared,
+    accept: bool = true,
+    calls: usize = 0,
+    lock_was_free: bool = false,
+    last_ptr: ?[*]const u8 = null,
+    data: [256]u8 = undefined,
+    len: usize = 0,
+
+    fn writeSink(self: *TestSink) WriteSink {
+        return .{ .ptr = self, .callback = write };
+    }
+
+    fn write(ptr: *anyopaque, data: []const u8) bool {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.last_ptr = data.ptr;
+        self.len = data.len;
+        @memcpy(self.data[0..data.len], data);
+        self.lock_was_free = self.shared.mutex.tryLock();
+        if (self.lock_was_free) self.shared.mutex.unlock();
+        return self.accept;
+    }
+};
+
+fn testSurface(
+    alloc: std.mem.Allocator,
+    shared: *terminal.Shared,
+    write_sink: ?WriteSink,
+) TerminalSurface {
+    return .{
+        .alloc = alloc,
+        .runtime = undefined,
+        .size = undefined,
+        .shared = shared,
+        .write_sink = write_sink,
+        .macos_option_as_alt = .false,
+        .vt_kam_allowed = false,
+        .selection_clear_on_typing = true,
+        .scroll_to_bottom_on_keystroke = true,
+        .explicit_padding = undefined,
+        .padding_balance = undefined,
+        // Headless tests suppress renderer notification after verifying the
+        // terminal-side effects published before it.
+        .visible = .init(false),
+        .focused = true,
+    };
+}
+
+fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
+    shared.mutex.lock();
+    defer shared.mutex.unlock();
+    const screen = shared.terminal.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    shared.terminal.scrollViewport(.top);
+}
+
+fn testCompressionActivity(shared: *terminal.Shared) u64 {
+    shared.mutex.lock();
+    defer shared.mutex.unlock();
+    return shared.terminal.compressionActivity();
+}
+
+test "terminal surface key admission contract" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    var surface = testSurface(tracking.allocator(), shared, sink.writeSink());
+    const letter: input.KeyEvent = .{
+        .key = .key_a,
+        .utf8 = "a",
+        .unshifted_codepoint = 'a',
+    };
+
+    try testing.expectEqual(InputResult.sent, surface.key(.{
+        .key = .arrow_up,
+    }));
+    try testing.expectEqualStrings("\x1b[A", sink.data[0..sink.len]);
+    try testing.expect(sink.lock_was_free);
+    try testing.expectEqual(@as(usize, 0), tracking.allocations);
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.cursor_keys, true);
+    shared.mutex.unlock();
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.key(.{
+        .key = .arrow_up,
+    }));
+    try testing.expectEqualStrings("\x1bOA", sink.data[0..sink.len]);
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.disable_keyboard, true);
+    shared.mutex.unlock();
+    surface.vt_kam_allowed = true;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.key(.{
+        .key = .arrow_up,
+    }));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    surface.write_sink = null;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.key(.{}));
+    surface.write_sink = sink.writeSink();
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.disable_keyboard, false);
+    shared.mutex.unlock();
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.not_accepted, surface.key(.{}));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+
+    try setTestSelectionAndViewport(shared);
+    sink.accept = false;
+    try testing.expectEqual(InputResult.not_accepted, surface.key(letter));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+    }
+
+    sink.accept = true;
+    try testing.expectEqual(InputResult.sent, surface.key(letter));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection == null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
+    }
+    const compression_before_noop_key = testCompressionActivity(shared);
+    try testing.expectEqual(InputResult.sent, surface.key(letter));
+    try testing.expectEqual(
+        compression_before_noop_key,
+        testCompressionActivity(shared),
+    );
+
+    var unavailable = testSurface(testing.allocator, shared, null);
+    try testing.expectEqual(InputResult.unavailable, unavailable.key(letter));
+    try testing.expectEqual(InputResult.unavailable, unavailable.key(.{}));
+
+    // Escape clears even when selection-clear-on-typing is disabled.
+    try setTestSelectionAndViewport(shared);
+    surface.selection_clear_on_typing = false;
+    surface.scroll_to_bottom_on_keystroke = false;
+    try testing.expectEqual(InputResult.sent, surface.key(.{
+        .key = .escape,
+    }));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection == null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+    }
+
+    surface.macos_option_as_alt = .true;
+    const original: input.Mods = .{ .alt = true };
+    const translated = surface.keyTranslationMods(original);
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        try testing.expect(!translated.alt);
+        try testing.expectEqual(InputResult.sent, surface.key(.{
+            .key = .key_b,
+            .mods = original,
+            .utf8 = "b",
+            .unshifted_codepoint = 'b',
+        }));
+        try testing.expectEqualStrings("\x1bb", sink.data[0..sink.len]);
+    } else {
+        try testing.expect(translated.alt);
+    }
+
+    const long = "x" ** 128;
+    try testing.expectEqual(InputResult.sent, surface.key(.{ .utf8 = long }));
+    try testing.expectEqualStrings(long, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(usize, 1), tracking.allocations);
+    try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+}
+
+test "terminal surface paste admission contract" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    var surface = testSurface(tracking.allocator(), shared, sink.writeSink());
+
+    try setTestSelectionAndViewport(shared);
+    try testing.expectEqual(InputResult.consumed_no_output, surface.paste(""));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+    }
+    var unavailable = testSurface(testing.allocator, shared, null);
+    try testing.expectEqual(InputResult.consumed_no_output, unavailable.paste(""));
+    try testing.expectEqual(InputResult.unavailable, unavailable.paste("plain"));
+
+    const unchanged = "plain";
+    try testing.expectEqual(InputResult.sent, surface.paste(unchanged));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(unchanged, sink.data[0..sink.len]);
+    try testing.expect(sink.last_ptr.? == unchanged.ptr);
+    try testing.expect(sink.lock_was_free);
+    try testing.expectEqual(@as(usize, 0), tracking.allocations);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
+    }
+    const compression_before_noop_paste = testCompressionActivity(shared);
+    try testing.expectEqual(InputResult.sent, surface.paste(unchanged));
+    try testing.expectEqual(
+        compression_before_noop_paste,
+        testCompressionActivity(shared),
+    );
+
+    try setTestSelectionAndViewport(shared);
+    sink.accept = false;
+    try testing.expectEqual(InputResult.not_accepted, surface.paste(unchanged));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+    }
+    sink.accept = true;
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.bracketed_paste, true);
+    shared.mutex.unlock();
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.paste("a\nb\x00c"));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[200~a\nb c\x1b[201~", sink.data[0..sink.len]);
+    try testing.expectEqual(@as(usize, 1), tracking.allocations);
+    try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.bracketed_paste, false);
+    shared.mutex.unlock();
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.paste("a\nb\x03c"));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("a\rb c", sink.data[0..sink.len]);
+    try testing.expectEqual(@as(usize, 2), tracking.allocations);
+    try testing.expectEqual(@as(usize, 2), tracking.deallocations);
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    surface.alloc = failing.allocator();
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.out_of_memory, surface.paste("line\n"));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
 }

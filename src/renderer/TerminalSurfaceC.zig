@@ -4,6 +4,7 @@
 const std = @import("std");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
+const input = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const SharedTerminal = @import("../terminal/Shared.zig");
 const terminal = @import("../terminal/main.zig");
@@ -23,6 +24,14 @@ pub const RendererHealthCallback = *const fn (
     health: renderer.Health,
 ) callconv(.c) void;
 
+pub const WriteCallback = *const fn (
+    userdata: ?*anyopaque,
+    data: [*]const u8,
+    len: usize,
+) callconv(.c) bool;
+
+pub const InputResult = renderer.TerminalSurface.InputResult;
+
 pub const Platform = apprt.embedded.Platform.C;
 
 pub const Config = extern struct {
@@ -30,6 +39,7 @@ pub const Config = extern struct {
     platform: Platform = undefined,
     userdata: ?*anyopaque = null,
     renderer_health_cb: ?RendererHealthCallback = null,
+    write_cb: ?WriteCallback = null,
     scale_factor: f64 = 1,
     font_size: f32 = 0,
     width_px: u32 = 0,
@@ -49,6 +59,12 @@ pub const SurfaceSize = extern struct {
 
 fn configNew() Config {
     return .{};
+}
+
+fn inputSlice(data_ptr: ?[*]const u8, len: usize) ?[]const u8 {
+    if (len == 0) return &.{};
+    const data = data_ptr orelse return null;
+    return data[0..len];
 }
 
 fn validConfig(config: Config) bool {
@@ -92,6 +108,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         core: renderer.TerminalSurface,
         userdata: ?*anyopaque,
         renderer_health_cb: ?RendererHealthCallback,
+        write_cb: ?WriteCallback,
 
         const event_vtable: renderer.EventSink.VTable = .{
             .scrollbar = eventScrollbar,
@@ -127,6 +144,19 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             // this sink for an app-thread redraw. Do not fabricate a process
             // Surface target for a path this runtime does not use.
             log.warn("unexpected app-thread redraw request for terminal surface", .{});
+        }
+
+        fn writeSink(self: *Surface) ?renderer.TerminalSurface.WriteSink {
+            if (self.write_cb == null) return null;
+            return .{
+                .ptr = self,
+                .callback = write,
+            };
+        }
+
+        fn write(ptr: *anyopaque, data: []const u8) bool {
+            const self: *Surface = @ptrCast(@alignCast(ptr));
+            return self.write_cb.?(self.userdata, data.ptr, data.len);
         }
     };
 
@@ -178,6 +208,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             .core = undefined,
             .userdata = config.userdata,
             .renderer_health_cb = config.renderer_health_cb,
+            .write_cb = config.write_cb,
         };
 
         // Runtime consumes this while creating/referring to its shared font
@@ -215,6 +246,9 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             .explicit_padding = explicit_padding,
             .padding_balance = app.config.@"window-padding-balance",
             .event_sink = surface.eventSink(),
+            .write_sink = surface.writeSink(),
+            .macos_option_as_alt = app.config.@"macos-option-as-alt" orelse
+                app.keyboardLayout().detectOptionAsAlt(),
             .crash_context = null,
             .visible = config.visible,
             .focused = config.focused,
@@ -294,6 +328,40 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    /// Filter modifiers for native key translation. The original modifiers
+    /// must still be passed in the subsequent key event.
+    export fn ghostty_terminal_surface_key_translation_mods(
+        surface: ?*const Surface,
+        mods_raw: c_int,
+    ) c_int {
+        const value = surface orelse return mods_raw;
+        const mods: input.Mods = @bitCast(@as(
+            input.Mods.Backing,
+            @truncate(@as(c_uint, @bitCast(mods_raw))),
+        ));
+        const result = value.core.keyTranslationMods(mods);
+        return @intCast(@as(input.Mods.Backing, @bitCast(result)));
+    }
+
+    export fn ghostty_terminal_surface_key(
+        surface: ?*Surface,
+        event: apprt.embedded.KeyEventC,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const core_event = event.core() orelse return .invalid_input;
+        return value.core.key(core_event);
+    }
+
+    export fn ghostty_terminal_surface_paste(
+        surface: ?*Surface,
+        data_ptr: ?[*]const u8,
+        len: usize,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const data = inputSlice(data_ptr, len) orelse return .invalid_input;
+        return value.core.paste(data);
+    }
+
     fn operationError(comptime operation: []const u8, err: anyerror) Result {
         log.err("terminal surface operation failed operation={s} err={}", .{
             operation,
@@ -319,6 +387,7 @@ test "terminal surface C ABI matches ghostty header" {
     const c = @import("ghostty.h");
 
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_action_renderer_health_e));
     try testing.expectEqual(
         @as(c_int, @intFromEnum(Result.ok)),
@@ -327,6 +396,30 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expectEqual(
         @as(c_int, @intFromEnum(Result.renderer_in_use)),
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_RESULT_RENDERER_IN_USE),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.sent)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_SENT),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.consumed_no_output)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_CONSUMED_NO_OUTPUT),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.not_accepted)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_NOT_ACCEPTED),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.unavailable)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_UNAVAILABLE),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.invalid_input)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_INVALID_INPUT),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(InputResult.out_of_memory)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_OUT_OF_MEMORY),
     );
     try testing.expectEqual(
         @as(c_int, @intFromEnum(renderer.Health.healthy)),
@@ -340,6 +433,7 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expectEqual(@alignOf(Platform), @alignOf(c.ghostty_platform_u));
     try expectStructLayout(Config, c.ghostty_terminal_surface_config_s);
     try expectStructLayout(SurfaceSize, c.ghostty_surface_size_s);
+    try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
 }
 
 test "terminal surface C config defaults and validation" {
@@ -351,6 +445,7 @@ test "terminal surface C config defaults and validation" {
     try testing.expectEqual(@as(u32, 0), config.height_px);
     try testing.expect(config.visible);
     try testing.expect(config.focused);
+    try testing.expect(config.write_cb == null);
     try testing.expect(!validConfig(config));
 
     config.width_px = 390;
@@ -368,4 +463,26 @@ test "terminal surface C invalid platform tag is invalid input" {
         Result.invalid_input,
         mapError(error.InvalidEnumTag),
     );
+}
+
+test "terminal surface C input validation and key mapping" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 0), inputSlice(null, 0).?.len);
+    try testing.expect(inputSlice(null, 1) == null);
+    const bytes = "a\x00b";
+    try testing.expectEqualSlices(u8, bytes, inputSlice(bytes.ptr, bytes.len).?);
+
+    const valid: apprt.embedded.KeyEventC = .{
+        .action = @intFromEnum(input.Action.press),
+        .mods = 0,
+        .consumed_mods = 0,
+        .keycode = 0,
+        .text = "a",
+        .unshifted_codepoint = 'a',
+        .composing = false,
+    };
+    try testing.expect(valid.core() != null);
+    var invalid = valid;
+    invalid.action = 99;
+    try testing.expect(invalid.core() == null);
 }

@@ -886,6 +886,20 @@ typedef enum {
   GHOSTTY_TERMINAL_SURFACE_RESULT_FAILED,
 } ghostty_terminal_surface_result_e;
 
+typedef enum {
+  // The complete encoded payload was accepted by write_cb.
+  GHOSTTY_TERMINAL_SURFACE_INPUT_SENT,
+  // The input was valid but intentionally produced no payload. This is
+  // returned for KAM-consumed keys and empty pastes.
+  GHOSTTY_TERMINAL_SURFACE_INPUT_CONSUMED_NO_OUTPUT,
+  // The key was unencodable or write_cb rejected the complete payload.
+  GHOSTTY_TERMINAL_SURFACE_INPUT_NOT_ACCEPTED,
+  // No write_cb was configured.
+  GHOSTTY_TERMINAL_SURFACE_INPUT_UNAVAILABLE,
+  GHOSTTY_TERMINAL_SURFACE_INPUT_INVALID_INPUT,
+  GHOSTTY_TERMINAL_SURFACE_INPUT_OUT_OF_MEMORY,
+} ghostty_terminal_surface_input_result_e;
+
 // Called synchronously from draw or asynchronously from renderer/GPU completion
 // work. The callback must be thread-safe and may only record the value or signal
 // other work. It must not call any ghostty_terminal_surface_* function. Userdata
@@ -894,11 +908,23 @@ typedef void (*ghostty_terminal_surface_renderer_health_cb)(
     void*,
     ghostty_action_renderer_health_e);
 
+// Called synchronously by terminal-surface key and paste operations on the
+// presentation-owner thread. The bytes are borrowed only for the callback;
+// copy or enqueue them before returning true. True means the complete payload
+// was admitted; false rejects it. The callback must not call any
+// ghostty_terminal_surface_* function. write_cb and userdata must remain valid
+// until ghostty_terminal_surface_free returns.
+typedef bool (*ghostty_terminal_surface_write_cb)(
+    void*,
+    const uint8_t*,
+    size_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
   void* userdata;
   ghostty_terminal_surface_renderer_health_cb renderer_health_cb;
+  ghostty_terminal_surface_write_cb write_cb;
   double scale_factor;
   float font_size;
   uint32_t width_px;
@@ -1296,22 +1322,25 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // Renderer-only surface over an existing terminal. The app supplies shared
 // configuration and font resources and must outlive the surface. The platform
 // view is unretained and must also outlive the surface. Creation snapshots the
-// app configuration, theme, and content scale; recreate the surface to adopt
-// changes to any of them. The supplied terminal remains caller-owned because
-// the surface retains its own reference.
+// app configuration, theme, content scale, and keyboard-layout-derived
+// OptionAsAlt policy; recreate the surface to adopt changes to any of them. The
+// supplied terminal remains caller-owned because the surface retains its own
+// reference.
 //
 // width_px and height_px are required exact nonzero backing-pixel dimensions of
 // the already-sized platform view. These calls notify the renderer; they do not
 // resize the native view. The host must resize the view first and then report
 // matching dimensions.
 //
-// Presentation setters, draw, size, and free must be serialized by one
+// Presentation setters, input, draw, size, and free must be serialized by one
 // presentation owner. terminal_changed may run concurrently after the terminal
 // mutation was published under its mutex, but every such call must finish and no
 // new call may begin before free. Free stops and joins the renderer before
-// returning. If terminal_changed or a presentation setter returns non-OK, its
-// wake may have failed after work was admitted; a host keeping the surface must
-// retry the same notification or value.
+// returning. Input callbacks must return before free begins. If terminal_changed
+// or a presentation setter returns non-OK, its wake may have failed after work
+// was admitted; a host keeping the surface must retry the same notification or
+// value. Input never returns a failure after write_cb accepts bytes, because a
+// retry would duplicate input; renderer wake failures are logged instead.
 GHOSTTY_API ghostty_terminal_surface_config_s
 ghostty_terminal_surface_config_new(void);
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_new(
@@ -1339,6 +1368,34 @@ GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_set_size(
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_size(
     ghostty_terminal_surface_t,
     ghostty_surface_size_s*);
+
+// Filter modifiers for native text translation. Pass the original unfiltered
+// modifiers in the following key event.
+GHOSTTY_API ghostty_input_mods_e
+ghostty_terminal_surface_key_translation_mods(
+    ghostty_terminal_surface_t,
+    ghostty_input_mods_e);
+
+// Host/global keybindings remain the host's responsibility. This operation
+// applies terminal keyboard modes, synchronously admits at most one complete
+// payload through write_cb, then applies accepted-key selection/viewport
+// effects. write_cb rejection, missing input, and unencodable keys do not
+// mutate presentation state.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_key(
+    ghostty_terminal_surface_t,
+    ghostty_input_key_s);
+
+// Clipboard access and unsafe-paste confirmation remain host policy. Embedded
+// NUL is supported. Prefix, transformed body, and suffix are admitted through
+// exactly one write_cb invocation. A NULL pointer is valid only when len is 0;
+// empty paste is CONSUMED_NO_OUTPUT and does not invoke write_cb or mutate the
+// viewport.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_paste(
+    ghostty_terminal_surface_t,
+    const uint8_t*,
+    size_t);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);
