@@ -1463,6 +1463,24 @@ ghostty_terminal_surface_key(
     ghostty_terminal_surface_t,
     ghostty_input_key_s);
 
+// Already-committed text without a physical key event, such as software-
+// keyboard or IME output. Accepted nonempty length-delimited bytes are admitted
+// unchanged through exactly one write_cb invocation: no key encoding or paste
+// transformation is applied, and embedded NUL and control bytes are supported.
+// Physical keys must use terminal_surface_key so terminal keyboard protocols
+// are honored; clipboard paste must use terminal_surface_paste so paste modes
+// are honored. A NULL pointer is valid only when len is 0; empty input is
+// CONSUMED_NO_OUTPUT and does not invoke write_cb or mutate presentation state.
+// When the creation snapshot permits KAM and the terminal enables it, nonempty
+// input is also consumed without write_cb. Only accepted input applies the
+// configured selection-clear and keystroke scroll-to-bottom presentation
+// effects; unavailable or rejected input mutates nothing.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_input(
+    ghostty_terminal_surface_t,
+    const uint8_t*,
+    size_t);
+
 // Clipboard access and unsafe-paste confirmation remain host policy. Embedded
 // NUL is supported. Prefix, transformed body, and suffix are admitted through
 // exactly one write_cb invocation. A NULL pointer is valid only when len is 0;

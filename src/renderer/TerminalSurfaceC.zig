@@ -508,6 +508,16 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return value.core.key(core_event);
     }
 
+    export fn ghostty_terminal_surface_input(
+        surface: ?*Surface,
+        data_ptr: ?[*]const u8,
+        len: usize,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const data = inputSlice(data_ptr, len) orelse return .invalid_input;
+        return value.core.committedText(data);
+    }
+
     export fn ghostty_terminal_surface_paste(
         surface: ?*Surface,
         data_ptr: ?[*]const u8,
@@ -629,6 +639,7 @@ test "terminal surface C ABI matches ghostty header" {
     const testing = std.testing;
     const c = @import("ghostty.h");
 
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_input"));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_action_renderer_health_e));

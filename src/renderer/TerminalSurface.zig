@@ -47,7 +47,7 @@ pub const WriteSink = struct {
     }
 };
 
-/// Result of terminal-aware key or paste admission.
+/// Result of terminal-aware input admission.
 pub const InputResult = enum(c_int) {
     sent,
     consumed_no_output,
@@ -1238,6 +1238,29 @@ fn keyLong(
     return .sent;
 }
 
+/// Synchronously admit already-committed text without key encoding or paste
+/// transformation. This is for software-keyboard and IME commits that have no
+/// physical key event. The caller's bytes are borrowed through the synchronous
+/// sink and may contain arbitrary values, including NUL and control bytes.
+pub fn committedText(
+    self: *TerminalSurface,
+    data: []const u8,
+) InputResult {
+    if (data.len == 0) return .consumed_no_output;
+
+    self.shared.mutex.lock();
+    const keyboard_disabled = self.vt_kam_allowed and
+        self.shared.terminal.modes.get(.disable_keyboard);
+    self.shared.mutex.unlock();
+    if (keyboard_disabled) return .consumed_no_output;
+
+    const sink = self.write_sink orelse return .unavailable;
+    if (!sink.write(data)) return .not_accepted;
+
+    self.acceptedTyping(false);
+    return .sent;
+}
+
 /// Transform and synchronously admit one paste as a single callback payload.
 /// Empty paste is a consumed no-op. Unchanged unbracketed input is borrowed
 /// directly; framing or byte transformation performs one combined allocation.
@@ -1305,10 +1328,17 @@ fn pasteAllocated(
 fn acceptedKey(self: *TerminalSurface, key_value: input.Key) void {
     if (key_value.modifier()) return;
 
+    self.acceptedTyping(key_value == .escape);
+}
+
+fn acceptedTyping(
+    self: *TerminalSurface,
+    force_selection_clear: bool,
+) void {
     var changed = false;
     self.shared.mutex.lock();
     const screen = self.shared.terminal.screens.active;
-    if ((self.selection_clear_on_typing or key_value == .escape) and
+    if ((self.selection_clear_on_typing or force_selection_clear) and
         screen.selection != null)
     {
         screen.clearSelection();
@@ -1559,6 +1589,153 @@ test "terminal surface key admission contract" {
     try testing.expectEqualStrings(long, sink.data[0..sink.len]);
     try testing.expectEqual(@as(usize, 1), tracking.allocations);
     try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+}
+
+test "terminal surface committed text admission contract" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    var surface = testSurface(tracking.allocator(), shared, sink.writeSink());
+
+    try setTestSelectionAndViewport(shared);
+    var unavailable = testSurface(testing.allocator, shared, null);
+    try testing.expectEqual(
+        InputResult.consumed_no_output,
+        unavailable.committedText(""),
+    );
+    try testing.expectEqual(
+        InputResult.unavailable,
+        unavailable.committedText("text"),
+    );
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+    }
+
+    const arbitrary = [_]u8{ 'a', 0, 0x03, 0xf0, 0x9f, 0x98, 0x80 };
+    shared.mutex.lock();
+    shared.terminal.modes.set(.bracketed_paste, true);
+    shared.mutex.unlock();
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.committedText(&arbitrary),
+    );
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualSlices(u8, &arbitrary, sink.data[0..sink.len]);
+    try testing.expect(sink.last_ptr.? == &arbitrary);
+    try testing.expect(sink.lock_was_free);
+    try testing.expectEqual(@as(usize, 0), tracking.allocations);
+
+    try setTestSelectionAndViewport(shared);
+    shared.mutex.lock();
+    shared.terminal.modes.set(.disable_keyboard, true);
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    shared.mutex.unlock();
+    surface.vt_kam_allowed = true;
+    surface.write_sink = null;
+    sink.calls = 0;
+    try testing.expectEqual(
+        InputResult.consumed_no_output,
+        surface.committedText("blocked"),
+    );
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    surface.vt_kam_allowed = false;
+    try testing.expectEqual(
+        InputResult.unavailable,
+        surface.committedText("not gated"),
+    );
+
+    shared.mutex.lock();
+    shared.terminal.modes.set(.disable_keyboard, false);
+    shared.mutex.unlock();
+    surface.write_sink = sink.writeSink();
+    sink.accept = false;
+    try testing.expectEqual(
+        InputResult.not_accepted,
+        surface.committedText("rejected"),
+    );
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    // Committed Escape is text, not a physical Escape key, so it does not
+    // receive the key operation's unconditional Escape selection behavior.
+    sink.accept = true;
+    surface.selection_clear_on_typing = false;
+    surface.scroll_to_bottom_on_keystroke = false;
+    try testing.expectEqual(InputResult.sent, surface.committedText("\x1b"));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    surface.selection_clear_on_typing = true;
+    try testing.expectEqual(InputResult.sent, surface.committedText("clear"));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection == null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    try setTestSelectionAndViewport(shared);
+    shared.mutex.lock();
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    shared.mutex.unlock();
+    surface.selection_clear_on_typing = false;
+    surface.scroll_to_bottom_on_keystroke = true;
+    try testing.expectEqual(InputResult.sent, surface.committedText("scroll"));
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expect(shared.terminal.screens.active.selection != null);
+        try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
+        try testing.expectEqual(
+            @as(f64, 0),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    const activity = testCompressionActivity(shared);
+    try testing.expectEqual(InputResult.sent, surface.committedText("no-op"));
+    try testing.expectEqual(activity, testCompressionActivity(shared));
+    try testing.expectEqual(@as(usize, 0), tracking.allocations);
 }
 
 test "terminal surface paste admission contract" {
