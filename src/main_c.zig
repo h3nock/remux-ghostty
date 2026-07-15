@@ -47,6 +47,9 @@ comptime {
     // Sans-I/O tmux control-mode embedding API.
     _ = @import("terminal/tmux/c.zig");
 
+    // Generic terminal producer and shared terminal lifetime API.
+    _ = @import("terminal/TerminalProducerC.zig");
+
     // Renderer-only surface over an externally owned terminal.
     _ = @import("renderer/TerminalSurfaceC.zig").CAPI;
 }

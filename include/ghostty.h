@@ -59,6 +59,7 @@ typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
 typedef struct ghostty_terminal* ghostty_terminal_t;
+typedef struct ghostty_terminal_producer* ghostty_terminal_producer_t;
 typedef struct ghostty_terminal_surface* ghostty_terminal_surface_t;
 
 // Opaque handles for the sans-I/O tmux control-mode embedding API.
@@ -894,6 +895,20 @@ typedef enum {
   GHOSTTY_RENDERER_HEALTH_UNHEALTHY,
 } ghostty_action_renderer_health_e;
 
+// Generic producer for a terminal without a PTY or subprocess.
+
+typedef enum {
+  GHOSTTY_TERMINAL_PRODUCER_RESULT_OK,
+  GHOSTTY_TERMINAL_PRODUCER_RESULT_INVALID_INPUT,
+  GHOSTTY_TERMINAL_PRODUCER_RESULT_OUT_OF_MEMORY,
+} ghostty_terminal_producer_result_e;
+
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  size_t max_scrollback;
+} ghostty_terminal_producer_config_s;
+
 // Renderer-only surface over an externally supplied ghostty_terminal_t.
 
 typedef enum {
@@ -1285,6 +1300,36 @@ GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 
+// Returns the default producer configuration: 80 columns, 24 rows, and 10,000
+// bytes of scrollback. Zero max_scrollback disables scrollback.
+GHOSTTY_API ghostty_terminal_producer_config_s
+ghostty_terminal_producer_config_new(void);
+// Creates a new terminal and its persistent VT parser without a PTY,
+// subprocess, transport, callbacks, or renderer. All calls for one producer
+// must be serialized by the caller. Feed input is length-delimited, preserves
+// parser state across calls, and does not notify renderers. After feeding a
+// terminal with a live surface, the host calls
+// ghostty_terminal_surface_terminal_changed explicitly.
+GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_new(
+    const ghostty_terminal_producer_config_s*,
+    ghostty_terminal_producer_t*);
+// Returns the producer's canonical terminal with one retained reference. The
+// caller releases it exactly once with ghostty_terminal_release. Producer,
+// retained terminal, and terminal surface may be freed in any order.
+GHOSTTY_API ghostty_terminal_producer_result_e
+ghostty_terminal_producer_retain_terminal(
+    ghostty_terminal_producer_t,
+    ghostty_terminal_t*);
+// Data is borrowed only for this call. A NULL data pointer is valid only when
+// len is zero. Embedded NUL bytes are passed unchanged to the VT parser. The
+// producer does not attach to or mutate other terminals.
+GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_feed(
+    ghostty_terminal_producer_t,
+    const uint8_t*,
+    size_t);
+GHOSTTY_API void ghostty_terminal_producer_free(ghostty_terminal_producer_t);
+GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
+
 // Sans-I/O tmux control-mode client. The host owns the transport and must
 // serialize all calls for one client. Action payloads, exit details, command
 // response bodies, input failure bodies, session names, and topology views are
@@ -1358,7 +1403,6 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_retain_pane_terminal(
     ghostty_tmux_client_t,
     uint64_t,
     ghostty_terminal_t*);
-GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 
 // Renderer-only surface over an existing terminal. The app supplies shared
 // configuration and font resources and must outlive the surface. The platform

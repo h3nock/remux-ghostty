@@ -436,10 +436,6 @@ export fn ghostty_tmux_client_retain_pane_terminal(
     return .ok;
 }
 
-export fn ghostty_terminal_release(terminal: ?*SharedTerminal) void {
-    if (terminal) |value| value.release();
-}
-
 export fn ghostty_tmux_topology_visit(
     view_ptr: ?*const TopologyView,
     userdata: ?*anyopaque,
@@ -1151,7 +1147,7 @@ test "tmux C client topology and retained terminal lifetime" {
     client.deinit();
     client_live = false;
     context.client = null;
-    defer ghostty_terminal_release(retained);
+    defer retained.release();
 
     retained.mutex.lock();
     defer retained.mutex.unlock();
