@@ -41,6 +41,11 @@ pub const Key = enum {
 pub const Contents = struct {
     size: renderer.GridSize = .{ .rows = 0, .columns = 0 },
 
+    /// Physical row capacity of the CPU sources uploaded to the GPU. This can
+    /// be one row larger than `size.rows` after an adjacent shrink so a warmed
+    /// fractional-row transition can reuse the same allocations.
+    capacity_rows: terminal.size.CellCountInt = 0,
+
     /// Flat array containing cell background colors for the terminal grid.
     ///
     /// Indexed as `bg_cells[row * size.columns + col]`.
@@ -84,9 +89,22 @@ pub const Contents = struct {
         alloc: Allocator,
         size: renderer.GridSize,
     ) Allocator.Error!void {
-        self.size = size;
+        const adjacent_rows = if (self.size.rows > size.rows)
+            self.size.rows - size.rows == 1
+        else
+            size.rows - self.size.rows == 1;
+        if (self.size.columns == size.columns and
+            adjacent_rows and
+            self.capacity_rows == @max(self.size.rows, size.rows))
+        {
+            self.size = size;
+            self.reset();
+            return;
+        }
 
-        const cell_count = @as(usize, size.columns) * @as(usize, size.rows);
+        const capacity_rows = size.rows;
+
+        const cell_count = @as(usize, size.columns) * @as(usize, capacity_rows);
 
         const bg_cells = try alloc.alloc(shaderpkg.CellBg, cell_count);
         errdefer alloc.free(bg_cells);
@@ -102,12 +120,13 @@ pub const Contents = struct {
         // form a single grapheme, and multi-substitutions in fonts, the number
         // of glyphs in a row is theoretically unlimited.
         //
-        // We have size.rows + 2 lists because indexes 0 and size.rows - 1 are
+        // We have capacity_rows + 2 lists because indexes 0 and
+        // capacity_rows + 1 are
         // used for special lists containing the cursor cell which need to
         // be first and last in the buffer, respectively.
         var fg_rows: ArrayListCollection(shaderpkg.CellText) = try .init(
             alloc,
-            size.rows + 2,
+            capacity_rows + 2,
             size.columns * 3,
         );
         errdefer fg_rows.deinit(alloc);
@@ -118,8 +137,8 @@ pub const Contents = struct {
         // waste the memory.
         fg_rows.lists[0].deinit(alloc);
         fg_rows.lists[0] = try .initCapacity(alloc, 1);
-        fg_rows.lists[size.rows + 1].deinit(alloc);
-        fg_rows.lists[size.rows + 1] = try .initCapacity(alloc, 1);
+        fg_rows.lists[capacity_rows + 1].deinit(alloc);
+        fg_rows.lists[capacity_rows + 1] = try .initCapacity(alloc, 1);
 
         // Perform the swap, no going back from here.
         errdefer comptime unreachable;
@@ -127,12 +146,23 @@ pub const Contents = struct {
         self.fg_rows.deinit(alloc);
         self.bg_cells = bg_cells;
         self.fg_rows = fg_rows;
+        self.size = size;
+        self.capacity_rows = capacity_rows;
     }
 
     /// Reset the cell contents to an empty state without resizing.
     pub fn reset(self: *Contents) void {
         @memset(self.bg_cells, .{ 0, 0, 0, 0 });
         self.fg_rows.reset();
+    }
+
+    /// Active background cells for the logical render grid. The backing
+    /// allocation may retain one additional row for a warmed transition, but
+    /// that capacity tail must not be uploaded as active GPU source data.
+    pub fn activeBackgroundCells(self: *const Contents) []const shaderpkg.CellBg {
+        const len = @as(usize, self.size.columns) * @as(usize, self.size.rows);
+        assert(len <= self.bg_cells.len);
+        return self.bg_cells[0..len];
     }
 
     /// Set the cursor value. If the value is null then the cursor is hidden.
@@ -143,7 +173,7 @@ pub const Contents = struct {
     ) void {
         if (self.size.rows == 0) return;
         self.fg_rows.lists[0].clearRetainingCapacity();
-        self.fg_rows.lists[self.size.rows + 1].clearRetainingCapacity();
+        self.fg_rows.lists[self.capacity_rows + 1].clearRetainingCapacity();
 
         const cell = v orelse return;
         const style = cursor_style orelse return;
@@ -152,7 +182,7 @@ pub const Contents = struct {
             // Block cursors should be drawn first
             .block => self.fg_rows.lists[0].appendAssumeCapacity(cell),
             // Other cursor styles should be drawn last
-            .block_hollow, .bar, .underline, .lock => self.fg_rows.lists[self.size.rows + 1].appendAssumeCapacity(cell),
+            .block_hollow, .bar, .underline, .lock => self.fg_rows.lists[self.capacity_rows + 1].appendAssumeCapacity(cell),
         }
     }
 
@@ -162,8 +192,8 @@ pub const Contents = struct {
         if (self.fg_rows.lists[0].items.len > 0) {
             return self.fg_rows.lists[0].items[0];
         }
-        if (self.fg_rows.lists[self.size.rows + 1].items.len > 0) {
-            return self.fg_rows.lists[self.size.rows + 1].items[0];
+        if (self.fg_rows.lists[self.capacity_rows + 1].items.len > 0) {
+            return self.fg_rows.lists[self.capacity_rows + 1].items[0];
         }
         return null;
     }
@@ -413,6 +443,87 @@ test Contents {
     c.setCursor(cursor_cell, .block_hollow);
     try testing.expectEqual(cursor_cell, c.fg_rows.lists[rows + 1].items[0]);
     try testing.expectEqual(cursor_cell, c.getCursorGlyph().?);
+}
+
+test "Contents reuses warmed optional row CPU sources" {
+    const testing = std.testing;
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = tracking.allocator();
+    const cols = 4;
+
+    var c: Contents = .{};
+    try c.resize(alloc, .{ .rows = 2, .columns = cols });
+    defer c.deinit(alloc);
+
+    // The first growth establishes capacity for the optional row.
+    try c.resize(alloc, .{ .rows = 3, .columns = cols });
+    c.bgCell(2, 0).* = .{ 1, 2, 3, 4 };
+    try c.add(alloc, .text, .{
+        .atlas = .grayscale,
+        .grid_pos = .{ 0, 2 },
+        .color = .{ 0, 0, 0, 1 },
+    });
+    const allocations = tracking.allocations;
+    const deallocations = tracking.deallocations;
+
+    // Shrinking changes the logical grid but retains and clears the physical
+    // CPU sources that the frame upload reads.
+    try c.resize(alloc, .{ .rows = 2, .columns = cols });
+    try testing.expectEqual(allocations, tracking.allocations);
+    try testing.expectEqual(deallocations, tracking.deallocations);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 2), c.size.rows);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), c.capacity_rows);
+    try testing.expectEqual(@as(usize, 3 * cols), c.bg_cells.len);
+    try testing.expectEqual(@as(usize, 2 * cols), c.activeBackgroundCells().len);
+    try testing.expectEqual(@as(usize, 5), c.fg_rows.lists.len);
+    try testing.expectEqual(@as(usize, 0), c.fg_rows.lists[3].items.len);
+    var active_foreground_count: usize = 0;
+    for (c.fg_rows.lists) |list| active_foreground_count += list.items.len;
+    try testing.expectEqual(@as(usize, 0), active_foreground_count);
+    for (c.bg_cells[2 * cols ..]) |bg| {
+        try testing.expectEqual(shaderpkg.CellBg{ 0, 0, 0, 0 }, bg);
+    }
+
+    // Re-activating the retained row is allocation-free as well.
+    try c.resize(alloc, .{ .rows = 3, .columns = cols });
+    try testing.expectEqual(allocations, tracking.allocations);
+    try testing.expectEqual(deallocations, tracking.deallocations);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), c.size.rows);
+    try testing.expectEqual(@as(usize, 3 * cols), c.activeBackgroundCells().len);
+
+    // Reuse remains bounded to one adjacent spare row. A second consecutive
+    // shrink replaces the old capacity instead of retaining an arbitrary tail
+    // that every frame would continue scanning.
+    try c.resize(alloc, .{ .rows = 2, .columns = cols });
+    const before_second_shrink = tracking.allocations;
+    try c.resize(alloc, .{ .rows = 1, .columns = cols });
+    try testing.expect(tracking.allocations > before_second_shrink);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 1), c.size.rows);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 1), c.capacity_rows);
+    try testing.expectEqual(@as(usize, cols), c.activeBackgroundCells().len);
+}
+
+test "Contents resize publishes geometry only after allocation succeeds" {
+    const testing = std.testing;
+    const initial = renderer.GridSize{ .rows = 2, .columns = 4 };
+
+    var c: Contents = .{};
+    try c.resize(testing.allocator, initial);
+    defer c.deinit(testing.allocator);
+
+    const background = c.bg_cells.ptr;
+    const foreground = c.fg_rows.lists.ptr;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.OutOfMemory,
+        c.resize(failing.allocator(), .{ .rows = 4, .columns = 4 }),
+    );
+    try testing.expectEqualDeep(initial, c.size);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 2), c.capacity_rows);
+    try testing.expectEqual(background, c.bg_cells.ptr);
+    try testing.expectEqual(foreground, c.fg_rows.lists.ptr);
 }
 
 test "Contents clear retains other content" {

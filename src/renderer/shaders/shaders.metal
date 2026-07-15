@@ -17,6 +17,7 @@ struct Uniforms {
   float4 grid_padding;
   uint8_t padding_extend;
   float min_contrast;
+  float scroll_cell_offset;
   ushort2 cursor_pos;
   uchar4 cursor_color;
   uchar4 bg_color;
@@ -25,6 +26,16 @@ struct Uniforms {
   bool use_linear_blending;
   bool use_linear_correction;
 };
+
+float scroll_pixel_offset(constant Uniforms& uniforms) {
+  return uniforms.scroll_cell_offset * uniforms.cell_size.y;
+}
+
+bool in_terminal_vertical_clip(float terminal_y, constant Uniforms& uniforms) {
+  float terminal_height = uniforms.screen_size.y -
+    (uniforms.grid_padding.x + uniforms.grid_padding.z);
+  return terminal_y >= 0.0 && terminal_y < terminal_height;
+}
 
 //-------------------------------------------------------------------
 // Color Functions
@@ -453,7 +464,10 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  float2 terminal_pos = in.position.xy - uniforms.grid_padding.wx;
+  float2 sample_pos = terminal_pos;
+  sample_pos.y += scroll_pixel_offset(uniforms);
+  int2 grid_pos = int2(floor(sample_pos / uniforms.cell_size));
 
   float4 bg = float4(0.0);
 
@@ -472,8 +486,27 @@ fragment float4 cell_bg_fragment(
     }
   }
 
-  // Clamp y position if we should extend, otherwise discard if out of bounds.
-  if (grid_pos.y < 0) {
+  // Fractional sampling may address the extra materialized row, but clipping
+  // and padding decisions still use the visible viewport. With no fractional
+  // offset, retain the original grid-position boundary path exactly.
+  if (uniforms.scroll_cell_offset != 0.0) {
+    float terminal_height = uniforms.screen_size.y -
+      (uniforms.grid_padding.x + uniforms.grid_padding.z);
+    if (terminal_pos.y < 0.0) {
+      if (uniforms.padding_extend & EXTEND_UP) {
+        grid_pos.y = 0;
+      } else {
+        return bg;
+      }
+    } else if (terminal_pos.y >= terminal_height) {
+      if (uniforms.padding_extend & EXTEND_DOWN) {
+        grid_pos.y = uniforms.grid_size.y - 1;
+      } else {
+        return bg;
+      }
+    }
+    grid_pos.y = clamp(grid_pos.y, 0, int(uniforms.grid_size.y) - 1);
+  } else if (grid_pos.y < 0) {
     if (uniforms.padding_extend & EXTEND_UP) {
       grid_pos.y = 0;
     } else {
@@ -617,6 +650,7 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
+  cell_pos.y -= scroll_pixel_offset(uniforms);
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
@@ -686,6 +720,12 @@ fragment float4 cell_text_fragment(
     address::clamp_to_edge,
     filter::nearest
   );
+
+  if (uniforms.scroll_cell_offset != 0.0 &&
+      !in_terminal_vertical_clip(
+        in.position.y - uniforms.grid_padding.x,
+        uniforms
+      )) return float4(0.0);
 
   switch (in.atlas) {
     default:
@@ -822,6 +862,7 @@ vertex ImageVertexOut image_vertex(
   // adds the source rect width/height components.
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
+  image_pos.y -= scroll_pixel_offset(uniforms);
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);
@@ -840,6 +881,12 @@ fragment float4 image_fragment(
     filter::linear
   );
 
+  if (uniforms.scroll_cell_offset != 0.0 &&
+      !in_terminal_vertical_clip(
+        in.position.y - uniforms.grid_padding.x,
+        uniforms
+      )) return float4(0.0);
+
   float4 rgba = image.sample(textureSampler, in.tex_coord);
 
   if (!uniforms.use_linear_blending) {
@@ -850,4 +897,3 @@ fragment float4 image_fragment(
 
   return rgba;
 }
-

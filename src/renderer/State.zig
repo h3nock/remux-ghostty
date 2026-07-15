@@ -33,6 +33,11 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Fractional offset into the first visible terminal row. The owning surface
+/// updates this presentation state under `mutex`; the terminal remains
+/// whole-row addressed.
+scroll_cell_offset: f64 = 0,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to

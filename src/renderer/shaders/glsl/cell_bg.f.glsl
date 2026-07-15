@@ -12,7 +12,10 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    vec2 terminal_pos = gl_FragCoord.xy - grid_padding.wx;
+    vec2 sample_pos = terminal_pos;
+    sample_pos.y += scroll_pixel_offset();
+    ivec2 grid_pos = ivec2(floor(sample_pos / cell_size));
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     vec4 bg = vec4(0.0);
@@ -32,8 +35,27 @@ vec4 cell_bg() {
         }
     }
 
-    // Clamp y position if we should extend, otherwise discard if out of bounds.
-    if (grid_pos.y < 0) {
+    // Fractional sampling may address the extra materialized row, but clipping
+    // and padding decisions still use the visible viewport. With no fractional
+    // offset, retain the original grid-position boundary path exactly.
+    if (scroll_cell_offset != 0.0) {
+        float terminal_height = screen_size.y -
+            (grid_padding.x + grid_padding.z);
+        if (terminal_pos.y < 0.0) {
+            if ((padding_extend & EXTEND_UP) != 0) {
+                grid_pos.y = 0;
+            } else {
+                return bg;
+            }
+        } else if (terminal_pos.y >= terminal_height) {
+            if ((padding_extend & EXTEND_DOWN) != 0) {
+                grid_pos.y = int(grid_size.y) - 1;
+            } else {
+                return bg;
+            }
+        }
+        grid_pos.y = clamp(grid_pos.y, 0, int(grid_size.y) - 1);
+    } else if (grid_pos.y < 0) {
         if ((padding_extend & EXTEND_UP) != 0) {
             grid_pos.y = 0;
         } else {

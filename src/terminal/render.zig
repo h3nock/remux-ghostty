@@ -82,19 +82,29 @@ pub const RenderState = struct {
     rows: size.CellCountInt,
     cols: size.CellCountInt,
 
+    /// Rows materialized for rendering. This equals `rows` on the ordinary
+    /// path and may include one row below the viewport for fractional scroll.
+    render_rows: size.CellCountInt,
+
     /// The color state for the terminal.
     colors: Colors,
 
     /// Cursor state within the viewport.
     cursor: Cursor,
 
-    /// The rows (y=0 is top) of the viewport. Guaranteed to be `rows` length.
+    /// The rows (y=0 is top) available to render. Guaranteed to be
+    /// `render_rows` length.
     ///
     /// This is a MultiArrayList because only the update cares about
     /// the allocators. Callers care about all the other properties, and
     /// this better optimizes cache locality for read access for those
     /// use cases.
     row_data: std.MultiArrayList(Row),
+
+    /// One materialized row retained after the optional fractional-scroll row
+    /// is removed. Restoring it keeps warmed N <-> N+1 transitions from
+    /// allocating while `row_data.len` continues to match `render_rows`.
+    spare_row: ?Row,
 
     /// The dirty state of the render state. This is set by the update method.
     /// The renderer/caller should set this to false when it has handled
@@ -128,6 +138,7 @@ pub const RenderState = struct {
     pub const empty: RenderState = .{
         .rows = 0,
         .cols = 0,
+        .render_rows = 0,
         .colors = .{
             .background = .{ .r = 0, .g = 0, .b = 0 },
             .foreground = .{ .r = 0xff, .g = 0xff, .b = 0xff },
@@ -145,6 +156,7 @@ pub const RenderState = struct {
             .blinking = false,
         },
         .row_data = .empty,
+        .spare_row = null,
         .dirty = .false,
         .screen = .primary,
     };
@@ -237,6 +249,25 @@ pub const RenderState = struct {
         highlights: std.ArrayList(Highlight),
     };
 
+    fn emptyRow() Row {
+        return .{
+            .arena = .{},
+            .pin = undefined,
+            .serial = undefined,
+            .raw = undefined,
+            .cells = .empty,
+            .dirty = true,
+            .selection = null,
+            .highlights = .empty,
+        };
+    }
+
+    fn deinitRow(row: *Row, alloc: Allocator) void {
+        var arena: ArenaAllocator = row.arena.promote(alloc);
+        arena.deinit();
+        row.cells.deinit(alloc);
+    }
+
     pub const Highlight = struct {
         /// A special tag that can be used by the caller to differentiate
         /// different highlight types. The value is opaque to the RenderState.
@@ -309,8 +340,22 @@ pub const RenderState = struct {
             arena.deinit();
             cells.deinit(alloc);
         }
+        if (self.spare_row) |*row| deinitRow(row, alloc);
         self.row_data.deinit(alloc);
         self.pending_styles.deinit(alloc);
+    }
+
+    fn renderRows(
+        s: *Screen,
+        extra_rows: size.CellCountInt,
+    ) size.CellCountInt {
+        assert(extra_rows <= 1);
+        if (extra_rows == 0) return s.pages.rows;
+
+        const scrollbar = s.pages.scrollbar();
+        const available_rows = scrollbar.total - scrollbar.offset;
+        const requested_rows = s.pages.rows +| extra_rows;
+        return @intCast(@min(@as(usize, requested_rows), available_rows));
     }
 
     /// Update the render state to the latest terminal state.
@@ -328,7 +373,7 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
-        try self.beginUpdate(alloc, t);
+        try self.beginUpdateWithExtraRows(alloc, t, 0);
         self.endUpdate();
     }
 
@@ -358,8 +403,34 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
+        return self.beginUpdateWithExtraRows(alloc, t, 0);
+    }
+
+    /// Begin an update with optional rows immediately below the visible
+    /// viewport. Zero preserves the ordinary viewport-only path.
+    pub fn beginUpdateWithExtraRows(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        extra_rows: size.CellCountInt,
+    ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
+        const render_rows = renderRows(s, extra_rows);
+        const old_rows = self.rows;
+        const old_cols = self.cols;
+        const old_render_rows = self.render_rows;
+        const old_viewport_pin = self.viewport_pin;
+        // A failed fractional-row build must make the next attempt redraw.
+        // Restoring the prior geometry preserves the last complete state and
+        // makes a changed desired render height force that rebuild even when
+        // the terminal itself has no dirty rows.
+        errdefer {
+            self.rows = old_rows;
+            self.cols = old_cols;
+            self.render_rows = old_render_rows;
+            self.viewport_pin = old_viewport_pin;
+        }
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -383,7 +454,8 @@ pub const RenderState = struct {
 
             // If our dimensions changed, we do a full rebuild.
             if (self.rows != s.pages.rows or
-                self.cols != s.pages.cols)
+                self.cols != s.pages.cols or
+                self.render_rows != render_rows)
             {
                 break :redraw true;
             }
@@ -396,10 +468,8 @@ pub const RenderState = struct {
             break :redraw false;
         };
 
-        // Always set our cheap fields, its more expensive to compare
-        self.rows = s.pages.rows;
-        self.cols = s.pages.cols;
-        self.viewport_pin = viewport_pin;
+        // Always set our cheap non-geometry fields; its more expensive to
+        // compare them. Geometry is committed after its row storage succeeds.
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
         self.cursor.style = s.cursor.style;
@@ -439,46 +509,66 @@ pub const RenderState = struct {
             }
         }
 
-        // Ensure our row length is exactly our height, freeing or allocating
-        // data as necessary. In most cases we'll have a perfectly matching
-        // size.
-        if (self.row_data.len != self.rows) {
+        // Ensure our row length is exactly our render height, freeing or
+        // allocating data as necessary.
+        if (self.row_data.len != render_rows) {
             @branchHint(.unlikely);
 
-            if (self.row_data.len < self.rows) {
-                // Resize our rows to the desired length, marking any added
-                // values undefined.
+            if (self.row_data.len < render_rows) {
                 const old_len = self.row_data.len;
-                try self.row_data.resize(alloc, self.rows);
+                if (old_len + 1 == render_rows and
+                    self.spare_row != null)
+                {
+                    // append may allocate if the terminal dimensions changed
+                    // since this row was retained. The ordinary warmed
+                    // fractional transition already has sufficient capacity.
+                    try self.row_data.append(alloc, self.spare_row.?);
+                    self.spare_row = null;
+                } else {
+                    // Resize our rows to the desired length, marking any added
+                    // values undefined.
+                    try self.row_data.resize(alloc, render_rows);
 
-                // Initialize all our values. Its faster to use slice() + set()
-                // because appendAssumeCapacity does this multiple times.
-                var row_data = self.row_data.slice();
-                for (old_len..self.rows) |y| {
-                    row_data.set(y, .{
-                        .arena = .{},
-                        .pin = undefined,
-                        .serial = undefined,
-                        .raw = undefined,
-                        .cells = .empty,
-                        .dirty = true,
-                        .selection = null,
-                        .highlights = .empty,
-                    });
+                    // Initialize all our values. Its faster to use slice() +
+                    // set() because appendAssumeCapacity does this multiple
+                    // times.
+                    var row_data = self.row_data.slice();
+                    for (old_len..render_rows) |y| {
+                        row_data.set(y, emptyRow());
+                    }
                 }
             } else {
-                const row_data = self.row_data.slice();
-                for (
-                    row_data.items(.arena)[self.rows..],
-                    row_data.items(.cells)[self.rows..],
-                ) |state, *cell| {
-                    var arena: ArenaAllocator = state.promote(alloc);
-                    arena.deinit();
-                    cell.deinit(alloc);
+                const removing_optional_row =
+                    self.spare_row == null and
+                    old_rows == s.pages.rows and
+                    old_cols == s.pages.cols and
+                    old_render_rows > render_rows and
+                    old_render_rows - render_rows == 1 and
+                    render_rows == s.pages.rows and
+                    self.row_data.len == render_rows + 1;
+                if (removing_optional_row) {
+                    self.spare_row = self.row_data.pop().?;
+                } else {
+                    const row_data = self.row_data.slice();
+                    for (
+                        row_data.items(.arena)[render_rows..],
+                        row_data.items(.cells)[render_rows..],
+                    ) |state, *cell| {
+                        var arena: ArenaAllocator = state.promote(alloc);
+                        arena.deinit();
+                        cell.deinit(alloc);
+                    }
+                    self.row_data.shrinkRetainingCapacity(render_rows);
                 }
-                self.row_data.shrinkRetainingCapacity(self.rows);
             }
         }
+
+        // Row storage now matches the desired geometry. Publish the fields
+        // together so an allocation failure leaves the prior complete state.
+        self.rows = s.pages.rows;
+        self.cols = s.pages.cols;
+        self.render_rows = render_rows;
+        self.viewport_pin = viewport_pin;
 
         // Break down our row data
         const row_data = self.row_data.slice();
@@ -516,18 +606,17 @@ pub const RenderState = struct {
         var y: usize = 0;
         var any_dirty: bool = false;
         var page_it = viewport_pin.pageIterator(.right_down, null);
-        while (y < self.rows) {
+        while (y < self.render_rows) {
             const chunk = page_it.next() orelse break;
             const node = chunk.node;
             const node_serial = node.serial;
             const p: *page.Page = node.page();
 
             // The number of rows we consume from this chunk. The chunk
-            // may extend beyond the viewport (the viewport is always
-            // exactly `rows` tall) so we clamp.
+            // may extend beyond the requested render rows so we clamp.
             const take: usize = @min(
                 @as(usize, chunk.end - chunk.start),
-                self.rows - y,
+                self.render_rows - y,
             );
 
             // Find our cursor if we haven't found it yet. We do this even
@@ -628,7 +717,7 @@ pub const RenderState = struct {
 
             y += take;
         }
-        assert(y == self.rows);
+        assert(y == self.render_rows);
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -1343,6 +1432,7 @@ fn testCompareStates(
 
     try testing.expectEqual(fresh.rows, incremental.rows);
     try testing.expectEqual(fresh.cols, incremental.cols);
+    try testing.expectEqual(fresh.render_rows, incremental.render_rows);
     try testing.expectEqual(fresh.cursor.active, incremental.cursor.active);
     try testing.expectEqual(fresh.cursor.viewport, incremental.cursor.viewport);
     try testing.expectEqual(
@@ -1594,6 +1684,79 @@ test "begin and end update" {
         try testing.expect(cells[0].get(1).style.flags.bold);
         try testing.expect(cells[0].get(2).style.flags.italic);
     }
+}
+
+test "extra render row materializes row below viewport" {
+    const testing = std.testing;
+    const terminal_alloc = testing.allocator;
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const render_alloc = tracking.allocator();
+
+    var t = try Terminal.init(terminal_alloc, .{
+        .cols = 10,
+        .rows = 2,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(terminal_alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD");
+    t.scrollViewport(.top);
+
+    var state: RenderState = .empty;
+    defer state.deinit(render_alloc);
+
+    try state.update(render_alloc, &t);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.render_rows);
+    try testing.expectEqual(@as(usize, 2), state.row_data.len);
+
+    // A failed first materialization keeps the last complete geometry. The
+    // retry must force a full rebuild even though no terminal row is dirty.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.OutOfMemory,
+        state.beginUpdateWithExtraRows(failing.allocator(), &t, 1),
+    );
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.render_rows);
+    try testing.expect(state.viewport_pin.?.eql(
+        t.screens.active.pages.getTopLeft(.viewport),
+    ));
+
+    try state.beginUpdateWithExtraRows(render_alloc, &t, 1);
+    state.endUpdate();
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 3), state.render_rows);
+    try testing.expectEqual(@as(usize, 3), state.row_data.len);
+
+    const cells = state.row_data.items(.cells);
+    try testing.expectEqual('A', cells[0].get(0).raw.codepoint());
+    try testing.expectEqual('B', cells[1].get(0).raw.codepoint());
+    try testing.expectEqual('C', cells[2].get(0).raw.codepoint());
+
+    // Remove the optional row once to retain its initialized storage, then
+    // verify the warmed logical transition neither allocates nor frees.
+    try state.beginUpdateWithExtraRows(render_alloc, &t, 0);
+    state.endUpdate();
+    const allocations = tracking.allocations;
+    const deallocations = tracking.deallocations;
+    try state.beginUpdateWithExtraRows(render_alloc, &t, 1);
+    state.endUpdate();
+    try state.beginUpdateWithExtraRows(render_alloc, &t, 0);
+    state.endUpdate();
+    try testing.expectEqual(allocations, tracking.allocations);
+    try testing.expectEqual(deallocations, tracking.deallocations);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.render_rows);
+    try testing.expectEqual(@as(usize, 2), state.row_data.len);
+
+    t.scrollViewport(.bottom);
+    try state.beginUpdateWithExtraRows(render_alloc, &t, 1);
+    state.endUpdate();
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.render_rows);
+    try testing.expectEqual(@as(usize, 2), state.row_data.len);
 }
 
 test "bg color cells" {

@@ -1,5 +1,7 @@
 #include "common.glsl"
 
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
 
@@ -20,6 +22,12 @@ layout(location = 0) out vec4 out_FragColor;
 void main() {
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
+
+    if (scroll_cell_offset != 0.0 &&
+        !in_terminal_vertical_clip(gl_FragCoord.y - grid_padding.x)) {
+        out_FragColor = vec4(0.0);
+        return;
+    }
 
     switch (in_data.atlas) {
         default:

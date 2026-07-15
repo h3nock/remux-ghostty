@@ -7,6 +7,7 @@ const terminal = @import("../terminal/main.zig");
 const Renderer = @import("../renderer.zig").Renderer;
 const GraphicsAPI = Renderer.API;
 const Texture = GraphicsAPI.Texture;
+const UniformsHandle = @TypeOf(@as(GraphicsAPI.RenderPass.Step, undefined).uniforms);
 const CellSize = @import("size.zig").CellSize;
 const Overlay = @import("Overlay.zig");
 
@@ -33,6 +34,9 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// Render rows used when Kitty placements were last rebuilt.
+    kitty_render_rows: terminal.size.CellCountInt,
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +46,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .kitty_render_rows = 0,
         .overlay_placements = .empty,
     };
 
@@ -106,6 +111,7 @@ pub const State = struct {
         api: *GraphicsAPI,
         pipeline: GraphicsAPI.Pipeline,
         pass: *GraphicsAPI.RenderPass,
+        uniforms: UniformsHandle,
         placement_type: DrawPlacements,
     ) void {
         const placements: []const Placement = switch (placement_type) {
@@ -168,6 +174,7 @@ pub const State = struct {
 
             pass.step(.{
                 .pipeline = pipeline,
+                .uniforms = uniforms,
                 .buffers = &.{buf.buffer},
                 .textures = &.{texture},
                 .draw = .{
@@ -236,9 +243,20 @@ pub const State = struct {
     pub fn kittyRequiresUpdate(
         self: *const State,
         t: *const terminal.Terminal,
+        render_rows: terminal.size.CellCountInt,
     ) bool {
         // If the terminal kitty image state is dirty, we must update.
         if (t.screens.active.kitty_images.dirty) return true;
+
+        // Placement inclusion changes when fractional scrolling exposes the
+        // row immediately below the visible viewport. If neither side has a
+        // placement, there is nothing to rebuild solely for this change.
+        if (self.kitty_render_rows != render_rows and
+            (t.screens.active.kitty_images.placements.count() > 0 or
+                self.kitty_placements.items.len > 0))
+        {
+            return true;
+        }
 
         // If we have any virtual references, we must also rebuild our
         // kitty state on every frame because any cell change can move
@@ -257,9 +275,11 @@ pub const State = struct {
         alloc: Allocator,
         t: *const terminal.Terminal,
         cell_size: CellSize,
+        render_rows: terminal.size.CellCountInt,
     ) void {
         const storage = &t.screens.active.kitty_images;
         defer storage.dirty = false;
+        self.kitty_render_rows = render_rows;
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.
@@ -288,7 +308,12 @@ pub const State = struct {
         // The top-left and bottom-right corners of our viewport in screen
         // points. This lets us determine offsets and containment of placements.
         const top = t.screens.active.pages.getTopLeft(.viewport);
-        const bot = t.screens.active.pages.getBottomRight(.viewport).?;
+        assert(render_rows >= t.screens.active.pages.rows);
+        assert(render_rows <= t.screens.active.pages.rows +| 1);
+        const bot = if (render_rows == t.screens.active.pages.rows)
+            t.screens.active.pages.getBottomRight(.viewport).?
+        else
+            top.down(render_rows - 1).?;
         const top_y = t.screens.active.pages.pointFromPin(.screen, top).?.screen.y;
         const bot_y = t.screens.active.pages.pointFromPin(.screen, bot).?.screen.y;
 
@@ -346,6 +371,7 @@ pub const State = struct {
                     t,
                     &virtual_p,
                     cell_size,
+                    top_y,
                 ) catch |err| {
                     // For errors we log and continue. We try to place
                     // other placements even if one fails.
@@ -468,6 +494,7 @@ pub const State = struct {
         t: *const terminal.Terminal,
         p: *const terminal.kitty.graphics.unicode.Placement,
         cell_size: CellSize,
+        top_y: u32,
     ) PrepImageError!void {
         const storage = &t.screens.active.kitty_images;
         const image = storage.imageById(p.image_id) orelse {
@@ -491,23 +518,19 @@ pub const State = struct {
         // If our placement is zero sized then we don't do anything.
         if (rp.dest_width == 0 or rp.dest_height == 0) return;
 
-        const viewport: terminal.point.Point = t.screens.active.pages.pointFromPin(
-            .viewport,
+        const screen_y = t.screens.active.pages.pointFromPin(
+            .screen,
             rp.top_left,
-        ) orelse {
-            // This is unreachable with virtual placements because we should
-            // only ever be looking at virtual placements that are in our
-            // viewport in the renderer and virtual placements only ever take
-            // up one row.
-            unreachable;
-        };
+        ).?.screen.y;
+        const y_pos: i32 =
+            @as(i32, @intCast(screen_y)) - @as(i32, @intCast(top_y));
 
         // Prepare the image for the GPU and store the placement.
         try self.prepKittyImage(alloc, &image);
         try self.kitty_placements.append(alloc, .{
             .image_id = .{ .kitty = image.id },
             .x = @intCast(rp.top_left.x),
-            .y = @intCast(viewport.viewport.y),
+            .y = y_pos,
             .z = -1,
             .width = rp.dest_width,
             .height = rp.dest_height,
@@ -962,3 +985,26 @@ pub const Image = union(enum) {
         };
     }
 };
+
+test "Kitty render row changes skip empty placement rebuild" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var state: State = .empty;
+    t.screens.active.kitty_images.dirty = false;
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.placements.count(),
+    );
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
+    try testing.expect(!state.kittyRequiresUpdate(&t, 2));
+
+    t.screens.active.kitty_images.dirty = true;
+    try testing.expect(state.kittyRequiresUpdate(&t, 2));
+}

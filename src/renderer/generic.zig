@@ -42,6 +42,24 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Return the grid represented by the current CPU cell contents, excluding
+/// the optional fractional-scroll row only when those contents are known to
+/// match the current render state. During an asynchronous resize, the cell
+/// contents remain the source of truth for padding geometry.
+fn visibleRenderGrid(
+    cells_size: renderer.GridSize,
+    state: *const terminal.RenderState,
+) renderer.GridSize {
+    var result = cells_size;
+    if (result.columns == state.cols and
+        result.rows == state.render_rows and
+        state.render_rows > state.rows)
+    {
+        result.rows = state.rows;
+    }
+    return result;
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -726,6 +744,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
+                    .scroll_cell_offset = 0,
                     .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
                     .cursor_color = undefined,
                     .bg_color = .{
@@ -1163,6 +1182,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
+                scroll_cell_offset: f64,
                 overlay_features: []const Overlay.Feature,
             };
 
@@ -1186,6 +1206,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
 
+                var scroll_cell_offset = state.scroll_cell_offset;
+
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or
                 // y offset changed, new content was added to the screen.
@@ -1204,6 +1226,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Scroll
                     state.terminal.scrollViewport(.bottom);
+                    state.scroll_cell_offset = 0;
+                    scroll_cell_offset = 0;
+                }
+
+                // Get our scrollbar out of the terminal. PageList caches this
+                // geometry, and RenderState reuses it below when it needs to
+                // bound the optional extra row.
+                //
+                // Fractional scrolling only has a row below the viewport
+                // while the whole-row viewport is not at canonical bottom.
+                // Establish that invariant under the same lock before asking
+                // RenderState to materialize its one optional extra row.
+                const scrollbar = state.terminal.screens.active.pages.scrollbar();
+                const max_scroll_row = if (scrollbar.total > scrollbar.len)
+                    scrollbar.total - scrollbar.len
+                else
+                    0;
+                if (scrollbar.offset >= max_scroll_row) {
+                    state.scroll_cell_offset = 0;
+                    scroll_cell_offset = 0;
                 }
 
                 // Begin the update of our terminal state. Work that
@@ -1211,9 +1253,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
-                try self.terminal_state.beginUpdate(
+                try self.terminal_state.beginUpdateWithExtraRows(
                     self.alloc,
                     state.terminal,
+                    if (scroll_cell_offset > 0) 1 else 0,
                 );
 
                 // If our terminal state is dirty at all we need to redo
@@ -1221,13 +1264,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.terminal_state.dirty != .false) {
                     state.terminal.flags.search_viewport_dirty = true;
                 }
-
-                // Get our scrollbar out of the terminal. We synchronize
-                // the scrollbar read with frame data updates because this
-                // naturally limits the number of calls to this method (it
-                // can be expensive) and also makes it so we don't need another
-                // cross-thread mailbox message within the IO path.
-                const scrollbar = state.terminal.screens.active.pages.scrollbar();
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {
@@ -1242,7 +1278,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                if (self.images.kittyRequiresUpdate(
+                    state.terminal,
+                    self.terminal_state.render_rows,
+                )) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lock();
@@ -1254,6 +1293,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .width = self.grid_metrics.cell_width,
                             .height = self.grid_metrics.cell_height,
                         },
+                        self.terminal_state.render_rows,
                     );
                 }
 
@@ -1289,6 +1329,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
+                    .scroll_cell_offset = scroll_cell_offset,
                     .overlay_features = overlay_features,
                 };
             };
@@ -1378,6 +1419,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
+
+                self.uniforms.scroll_cell_offset =
+                    @floatCast(critical.scroll_cell_offset);
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1574,7 +1618,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
-            try frame.cells_bg.sync(self.cells.bg_cells);
+            try frame.cells_bg.sync(self.cells.activeBackgroundCells());
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
 
             // If our background image buffer has changed, sync it.
@@ -1650,6 +1694,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_below_bg,
                 );
 
@@ -1666,6 +1711,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_below_text,
                 );
 
@@ -1693,6 +1739,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_above_text,
                 );
 
@@ -1702,6 +1749,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .overlay,
                 );
             }
@@ -1956,10 +2004,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Blank space around the grid.
             const blank: renderer.Padding = self.size.screen.blankPadding(
                 self.size.padding,
-                .{
-                    .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
-                },
+                visibleRenderGrid(self.cells.size, &self.terminal_state),
                 .{
                     .width = self.grid_metrics.cell_width,
                     .height = self.grid_metrics.cell_height,
@@ -2139,6 +2184,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const screen = self.size.screen;
             const padding = self.size.padding;
             const cell = self.size.cell;
+            const scroll_pixel_offset =
+                self.uniforms.scroll_cell_offset * @as(f32, @floatFromInt(cell.height));
 
             uniforms.resolution = .{
                 @floatFromInt(screen.width),
@@ -2188,12 +2235,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     pixel_y += @floatFromInt(cell.height);
                     pixel_y -= @floatFromInt(cursor.bearings[1]);
                     pixel_y += @floatFromInt(cursor.glyph_size[1]);
+                    pixel_y -= scroll_pixel_offset;
                 } else {
                     // If the Y direction is reversed though, we instead want
                     // the *top* edge of the cursor, which means we just need
                     // to subtract the cell height and add the Y bearing.
                     pixel_y -= @floatFromInt(cell.height);
                     pixel_y += @floatFromInt(cursor.bearings[1]);
+                    pixel_y += scroll_pixel_offset;
                 }
 
                 const new_cursor: [4]f32 = .{
@@ -2336,12 +2385,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // }
 
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != state.render_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = state.render_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2389,7 +2438,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                state.render_rows,
                 self.cells.size.rows,
             );
 
@@ -3397,6 +3446,30 @@ inline fn emitScrollbar(
 ) void {
     if (!dirty.*) return;
     if (event_sink.scrollbar(scrollbar)) dirty.* = false;
+}
+
+test "visible render grid preserves asynchronous cell geometry" {
+    const testing = std.testing;
+
+    var state: terminal.RenderState = .empty;
+    state.rows = 24;
+    state.cols = 80;
+    state.render_rows = 25;
+
+    try testing.expectEqualDeep(
+        renderer.GridSize{ .columns = 80, .rows = 24 },
+        visibleRenderGrid(.{ .columns = 80, .rows = 25 }, &state),
+    );
+    try testing.expectEqualDeep(
+        renderer.GridSize{ .columns = 100, .rows = 30 },
+        visibleRenderGrid(.{ .columns = 100, .rows = 30 }, &state),
+    );
+
+    state.render_rows = state.rows;
+    try testing.expectEqualDeep(
+        renderer.GridSize{ .columns = 80, .rows = 24 },
+        visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state),
+    );
 }
 
 test "scrollbar delivery remains dirty until accepted" {

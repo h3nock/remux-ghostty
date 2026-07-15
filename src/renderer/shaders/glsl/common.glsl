@@ -19,6 +19,7 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec4 grid_padding;
     uniform uint padding_extend;
     uniform float min_contrast;
+    uniform float scroll_cell_offset;
     uniform uint cursor_pos_packed_2u16;
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
@@ -36,6 +37,16 @@ const uint EXTEND_LEFT = 1u;
 const uint EXTEND_RIGHT = 2u;
 const uint EXTEND_UP = 4u;
 const uint EXTEND_DOWN = 8u;
+
+float scroll_pixel_offset() {
+    return scroll_cell_offset * cell_size.y;
+}
+
+bool in_terminal_vertical_clip(float terminal_y) {
+    float terminal_height = screen_size.y -
+        (grid_padding.x + grid_padding.z);
+    return terminal_y >= 0.0 && terminal_y < terminal_height;
+}
 
 //----------------------------------------------------------------------------//
 // Functions for Unpacking Values
