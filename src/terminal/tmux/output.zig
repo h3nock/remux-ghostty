@@ -160,6 +160,8 @@ pub const Variable = enum {
     version,
     /// Unique window ID prefixed with `@` (e.g., `@0`, `@42`).
     window_id,
+    /// 1 if the window is the current session window.
+    window_active,
     /// Width of window.
     window_width,
     /// Height of window.
@@ -194,6 +196,7 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
+            .window_active,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -246,6 +249,7 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
+            .window_active,
             .wrap_flag,
             => bool,
             .alternate_saved_x,
@@ -341,6 +345,14 @@ test "parse window id" {
     try testing.expectError(error.FormatError, Variable.parse(.window_id, "@"));
     try testing.expectError(error.FormatError, Variable.parse(.window_id, ""));
     try testing.expectError(error.InvalidCharacter, Variable.parse(.window_id, "@abc"));
+}
+
+test "parse window_active" {
+    try testing.expectEqual(true, try Variable.parse(.window_active, "1"));
+    try testing.expectEqual(false, try Variable.parse(.window_active, "0"));
+    try testing.expectEqual(false, try Variable.parse(.window_active, ""));
+    try testing.expectEqual(false, try Variable.parse(.window_active, "true"));
+    try testing.expectEqual(false, try Variable.parse(.window_active, "yes"));
 }
 
 test "parse window width" {

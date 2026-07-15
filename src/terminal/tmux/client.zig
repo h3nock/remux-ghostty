@@ -338,7 +338,7 @@ test "control client sends startup commands before either response" {
     try testing.expectEqual(0, actions.records.items.len);
     try testing.expectEqualStrings(
         "display-message -p '#{version}'\n" ++
-            "list-windows -F '#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
         client.outboundBytes(),
     );
 }
@@ -356,7 +356,7 @@ test "control client hydrates as one group and keeps later command independent" 
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
             "%end 3 3 1\n" ++
             "%window-add @1\n",
         &actions,
@@ -373,7 +373,7 @@ test "control client hydrates as one group and keeps later command independent" 
         1,
         "list-panes -s",
     ));
-    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n"));
+    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n"));
 }
 
 test "control client hydration error skips only its group" {
@@ -389,7 +389,7 @@ test "control client hydration error skips only its group" {
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
             "%end 3 3 1\n" ++
             "%window-add @1\n",
         &actions,
@@ -572,7 +572,7 @@ test "control client retained pane terminal outlives client" {
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
             "%end 3 3 1\n",
         &actions,
     );
