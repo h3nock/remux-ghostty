@@ -9,8 +9,8 @@
 
         .libxev = .{
             // mitchellh/libxev
-            .url = "https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz",
-            .hash = "libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs",
+            .url = "https://github.com/mitchellh/libxev/archive/7bf2b2f9027a1862c7422b64cc4e53901f4f19ff.tar.gz",
+            .hash = "libxev-0.0.0-86vtc0IbEwDsp-ljrhdEWhf2TYBvSrqqgNAPQwtfX8Eg",
             .lazy = true,
         },
         .vaxis = .{
