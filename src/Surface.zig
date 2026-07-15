@@ -580,18 +580,27 @@ pub fn init(
             .mailbox = &app.mailbox,
         };
         const renderer_event_sink = RendererEventSink.init(self);
+        const surface_size = try renderer_surface.getSize();
+        var prepared_layout = try rendererpkg.Runtime.PreparedLayout.init(.{
+            .font_grid_set = &app.font_grid_set,
+            .font_config = &derived_config.font,
+            .font_size = font_size,
+            .screen = .{
+                .width = surface_size.width,
+                .height = surface_size.height,
+            },
+            .explicit_padding = derived_config.scaledPadding(x_dpi, y_dpi),
+            .padding_balance = derived_config.window_padding_balance,
+        });
+        defer prepared_layout.deinit();
         self.font_metrics = try self.render.init(.{
             .alloc = alloc,
             .config = config,
             .rt_surface = renderer_surface,
             .terminal = &self.io.terminal,
             .mutex = mutex,
-            .font_grid_set = &app.font_grid_set,
-            .font_config = &derived_config.font,
-            .font_size = font_size,
+            .prepared_layout = &prepared_layout,
             .size = &self.size,
-            .explicit_padding = derived_config.scaledPadding(x_dpi, y_dpi),
-            .padding_balance = derived_config.window_padding_balance,
             .event_sink = renderer_event_sink,
             .crash_context = .{
                 .type = .renderer,

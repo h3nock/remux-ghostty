@@ -26,46 +26,79 @@ pub const Options = struct {
     rt_surface: *apprt.RendererSurface,
     terminal: *terminal.Terminal,
     mutex: *std.Thread.Mutex,
-    font_grid_set: *font.SharedGridSet,
-    font_config: *const font.SharedGridSet.DerivedConfig,
-    font_size: font.face.DesiredSize,
+    prepared_layout: *PreparedLayout,
     size: *rendererpkg.Size,
-    explicit_padding: rendererpkg.Padding,
-    padding_balance: sizepkg.PaddingBalance,
     event_sink: rendererpkg.EventSink,
     crash_context: ?crash.sentry.ThreadState,
     visible: bool = true,
     focused: bool = true,
 };
 
-/// Initialize a runtime in stable caller-owned storage. The terminal, mutex,
-/// renderer surface, font-grid set, and event-sink context are borrowed and
-/// must outlive the runtime. Config and derived font config are consumed only
-/// during this call and may be released when it returns. This initializes all
-/// renderer resources but does not start the renderer OS thread.
-pub fn init(self: *Runtime, opts: Options) !font.Metrics {
-    const font_grid_key, const font_grid = try opts.font_grid_set.ref(
-        opts.font_config,
-        opts.font_size,
-    );
-    errdefer opts.font_grid_set.deref(font_grid_key);
+/// Owned font-grid reference and the exact renderer geometry derived from it.
+/// Callers must either deinitialize this value or transfer it to Runtime.init.
+pub const PreparedLayout = struct {
+    font_grid_set: *font.SharedGridSet,
+    font_grid_key: font.SharedGridSet.Key,
+    font_grid: *font.SharedGrid,
+    size: rendererpkg.Size,
+    explicit_padding: rendererpkg.Padding,
+    padding_balance: sizepkg.PaddingBalance,
+    owned: bool = true,
 
-    const surface_size = try opts.rt_surface.getSize();
-    opts.size.* = .{
-        .screen = .{
-            .width = surface_size.width,
-            .height = surface_size.height,
-        },
-        .cell = font_grid.cellSize(),
-        .padding = opts.explicit_padding,
+    pub const Options = struct {
+        font_grid_set: *font.SharedGridSet,
+        font_config: *const font.SharedGridSet.DerivedConfig,
+        font_size: font.face.DesiredSize,
+        screen: rendererpkg.ScreenSize,
+        explicit_padding: rendererpkg.Padding,
+        padding_balance: sizepkg.PaddingBalance,
     };
-    if (opts.padding_balance != .false) {
-        opts.size.balancePadding(opts.explicit_padding, opts.padding_balance);
+
+    pub fn init(opts: PreparedLayout.Options) !PreparedLayout {
+        const font_grid_key, const font_grid = try opts.font_grid_set.ref(
+            opts.font_config,
+            opts.font_size,
+        );
+        errdefer opts.font_grid_set.deref(font_grid_key);
+
+        var size: rendererpkg.Size = .{
+            .screen = opts.screen,
+            .cell = font_grid.cellSize(),
+            .padding = opts.explicit_padding,
+        };
+        if (opts.padding_balance != .false) {
+            size.balancePadding(opts.explicit_padding, opts.padding_balance);
+        }
+
+        return .{
+            .font_grid_set = opts.font_grid_set,
+            .font_grid_key = font_grid_key,
+            .font_grid = font_grid,
+            .size = size,
+            .explicit_padding = opts.explicit_padding,
+            .padding_balance = opts.padding_balance,
+        };
     }
 
+    pub fn deinit(self: *PreparedLayout) void {
+        if (!self.owned) return;
+        self.font_grid_set.deref(self.font_grid_key);
+        self.owned = false;
+    }
+};
+
+/// Initialize a runtime in stable caller-owned storage. The terminal, mutex,
+/// renderer surface, and event-sink context are borrowed and must outlive the
+/// runtime. The prepared layout and its font-grid reference are transferred to
+/// the runtime on success and remain caller-owned on failure. Config is
+/// consumed only during this call and may be released when it returns. This
+/// initializes all renderer resources but does not start the renderer OS
+/// thread.
+pub fn init(self: *Runtime, opts: Options) !font.Metrics {
+    const prepared = opts.prepared_layout.*;
+    opts.size.* = prepared.size;
+
     self.alloc = opts.alloc;
-    self.font_grid_set = opts.font_grid_set;
-    self.font_grid_key = font_grid_key;
     self.renderer = renderer: {
         var derived = try rendererpkg.Renderer.DerivedConfig.init(
             opts.alloc,
@@ -74,7 +107,7 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
         errdefer derived.deinit();
         break :renderer try rendererpkg.Renderer.init(opts.alloc, .{
             .config = derived,
-            .font_grid = font_grid,
+            .font_grid = prepared.font_grid,
             .size = opts.size.*,
             .event_sink = opts.event_sink,
             .rt_surface = opts.rt_surface,
@@ -101,7 +134,10 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
     );
     errdefer self.thread.deinit();
 
-    return font_grid.metrics;
+    self.font_grid_set = prepared.font_grid_set;
+    self.font_grid_key = prepared.font_grid_key;
+    opts.prepared_layout.owned = false;
+    return prepared.font_grid.metrics;
 }
 
 /// Finalize platform renderer setup and start the renderer OS thread. The
@@ -152,4 +188,52 @@ pub fn setFontGrid(
         },
     }, .{ .forever = {} });
     self.font_grid_key = key;
+}
+
+test "PreparedLayout owns one font grid and canonical balanced geometry" {
+    const testing = std.testing;
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var font_config = try font.SharedGridSet.DerivedConfig.init(
+        testing.allocator,
+        &config,
+    );
+    defer font_config.deinit();
+    var font_grid_set = try font.SharedGridSet.init(testing.allocator);
+    defer font_grid_set.deinit();
+
+    const screen: rendererpkg.ScreenSize = .{
+        .width = 391,
+        .height = 845,
+    };
+    const explicit_padding: rendererpkg.Padding = .{
+        .top = 4,
+        .bottom = 8,
+        .left = 6,
+        .right = 10,
+    };
+    var prepared = try PreparedLayout.init(.{
+        .font_grid_set = &font_grid_set,
+        .font_config = &font_config,
+        .font_size = .{ .points = 13, .xdpi = 192, .ydpi = 192 },
+        .screen = screen,
+        .explicit_padding = explicit_padding,
+        .padding_balance = .equal,
+    });
+    try testing.expectEqual(@as(usize, 1), font_grid_set.count());
+    try testing.expectEqual(screen, prepared.size.screen);
+    try testing.expectEqual(explicit_padding, prepared.explicit_padding);
+    try testing.expectEqual(sizepkg.PaddingBalance.equal, prepared.padding_balance);
+
+    var expected: rendererpkg.Size = .{
+        .screen = screen,
+        .cell = prepared.font_grid.cellSize(),
+        .padding = explicit_padding,
+    };
+    expected.balancePadding(explicit_padding, .equal);
+    try testing.expectEqual(expected, prepared.size);
+
+    prepared.deinit();
+    try testing.expectEqual(@as(usize, 0), font_grid_set.count());
 }

@@ -144,6 +144,18 @@ fn interactionStateC(state: renderer.TerminalSurface.InteractionState) Interacti
     };
 }
 
+fn surfaceSizeC(size: renderer.Size) SurfaceSize {
+    const grid = size.grid();
+    return .{
+        .columns = grid.columns,
+        .rows = grid.rows,
+        .width_px = size.screen.width,
+        .height_px = size.screen.height,
+        .cell_width_px = size.cell.width,
+        .cell_height_px = size.cell.height,
+    };
+}
+
 fn validConfig(config: Config) bool {
     if (config.width_px == 0 or config.height_px == 0) return false;
     if (!std.math.isFinite(config.scale_factor) or config.scale_factor <= 0) {
@@ -157,6 +169,13 @@ fn validConfig(config: Config) bool {
     if (config.font_size != 0 and
         (config.font_size < 1 or config.font_size > 255)) return false;
     return true;
+}
+
+fn surfaceDpi(config: Config) f32 {
+    // Preserve terminal-surface creation's established rounding: the content
+    // scale is narrowed before the DPI multiplication.
+    const scale: f32 = @floatCast(config.scale_factor);
+    return scale * font.face.default_dpi;
 }
 
 fn mapError(err: anyerror) Result {
@@ -262,6 +281,65 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_measure(
+        app_ptr: ?*Runtime.App,
+        config_ptr: ?*const Config,
+        out_ptr: ?*SurfaceSize,
+    ) Result {
+        const app = app_ptr orelse return .invalid_input;
+        const config = config_ptr orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        if (!validConfig(config.*)) return .invalid_input;
+
+        var prepared = prepareLayout(app, config.*) catch |err| {
+            log.err("failed to measure terminal surface err={}", .{err});
+            return mapError(err);
+        };
+        defer prepared.deinit();
+        out.* = surfaceSizeC(prepared.size);
+        return .ok;
+    }
+
+    fn prepareLayout(
+        app: *Runtime.App,
+        config: Config,
+    ) !renderer.Runtime.PreparedLayout {
+        const alloc = app.core_app.alloc;
+
+        var font_config = try font.SharedGridSet.DerivedConfig.init(
+            alloc,
+            &app.config,
+        );
+        defer font_config.deinit();
+
+        const dpi = surfaceDpi(config);
+        const explicit_padding = (renderer.Padding{
+            .top = app.config.@"window-padding-y".top_left,
+            .bottom = app.config.@"window-padding-y".bottom_right,
+            .left = app.config.@"window-padding-x".top_left,
+            .right = app.config.@"window-padding-x".bottom_right,
+        }).scaledDpi(dpi, dpi);
+
+        return .init(.{
+            .font_grid_set = &app.core_app.font_grid_set,
+            .font_config = &font_config,
+            .font_size = .{
+                .points = if (config.font_size == 0)
+                    app.config.@"font-size"
+                else
+                    config.font_size,
+                .xdpi = @max(1, @as(u16, @intFromFloat(dpi))),
+                .ydpi = @max(1, @as(u16, @intFromFloat(dpi))),
+            },
+            .screen = .{
+                .width = config.width_px,
+                .height = config.height_px,
+            },
+            .explicit_padding = explicit_padding,
+            .padding_balance = app.config.@"window-padding-balance",
+        });
+    }
+
     fn initSurface(
         app: *Runtime.App,
         shared: *SharedTerminal,
@@ -288,40 +366,15 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             .write_cb = config.write_cb,
         };
 
-        // Runtime consumes this while creating/referring to its shared font
-        // grid. It does not borrow the derived configuration afterward.
-        var font_config = try font.SharedGridSet.DerivedConfig.init(
-            alloc,
-            &app.config,
-        );
-        defer font_config.deinit();
-
-        const x_dpi: f32 = scale * font.face.default_dpi;
-        const y_dpi: f32 = scale * font.face.default_dpi;
-        const explicit_padding = (renderer.Padding{
-            .top = app.config.@"window-padding-y".top_left,
-            .bottom = app.config.@"window-padding-y".bottom_right,
-            .left = app.config.@"window-padding-x".top_left,
-            .right = app.config.@"window-padding-x".bottom_right,
-        }).scaledDpi(x_dpi, y_dpi);
+        var prepared = try prepareLayout(app, config);
+        defer prepared.deinit();
 
         _ = try surface.core.init(.{
             .alloc = alloc,
             .config = &app.config,
             .rt_surface = &surface.renderer_surface,
             .shared = shared,
-            .font_grid_set = &app.core_app.font_grid_set,
-            .font_config = &font_config,
-            .font_size = .{
-                .points = if (config.font_size == 0)
-                    app.config.@"font-size"
-                else
-                    config.font_size,
-                .xdpi = @max(1, @as(u16, @intFromFloat(x_dpi))),
-                .ydpi = @max(1, @as(u16, @intFromFloat(y_dpi))),
-            },
-            .explicit_padding = explicit_padding,
-            .padding_balance = app.config.@"window-padding-balance",
+            .prepared_layout = &prepared,
             .event_sink = surface.eventSink(),
             .write_sink = surface.writeSink(),
             .macos_option_as_alt = app.config.@"macos-option-as-alt" orelse
@@ -392,16 +445,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
     ) Result {
         const value = surface orelse return .invalid_input;
         const out = out_ptr orelse return .invalid_input;
-        const size = value.core.size;
-        const grid = size.grid();
-        out.* = .{
-            .columns = grid.columns,
-            .rows = grid.rows,
-            .width_px = size.screen.width,
-            .height_px = size.screen.height,
-            .cell_width_px = size.cell.width,
-            .cell_height_px = size.cell.height,
-        };
+        out.* = surfaceSizeC(value.core.size);
         return .ok;
     }
 
@@ -696,6 +740,9 @@ test "terminal surface C config defaults and validation" {
     config.scale_factor = 2;
     config.font_size = 256;
     try testing.expect(!validConfig(config));
+
+    config.scale_factor = 0.9027777129432222;
+    try testing.expectEqual(@as(f32, 65), surfaceDpi(config));
 }
 
 test "terminal surface C invalid platform tag is invalid input" {
@@ -703,6 +750,178 @@ test "terminal surface C invalid platform tag is invalid input" {
         Result.invalid_input,
         mapError(error.InvalidEnumTag),
     );
+}
+
+test "terminal surface C measurement validates without writing output" {
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const CoreApp = @import("../App.zig");
+    const ConfigPackage = @import("../config.zig");
+
+    var app_config = try ConfigPackage.Config.default(testing.allocator);
+    defer app_config.deinit();
+    const core_app = try CoreApp.create(testing.allocator);
+    defer core_app.destroy();
+    var app: apprt.embedded.App = undefined;
+    app.core_app = core_app;
+    app.config = try app_config.clone(testing.allocator);
+    defer app.config.deinit();
+
+    var config = configNew();
+    config.width_px = 390;
+    config.height_px = 844;
+    const sentinel: SurfaceSize = .{
+        .columns = 1,
+        .rows = 2,
+        .width_px = 3,
+        .height_px = 4,
+        .cell_width_px = 5,
+        .cell_height_px = 6,
+    };
+    var out = sentinel;
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_measure(null, &config, &out),
+    );
+    try testing.expectEqual(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_measure(&app, null, &out),
+    );
+    try testing.expectEqual(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_measure(&app, &config, null),
+    );
+
+    const invalid_values = [_]Config{
+        invalid: {
+            var value = config;
+            value.width_px = 0;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.height_px = 0;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.scale_factor = 0;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.scale_factor = std.math.nan(f64);
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.scale_factor = std.math.inf(f64);
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.scale_factor = (@as(f64, std.math.maxInt(u16)) + 1) /
+                font.face.default_dpi;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.font_size = std.math.nan(f32);
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.font_size = -1;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.font_size = 0.5;
+            break :invalid value;
+        },
+        invalid: {
+            var value = config;
+            value.font_size = 256;
+            break :invalid value;
+        },
+    };
+    for (invalid_values) |invalid| {
+        out = sentinel;
+        try testing.expectEqual(
+            Result.invalid_input,
+            CAPI.ghostty_terminal_surface_measure(&app, &invalid, &out),
+        );
+        try testing.expectEqual(sentinel, out);
+    }
+    try testing.expectEqual(@as(usize, 0), core_app.font_grid_set.count());
+}
+
+test "terminal surface C measurement uses font scale and app padding" {
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const CoreApp = @import("../App.zig");
+    const ConfigPackage = @import("../config.zig");
+
+    var app_config = try ConfigPackage.Config.default(testing.allocator);
+    defer app_config.deinit();
+    app_config.@"window-padding-x" = .{ .top_left = 0, .bottom_right = 0 };
+    app_config.@"window-padding-y" = .{ .top_left = 0, .bottom_right = 0 };
+    const core_app = try CoreApp.create(testing.allocator);
+    defer core_app.destroy();
+    var app: apprt.embedded.App = undefined;
+    app.core_app = core_app;
+    app.config = try app_config.clone(testing.allocator);
+    defer app.config.deinit();
+
+    var config = configNew();
+    config.width_px = 1170;
+    config.height_px = 2532;
+
+    var default_size: SurfaceSize = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        CAPI.ghostty_terminal_surface_measure(&app, &config, &default_size),
+    );
+    try testing.expectEqual(@as(usize, 0), core_app.font_grid_set.count());
+
+    config.font_size = 24;
+    var override_size: SurfaceSize = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        CAPI.ghostty_terminal_surface_measure(&app, &config, &override_size),
+    );
+    try testing.expect(override_size.cell_width_px > default_size.cell_width_px);
+    try testing.expect(override_size.cell_height_px > default_size.cell_height_px);
+    try testing.expect(override_size.columns < default_size.columns);
+    try testing.expect(override_size.rows < default_size.rows);
+    try testing.expectEqual(@as(usize, 0), core_app.font_grid_set.count());
+
+    config.scale_factor = 2;
+    var scaled_size: SurfaceSize = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        CAPI.ghostty_terminal_surface_measure(&app, &config, &scaled_size),
+    );
+    try testing.expect(scaled_size.cell_width_px > override_size.cell_width_px);
+    try testing.expect(scaled_size.cell_height_px > override_size.cell_height_px);
+    try testing.expectEqual(@as(usize, 0), core_app.font_grid_set.count());
+
+    app.config.@"window-padding-x" = .{ .top_left = 40, .bottom_right = 40 };
+    app.config.@"window-padding-y" = .{ .top_left = 40, .bottom_right = 40 };
+    app.config.@"window-padding-balance" = .equal;
+    var padded_size: SurfaceSize = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        CAPI.ghostty_terminal_surface_measure(&app, &config, &padded_size),
+    );
+    try testing.expect(padded_size.columns < scaled_size.columns);
+    try testing.expect(padded_size.rows < scaled_size.rows);
+    try testing.expectEqual(@as(usize, 0), core_app.font_grid_set.count());
 }
 
 test "terminal surface C input validation and key mapping" {

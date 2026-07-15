@@ -124,11 +124,7 @@ pub const Options = struct {
     config: *const configpkg.Config,
     rt_surface: *apprt.RendererSurface,
     shared: *terminal.Shared,
-    font_grid_set: *font.SharedGridSet,
-    font_config: *const font.SharedGridSet.DerivedConfig,
-    font_size: font.face.DesiredSize,
-    explicit_padding: rendererpkg.Padding,
-    padding_balance: sizepkg.PaddingBalance,
+    prepared_layout: *rendererpkg.Runtime.PreparedLayout,
     event_sink: rendererpkg.EventSink,
     write_sink: ?WriteSink = null,
     macos_option_as_alt: input.OptionAsAlt = .false,
@@ -140,8 +136,9 @@ pub const Options = struct {
 /// Initialize in stable caller-owned storage and start the renderer thread.
 /// The renderer surface, font-grid set, and event-sink context are borrowed and
 /// must outlive this surface. Config and derived font config are consumed only
-/// during this call. The retained Shared terminal and its mutex remain valid
-/// through deinit.
+/// during this call. The prepared layout is transferred on success and remains
+/// caller-owned on failure. The retained Shared terminal and its mutex remain
+/// valid through deinit.
 pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     var interaction_config = try InteractionConfig.init(opts.alloc, opts.config);
     errdefer interaction_config.deinit(opts.alloc);
@@ -167,8 +164,8 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .mouse_reporting = opts.config.@"mouse-reporting",
         .interaction_config = interaction_config,
         .interaction = .{},
-        .explicit_padding = opts.explicit_padding,
-        .padding_balance = opts.padding_balance,
+        .explicit_padding = opts.prepared_layout.explicit_padding,
+        .padding_balance = opts.prepared_layout.padding_balance,
         .visible = .init(opts.visible),
         .focused = opts.focused,
     };
@@ -179,12 +176,8 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .rt_surface = opts.rt_surface,
         .terminal = &shared.terminal,
         .mutex = &shared.mutex,
-        .font_grid_set = opts.font_grid_set,
-        .font_config = opts.font_config,
-        .font_size = opts.font_size,
+        .prepared_layout = opts.prepared_layout,
         .size = &self.size,
-        .explicit_padding = opts.explicit_padding,
-        .padding_balance = opts.padding_balance,
         .event_sink = opts.event_sink,
         .crash_context = opts.crash_context,
         .visible = opts.visible,

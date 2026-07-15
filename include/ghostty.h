@@ -1365,6 +1365,20 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // retry would duplicate input; renderer wake failures are logged instead.
 GHOSTTY_API ghostty_terminal_surface_config_s
 ghostty_terminal_surface_config_new(void);
+
+// Synchronously measures the exact geometry terminal_surface_new will use for
+// the same dimensions, scale, font-size override, and unchanged app
+// configuration. This only prepares font metrics and renderer geometry: it
+// does not read or require the config's platform view, callbacks, userdata,
+// terminal, renderer/GPU resources, or native view. Inputs are borrowed for the
+// call and out is written only on success. Call this on the app/presentation-
+// owner thread and serialize it with app config updates, app destruction, and
+// all surface creation using the same app.
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_measure(
+    ghostty_app_t,
+    const ghostty_terminal_surface_config_s*,
+    ghostty_surface_size_s*);
+
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_new(
     ghostty_app_t,
     ghostty_terminal_t,
