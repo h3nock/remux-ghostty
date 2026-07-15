@@ -43,6 +43,48 @@ pub fn release(self: *IOSurfaceLayer) void {
     self.layer.release();
 }
 
+/// Neutralize the display callback before the renderer backing `display_ctx`
+/// is destroyed. On iOS the renderer layer is a sublayer, so remove it from
+/// its host view at the same boundary. On macOS it is the view's root layer;
+/// the host view owns that inert layer until replacement or view teardown.
+///
+/// AppKit/UIKit and Core Animation ownership changes must happen on the main
+/// thread.
+/// This operation is synchronous because returning while the layer is still
+/// attached would leave its display callback able to dereference freed
+/// renderer state.
+pub fn deactivate(self: *IOSurfaceLayer) void {
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        detachLayer(self.layer);
+        return;
+    }
+
+    var block = DetachBlock.init(.{
+        .layer = self.layer.value,
+    }, &detachCallback);
+    macos.dispatch.dispatch_sync(
+        @ptrCast(macos.dispatch.queue.getMain()),
+        @ptrCast(&block),
+    );
+}
+
+const DetachBlock = objc.Block(struct {
+    layer: objc.c.id,
+}, .{}, void);
+
+fn detachCallback(
+    block: *const DetachBlock.Context,
+) callconv(.c) void {
+    detachLayer(objc.Object.fromId(block.layer));
+}
+
+fn detachLayer(layer: objc.Object) void {
+    layer.setInstanceVariable("display_cb", .{ .value = null });
+    layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+}
+
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.

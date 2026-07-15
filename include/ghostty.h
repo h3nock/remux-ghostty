@@ -1418,14 +1418,17 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_retain_pane_terminal(
 // matching dimensions.
 //
 // Presentation setters, input, draw, size, and free must be serialized by one
-// presentation owner. terminal_changed may run concurrently after the terminal
-// mutation was published under its mutex, but every such call must finish and no
-// new call may begin before free. Free stops and joins the renderer before
-// returning. Input callbacks must return before free begins. If terminal_changed
-// or a presentation setter returns non-OK, its wake may have failed after work
-// was admitted; a host keeping the surface must retry the same notification or
-// value. Input never returns a failure after write_cb accepts bytes, because a
-// retry would duplicate input; renderer wake failures are logged instead.
+// presentation owner. For UIKit and AppKit platform views, that owner is the
+// main thread. terminal_changed may run concurrently after the terminal
+// mutation was published under its mutex, but every such call must finish and
+// no new call may begin before free. Free stops and joins the renderer and
+// neutralizes any platform-layer callback into renderer state before
+// returning. Input callbacks must return before free begins. If
+// terminal_changed or a presentation setter returns non-OK, its wake may have
+// failed after work was admitted; a host keeping the surface must retry the
+// same notification or value. Input never returns a failure after write_cb
+// accepts bytes, because a retry would duplicate input; renderer wake failures
+// are logged instead.
 GHOSTTY_API ghostty_terminal_surface_config_s
 ghostty_terminal_surface_config_new(void);
 

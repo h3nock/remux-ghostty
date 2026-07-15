@@ -156,6 +156,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 }
 
 pub fn deinit(self: *Metal) void {
+    self.layer.deactivate();
     self.queue.release();
     self.device.release();
     self.layer.release();
