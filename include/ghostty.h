@@ -887,12 +887,14 @@ typedef enum {
 } ghostty_terminal_surface_result_e;
 
 typedef enum {
-  // The complete encoded payload was accepted by write_cb.
+  // The complete encoded payload was accepted by write_cb, or a read operation
+  // returned its owned result.
   GHOSTTY_TERMINAL_SURFACE_INPUT_SENT,
-  // The input was valid but intentionally produced no payload. This is
-  // returned for KAM-consumed keys and empty pastes.
+  // The operation was valid but intentionally produced no payload. This also
+  // covers local interaction and deduplicated remote mouse motion.
   GHOSTTY_TERMINAL_SURFACE_INPUT_CONSUMED_NO_OUTPUT,
-  // The key was unencodable or write_cb rejected the complete payload.
+  // The input was not locally accepted, was unencodable, or write_cb rejected
+  // the complete payload.
   GHOSTTY_TERMINAL_SURFACE_INPUT_NOT_ACCEPTED,
   // No write_cb was configured.
   GHOSTTY_TERMINAL_SURFACE_INPUT_UNAVAILABLE,
@@ -928,7 +930,7 @@ typedef void (*ghostty_terminal_surface_renderer_health_cb)(
     void*,
     ghostty_action_renderer_health_e);
 
-// Called synchronously by terminal-surface key and paste operations on the
+// Called synchronously by terminal-surface input operations on the
 // presentation-owner thread. The bytes are borrowed only for the callback;
 // copy or enqueue them before returning true. True means the complete payload
 // was admitted; false rejects it. The callback must not call any
@@ -1438,6 +1440,58 @@ ghostty_terminal_surface_paste(
     ghostty_terminal_surface_t,
     const uint8_t*,
     size_t);
+
+// Update the interaction pointer and modifiers used by remote mouse reporting,
+// scrolling, and local selection. When terminal mouse reporting is active,
+// motion is cell-deduplicated and the complete encoding is admitted through at
+// most one write_cb invocation.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_pos(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_input_mods_e);
+
+// Remotely captured buttons are encoded through write_cb. Without capture,
+// only the left button is accepted and drives terminal text selection.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_button(
+    ghostty_terminal_surface_t,
+    ghostty_input_mouse_state_e,
+    ghostty_input_mouse_button_e,
+    ghostty_input_mods_e);
+
+// Negative deltas are down/left and positive deltas are up/right. Precise input
+// is accumulated until it reaches a cell; non-precision input follows Ghostty's
+// platform wheel-tick behavior. Alternate-screen cursor input and remote wheel
+// reports each use at most one complete write_cb payload.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_scroll(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_input_scroll_mods_t);
+
+// Pressure is a local selection affordance only; it is never reported to a
+// terminal application.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_pressure(
+    ghostty_terminal_surface_t,
+    uint32_t,
+    double);
+
+// Copies the active selection through the terminal-surface allocator. SENT
+// means out contains owned text; CONSUMED_NO_OUTPUT means there is no selection.
+// Release a SENT result exactly once with terminal_surface_free_text before
+// freeing the owning terminal surface.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_read_selection(
+    ghostty_terminal_surface_t,
+    ghostty_text_s*);
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_free_text(
+    ghostty_terminal_surface_t,
+    ghostty_text_s*);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);

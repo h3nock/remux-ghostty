@@ -5,6 +5,7 @@ const std = @import("std");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
+const input_mouse = @import("../input/mouse.zig");
 const renderer = @import("../renderer.zig");
 const SharedTerminal = @import("../terminal/Shared.zig");
 const terminal = @import("../terminal/main.zig");
@@ -73,6 +74,15 @@ pub const InteractionState = extern struct {
     has_selection: bool,
 };
 
+pub const Text = extern struct {
+    tl_px_x: f64,
+    tl_px_y: f64,
+    offset_start: u32,
+    offset_len: u32,
+    text: ?[*]const u8,
+    text_len: usize,
+};
+
 fn configNew() Config {
     return .{};
 }
@@ -85,6 +95,35 @@ fn inputSlice(data_ptr: ?[*]const u8, len: usize) ?[]const u8 {
 
 fn validCellOffset(value: f64) bool {
     return std.math.isFinite(value);
+}
+
+fn inputMods(raw: c_int) ?input.Mods {
+    if (raw < 0) return null;
+    const value: c_uint = @intCast(raw);
+    const valid_mask: c_uint = (1 << 10) - 1;
+    if (value & ~valid_mask != 0) return null;
+    return @bitCast(@as(input.Mods.Backing, @intCast(value)));
+}
+
+fn mouseButtonState(raw: c_int) ?input.MouseButtonState {
+    return std.meta.intToEnum(input.MouseButtonState, raw) catch null;
+}
+
+fn mouseButtonValue(raw: c_int) ?input.MouseButton {
+    return std.meta.intToEnum(input.MouseButton, raw) catch null;
+}
+
+fn pressureStage(raw: u32) ?input.MousePressureStage {
+    return std.meta.intToEnum(input.MousePressureStage, raw) catch null;
+}
+
+fn scrollMods(raw: c_int) ?input.ScrollMods {
+    if (raw < 0 or raw > std.math.maxInt(u8)) return null;
+    const value: u8 = @intCast(raw);
+    if (value & 0xf0 != 0) return null;
+    const momentum: u3 = @truncate(value >> 1);
+    if (momentum > @intFromEnum(input_mouse.Momentum.may_begin)) return null;
+    return @bitCast(value);
 }
 
 fn scrollRow(value: u64) ?usize {
@@ -435,6 +474,93 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return value.core.paste(data);
     }
 
+    export fn ghostty_terminal_surface_mouse_pos(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        mods_raw: c_int,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const mods = inputMods(mods_raw) orelse return .invalid_input;
+        return value.core.pointerPosition(x, y, mods);
+    }
+
+    export fn ghostty_terminal_surface_mouse_button(
+        surface: ?*Surface,
+        state_raw: c_int,
+        button_raw: c_int,
+        mods_raw: c_int,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const state = mouseButtonState(state_raw) orelse return .invalid_input;
+        const button = mouseButtonValue(button_raw) orelse return .invalid_input;
+        const mods = inputMods(mods_raw) orelse return .invalid_input;
+        return value.core.mouseButton(state, button, mods);
+    }
+
+    export fn ghostty_terminal_surface_mouse_scroll(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        scroll_mods_raw: c_int,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const mods = scrollMods(scroll_mods_raw) orelse return .invalid_input;
+        return value.core.scroll(x, y, mods);
+    }
+
+    export fn ghostty_terminal_surface_mouse_pressure(
+        surface: ?*Surface,
+        stage_raw: u32,
+        pressure: f64,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const stage = pressureStage(stage_raw) orelse return .invalid_input;
+        return value.core.mousePressure(stage, pressure);
+    }
+
+    export fn ghostty_terminal_surface_read_selection(
+        surface: ?*Surface,
+        out_ptr: ?*Text,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = null,
+            .text_len = 0,
+        };
+        const text = value.core.selectedText() catch |err| return switch (err) {
+            error.NoSelection => .consumed_no_output,
+            error.OutOfMemory => .out_of_memory,
+        };
+        out.text = text.ptr;
+        out.text_len = text.len;
+        return .sent;
+    }
+
+    export fn ghostty_terminal_surface_free_text(
+        surface: ?*Surface,
+        text_ptr: ?*Text,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const text = text_ptr orelse return .invalid_input;
+        const ptr = text.text orelse return .invalid_input;
+        value.core.freeSelectedText(ptr[0..text.text_len :0]);
+        text.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = null,
+            .text_len = 0,
+        };
+        return .consumed_no_output;
+    }
+
     fn operationError(comptime operation: []const u8, err: anyerror) Result {
         log.err("terminal surface operation failed operation={s} err={}", .{
             operation,
@@ -462,6 +588,9 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_action_renderer_health_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_input_mouse_state_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_input_mouse_button_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_input_scroll_mods_t));
     try testing.expectEqual(
         @as(c_int, @intFromEnum(Result.ok)),
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_RESULT_OK),
@@ -495,6 +624,26 @@ test "terminal surface C ABI matches ghostty header" {
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_INPUT_OUT_OF_MEMORY),
     );
     try testing.expectEqual(
+        @as(c_int, @intFromEnum(input.MouseButtonState.release)),
+        @as(c_int, c.GHOSTTY_MOUSE_RELEASE),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(input.MouseButtonState.press)),
+        @as(c_int, c.GHOSTTY_MOUSE_PRESS),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(input.MouseButton.left)),
+        @as(c_int, c.GHOSTTY_MOUSE_LEFT),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(input.MouseButton.eleven)),
+        @as(c_int, c.GHOSTTY_MOUSE_ELEVEN),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(input_mouse.Momentum.may_begin)),
+        @as(c_int, c.GHOSTTY_MOUSE_MOMENTUM_MAY_BEGIN),
+    );
+    try testing.expectEqual(
         @as(c_int, @intFromEnum(renderer.Health.healthy)),
         @as(c_int, c.GHOSTTY_RENDERER_HEALTH_HEALTHY),
     );
@@ -511,6 +660,7 @@ test "terminal surface C ABI matches ghostty header" {
         InteractionState,
         c.ghostty_terminal_surface_interaction_state_s,
     );
+    try expectStructLayout(Text, c.ghostty_text_s);
     try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
     try testing.expectEqual(
         @as(c_int, @intFromEnum(ScrollRoute.viewport)),
@@ -588,4 +738,15 @@ test "terminal surface C input validation and key mapping" {
             scrollRow(std.math.maxInt(u64)),
         );
     }
+
+    try testing.expect(inputMods(-1) == null);
+    try testing.expect(inputMods(1 << 10) == null);
+    try testing.expect(inputMods(1 << 9) != null);
+    try testing.expect(mouseButtonState(99) == null);
+    try testing.expect(mouseButtonValue(99) == null);
+    try testing.expect(pressureStage(3) == null);
+    try testing.expect(scrollMods(-1) == null);
+    try testing.expect(scrollMods(0x10) == null);
+    try testing.expect(scrollMods(0x0e) == null);
+    try testing.expect(scrollMods(0x0d) != null);
 }
