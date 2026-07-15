@@ -34,6 +34,8 @@ pub const Options = struct {
     padding_balance: sizepkg.PaddingBalance,
     event_sink: rendererpkg.EventSink,
     crash_context: ?crash.sentry.ThreadState,
+    visible: bool = true,
+    focused: bool = true,
 };
 
 /// Initialize a runtime in stable caller-owned storage. The terminal, mutex,
@@ -91,6 +93,10 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
         &self.state,
         opts.event_sink,
         opts.crash_context,
+        .{
+            .visible = opts.visible,
+            .focused = opts.focused,
+        },
     );
     errdefer self.thread.deinit();
 

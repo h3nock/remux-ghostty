@@ -114,6 +114,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if the window is focused
         focused: bool,
 
+        /// True if the window is visible.
+        visible: bool,
+
         /// Flag to indicate that our focus state changed for custom
         /// shaders to update their state.
         custom_shader_focused_changed: bool = false,
@@ -704,6 +707,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
+                .visible = true,
                 .scrollbar = .zero,
                 .scrollbar_dirty = false,
                 .last_bottom_node = null,
@@ -911,7 +915,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &displayLinkCallback,
                 &thr.draw_now,
             );
-            display_link.start() catch {};
+            if (self.visible and self.focused) display_link.start() catch {};
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -1038,7 +1042,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // change-driven updates.
             if (comptime DisplayLink != void) link: {
                 const display_link = self.display_link orelse break :link;
-                if (focus) {
+                if (self.focused and self.visible) {
                     display_link.start() catch {};
                 } else {
                     display_link.stop() catch {};
@@ -1050,12 +1054,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
+            self.visible = visible;
+
             // If we're not visible, then we want to stop the display link
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
             if (comptime DisplayLink != void) link: {
                 const display_link = self.display_link orelse break :link;
-                if (visible and self.focused) {
+                if (self.visible and self.focused) {
                     display_link.start() catch {};
                 } else {
                     display_link.stop() catch {};

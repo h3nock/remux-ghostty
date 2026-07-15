@@ -127,6 +127,11 @@ pub const DerivedConfig = struct {
     }
 };
 
+pub const InitialState = struct {
+    visible: bool = true,
+    focused: bool = true,
+};
+
 /// Initialize the thread. This does not START the thread. This only sets
 /// up all the internal state necessary prior to starting the thread. It
 /// is up to the caller to start the thread with the threadMain entrypoint.
@@ -138,6 +143,7 @@ pub fn init(
     state: *rendererpkg.State,
     event_sink: rendererpkg.EventSink,
     crash_context: ?crash.sentry.ThreadState,
+    initial_state: InitialState,
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
@@ -187,6 +193,10 @@ pub fn init(
         .mailbox = mailbox,
         .event_sink = event_sink,
         .crash_context = crash_context,
+        .flags = .{
+            .visible = initial_state.visible,
+            .focused = initial_state.focused,
+        },
     };
 
     // Only enable compression if we have it enabled... save some
@@ -240,6 +250,11 @@ fn threadMain_(self: *Thread) !void {
 
     // Setup our thread QoS
     self.setQosClass();
+
+    // Apply non-default state before loop setup can install or start any
+    // rendering callbacks.
+    if (!self.flags.focused) try self.renderer.setFocus(false);
+    if (!self.flags.visible) self.renderer.setVisible(false);
 
     // Run our loop start/end callbacks if the renderer cares.
     const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
