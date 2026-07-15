@@ -13,12 +13,8 @@ font_grid: *font.SharedGrid,
 /// The size of everything.
 size: renderer.Size,
 
-/// The mailbox for sending the surface messages. This is only valid
-/// once the thread has started and should not be used outside of the thread.
-surface_mailbox: apprt.surface.Mailbox,
+/// Renderer-originated events delivered to the owning surface.
+event_sink: renderer.EventSink,
 
 /// The apprt surface.
 rt_surface: *apprt.Surface,
-
-/// The renderer thread.
-thread: *renderer.Thread,

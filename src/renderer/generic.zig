@@ -10,7 +10,6 @@ const os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
-const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
@@ -103,8 +102,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
 
-        /// The mailbox for communicating with the window.
-        surface_mailbox: apprt.surface.Mailbox,
+        /// Renderer-originated events delivered to the owning surface.
+        event_sink: renderer.EventSink,
 
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
@@ -701,7 +700,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var result: Self = .{
                 .alloc = alloc,
                 .config = options.config,
-                .surface_mailbox = options.surface_mailbox,
+                .event_sink = options.event_sink,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -1462,13 +1461,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
-            defer if (self.scrollbar_dirty) {
-                // Fail instantly if the surface mailbox if full, we'll just
-                // get it on the next frame.
-                if (self.surface_mailbox.push(.{
-                    .scrollbar = self.scrollbar,
-                }, .instant) > 0) self.scrollbar_dirty = false;
-            };
+            defer emitScrollbar(
+                self.event_sink,
+                self.scrollbar,
+                &self.scrollbar_dirty,
+            );
 
             // Let our graphics API do any bookkeeping, etc.
             // that it needs to do before / after `drawFrame`.
@@ -1746,9 +1743,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Our health value changed, so we notify the surface so that it
                 // can do something about it.
-                _ = self.surface_mailbox.push(.{
-                    .renderer_health = health,
-                }, .{ .forever = {} });
+                self.event_sink.rendererHealth(health);
             }
 
             // Always release our semaphore
@@ -3385,4 +3380,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+/// Attempt to deliver a dirty scrollbar value. A rejected delivery remains
+/// dirty so the renderer retries it on the next draw.
+inline fn emitScrollbar(
+    event_sink: renderer.EventSink,
+    scrollbar: terminal.Scrollbar,
+    dirty: *bool,
+) void {
+    if (!dirty.*) return;
+    if (event_sink.scrollbar(scrollbar)) dirty.* = false;
+}
+
+test "scrollbar delivery remains dirty until accepted" {
+    const testing = std.testing;
+
+    const Context = struct {
+        accepted: bool = false,
+        calls: usize = 0,
+
+        fn scrollbar(ptr: *anyopaque, _: terminal.Scrollbar) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.accepted;
+        }
+
+        fn rendererHealth(_: *anyopaque, _: renderer.Health) void {}
+        fn redraw(_: *anyopaque) void {}
+    };
+
+    const vtable: renderer.EventSink.VTable = .{
+        .scrollbar = Context.scrollbar,
+        .renderer_health = Context.rendererHealth,
+        .redraw = Context.redraw,
+    };
+    var context: Context = .{};
+    const sink: renderer.EventSink = .{
+        .ptr = &context,
+        .vtable = &vtable,
+    };
+    var dirty = true;
+
+    emitScrollbar(sink, .zero, &dirty);
+    try testing.expect(dirty);
+    try testing.expectEqual(@as(usize, 1), context.calls);
+
+    context.accepted = true;
+    emitScrollbar(sink, .zero, &dirty);
+    try testing.expect(!dirty);
+    try testing.expectEqual(@as(usize, 2), context.calls);
+
+    emitScrollbar(sink, .zero, &dirty);
+    try testing.expectEqual(@as(usize, 2), context.calls);
 }

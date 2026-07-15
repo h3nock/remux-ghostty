@@ -43,6 +43,49 @@ const log = std.log.scoped(.surface);
 // The renderer implementation to use.
 const Renderer = rendererpkg.Renderer;
 
+/// Adapts renderer events to the Core Surface and app mailboxes.
+const RendererEventSink = struct {
+    const vtable: rendererpkg.EventSink.VTable = .{
+        .scrollbar = scrollbar,
+        .renderer_health = rendererHealth,
+        .redraw = redraw,
+    };
+
+    fn init(surface: *Surface) rendererpkg.EventSink {
+        return .{
+            .ptr = surface,
+            .vtable = &vtable,
+        };
+    }
+
+    fn coreSurface(ptr: *anyopaque) *Surface {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn scrollbar(ptr: *anyopaque, value: terminal.Scrollbar) bool {
+        return coreSurface(ptr).surfaceMailbox().push(
+            .{ .scrollbar = value },
+            .{ .instant = {} },
+        ) > 0;
+    }
+
+    fn rendererHealth(ptr: *anyopaque, value: rendererpkg.Health) void {
+        _ = coreSurface(ptr).surfaceMailbox().push(
+            .{ .renderer_health = value },
+            .{ .forever = {} },
+        );
+    }
+
+    fn redraw(ptr: *anyopaque) void {
+        const core_surface = coreSurface(ptr);
+        const mailbox = core_surface.surfaceMailbox();
+        _ = mailbox.app.push(
+            .{ .redraw_surface = core_surface.rt_surface },
+            .{ .instant = {} },
+        );
+    }
+};
+
 /// Minimum window size in cells. This is used to prevent the window from
 /// being resized to a size that is too small to be useful. These defaults
 /// are chosen to match the default size of Mac's Terminal.app, but is
@@ -548,13 +591,13 @@ pub fn init(
 
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
+    const renderer_event_sink = RendererEventSink.init(self);
     var renderer_impl = try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
         .size = size,
-        .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+        .event_sink = renderer_event_sink,
         .rt_surface = rt_surface,
-        .thread = &self.renderer_thread,
     });
     errdefer renderer_impl.deinit();
 
@@ -570,7 +613,11 @@ pub fn init(
         rt_surface,
         &self.renderer,
         &self.renderer_state,
-        app_mailbox,
+        renderer_event_sink,
+        .{
+            .type = .renderer,
+            .surface = self,
+        },
     );
     errdefer render_thread.deinit();
 

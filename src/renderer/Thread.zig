@@ -12,7 +12,6 @@ const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const terminalpkg = @import("../terminal/main.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
-const App = @import("../App.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
@@ -89,8 +88,11 @@ state: *rendererpkg.State,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: *Mailbox,
 
-/// Mailbox to send messages to the app thread
-app_mailbox: App.Mailbox,
+/// Renderer-originated events delivered to the owning surface.
+event_sink: rendererpkg.EventSink,
+
+/// Renderer-thread crash metadata, when available.
+crash_context: ?crash.sentry.ThreadState,
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
@@ -134,7 +136,8 @@ pub fn init(
     surface: *apprt.Surface,
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
-    app_mailbox: App.Mailbox,
+    event_sink: rendererpkg.EventSink,
+    crash_context: ?crash.sentry.ThreadState,
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
@@ -182,7 +185,8 @@ pub fn init(
         .renderer = renderer_impl,
         .state = state,
         .mailbox = mailbox,
-        .app_mailbox = app_mailbox,
+        .event_sink = event_sink,
+        .crash_context = crash_context,
     };
 
     // Only enable compression if we have it enabled... save some
@@ -231,10 +235,7 @@ fn threadMain_(self: *Thread) !void {
     }
 
     // Setup our crash metadata
-    crash.sentry.thread_state = .{
-        .type = .renderer,
-        .surface = self.renderer.surface_mailbox.surface,
-    };
+    crash.sentry.thread_state = self.crash_context;
     defer crash.sentry.thread_state = null;
 
     // Setup our thread QoS
@@ -532,10 +533,7 @@ fn drawFrame(self: *Thread, now: bool) void {
     if (!now and self.renderer.hasVsync()) return;
 
     if (must_draw_from_app_thread) {
-        _ = self.app_mailbox.push(
-            .{ .redraw_surface = self.surface },
-            .{ .instant = {} },
-        );
+        self.event_sink.redraw();
     } else {
         self.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
