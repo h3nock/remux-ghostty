@@ -40,8 +40,9 @@ pub const Options = struct {
 
 /// Initialize a runtime in stable caller-owned storage. The terminal, mutex,
 /// renderer surface, font-grid set, and event-sink context are borrowed and
-/// must outlive the runtime. This initializes all renderer resources but does
-/// not start the renderer OS thread.
+/// must outlive the runtime. Config and derived font config are consumed only
+/// during this call and may be released when it returns. This initializes all
+/// renderer resources but does not start the renderer OS thread.
 pub fn init(self: *Runtime, opts: Options) !font.Metrics {
     const font_grid_key, const font_grid = try opts.font_grid_set.ref(
         opts.font_config,

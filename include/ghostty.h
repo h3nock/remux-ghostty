@@ -59,6 +59,7 @@ typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
 typedef struct ghostty_terminal* ghostty_terminal_t;
+typedef struct ghostty_terminal_surface* ghostty_terminal_surface_t;
 
 // Opaque handles for the sans-I/O tmux control-mode embedding API.
 typedef struct ghostty_tmux_client* ghostty_tmux_client_t;
@@ -873,6 +874,37 @@ typedef enum {
   GHOSTTY_RENDERER_HEALTH_UNHEALTHY,
 } ghostty_action_renderer_health_e;
 
+// Renderer-only surface over an externally supplied ghostty_terminal_t.
+
+typedef enum {
+  GHOSTTY_TERMINAL_SURFACE_RESULT_OK,
+  GHOSTTY_TERMINAL_SURFACE_RESULT_INVALID_INPUT,
+  GHOSTTY_TERMINAL_SURFACE_RESULT_OUT_OF_MEMORY,
+  GHOSTTY_TERMINAL_SURFACE_RESULT_RENDERER_IN_USE,
+  GHOSTTY_TERMINAL_SURFACE_RESULT_FAILED,
+} ghostty_terminal_surface_result_e;
+
+// Called synchronously from draw or asynchronously from renderer/GPU completion
+// work. The callback must be thread-safe and may only record the value or signal
+// other work. It must not call any ghostty_terminal_surface_* function. Userdata
+// must remain valid until ghostty_terminal_surface_free returns.
+typedef void (*ghostty_terminal_surface_renderer_health_cb)(
+    void*,
+    ghostty_action_renderer_health_e);
+
+typedef struct {
+  ghostty_platform_e platform_tag;
+  ghostty_platform_u platform;
+  void* userdata;
+  ghostty_terminal_surface_renderer_health_cb renderer_health_cb;
+  double scale_factor;
+  float font_size;
+  uint32_t width_px;
+  uint32_t height_px;
+  bool visible;
+  bool focused;
+} ghostty_terminal_surface_config_s;
+
 // apprt.action.KeySequence
 typedef struct {
   bool active;
@@ -1247,6 +1279,53 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_retain_pane_terminal(
     uint64_t,
     ghostty_terminal_t*);
 GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
+
+// Renderer-only surface over an existing terminal. The app supplies shared
+// configuration and font resources and must outlive the surface. The platform
+// view is unretained and must also outlive the surface. Creation snapshots the
+// app configuration, theme, and content scale; recreate the surface to adopt
+// changes to any of them. The supplied terminal remains caller-owned because
+// the surface retains its own reference.
+//
+// width_px and height_px are required exact nonzero backing-pixel dimensions of
+// the already-sized platform view. These calls notify the renderer; they do not
+// resize the native view. The host must resize the view first and then report
+// matching dimensions.
+//
+// Presentation setters, draw, size, and free must be serialized by one
+// presentation owner. terminal_changed may run concurrently after the terminal
+// mutation was published under its mutex, but every such call must finish and no
+// new call may begin before free. Free stops and joins the renderer before
+// returning. If terminal_changed or a presentation setter returns non-OK, its
+// wake may have failed after work was admitted; a host keeping the surface must
+// retry the same notification or value.
+GHOSTTY_API ghostty_terminal_surface_config_s
+ghostty_terminal_surface_config_new(void);
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_new(
+    ghostty_app_t,
+    ghostty_terminal_t,
+    const ghostty_terminal_surface_config_s*,
+    ghostty_terminal_surface_t*);
+GHOSTTY_API void ghostty_terminal_surface_free(ghostty_terminal_surface_t);
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_draw(
+    ghostty_terminal_surface_t);
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_terminal_changed(ghostty_terminal_surface_t);
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_set_visible(ghostty_terminal_surface_t, bool);
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_set_focused(ghostty_terminal_surface_t, bool);
+// Runtime dimensions must also be nonzero. Resize the platform view first and
+// pass its matching backing-pixel dimensions.
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_set_size(
+    ghostty_terminal_surface_t,
+    uint32_t,
+    uint32_t);
+// columns and rows are the desired presentation grid. Resizing presentation
+// never mutates the canonical terminal geometry.
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_size(
+    ghostty_terminal_surface_t,
+    ghostty_surface_size_s*);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);

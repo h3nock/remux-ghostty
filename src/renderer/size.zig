@@ -274,6 +274,17 @@ pub const Padding = extern struct {
     right: u32 = 0,
     left: u32 = 0,
 
+    /// Scale point-valued padding to pixels for the given horizontal and
+    /// vertical DPI. One point is 1/72 of an inch.
+    pub fn scaledDpi(self: Padding, x_dpi: f32, y_dpi: f32) Padding {
+        return .{
+            .top = @intFromFloat(@floor(@as(f32, @floatFromInt(self.top)) * y_dpi / 72)),
+            .bottom = @intFromFloat(@floor(@as(f32, @floatFromInt(self.bottom)) * y_dpi / 72)),
+            .left = @intFromFloat(@floor(@as(f32, @floatFromInt(self.left)) * x_dpi / 72)),
+            .right = @intFromFloat(@floor(@as(f32, @floatFromInt(self.right)) * x_dpi / 72)),
+        };
+    }
+
     /// Returns padding that balances the whitespace around the screen
     /// for the given grid and cell sizes.
     pub fn balanced(screen: ScreenSize, grid: GridSize, cell: CellSize) Padding {
@@ -372,6 +383,22 @@ test "Padding balanced on zero" {
     const screen: ScreenSize = .{ .width = 0, .height = 0 };
     const padding = Padding.balanced(screen, grid, cell);
     try testing.expectEqual(Padding{}, padding);
+}
+
+test "Padding scaledDpi scales axes independently" {
+    const testing = std.testing;
+    const padding: Padding = .{
+        .top = 2,
+        .bottom = 4,
+        .left = 3,
+        .right = 5,
+    };
+    try testing.expectEqual(Padding{
+        .top = 4,
+        .bottom = 8,
+        .left = 3,
+        .right = 5,
+    }, padding.scaledDpi(72, 144));
 }
 
 test "GridSize update exact" {

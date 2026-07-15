@@ -46,6 +46,9 @@ comptime {
 
     // Sans-I/O tmux control-mode embedding API.
     _ = @import("terminal/tmux/c.zig");
+
+    // Renderer-only surface over an externally owned terminal.
+    _ = @import("renderer/TerminalSurfaceC.zig").CAPI;
 }
 
 /// ghostty_info_s

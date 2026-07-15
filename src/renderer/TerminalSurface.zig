@@ -37,7 +37,10 @@ pub const Options = struct {
 };
 
 /// Initialize in stable caller-owned storage and start the renderer thread.
-/// The renderer surface, font set, config, and event-sink context are borrowed.
+/// The renderer surface, font-grid set, and event-sink context are borrowed and
+/// must outlive this surface. Config and derived font config are consumed only
+/// during this call. The retained Shared terminal and its mutex remain valid
+/// through deinit.
 pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     const shared = opts.shared.retain();
     errdefer shared.release();

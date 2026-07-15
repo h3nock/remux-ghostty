@@ -461,29 +461,12 @@ const DerivedConfig = struct {
     }
 
     fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
-        const padding_top: u32 = padding_top: {
-            const padding_top: f32 = @floatFromInt(self.window_padding_top);
-            break :padding_top @intFromFloat(@floor(padding_top * y_dpi / 72));
-        };
-        const padding_bottom: u32 = padding_bottom: {
-            const padding_bottom: f32 = @floatFromInt(self.window_padding_bottom);
-            break :padding_bottom @intFromFloat(@floor(padding_bottom * y_dpi / 72));
-        };
-        const padding_left: u32 = padding_left: {
-            const padding_left: f32 = @floatFromInt(self.window_padding_left);
-            break :padding_left @intFromFloat(@floor(padding_left * x_dpi / 72));
-        };
-        const padding_right: u32 = padding_right: {
-            const padding_right: f32 = @floatFromInt(self.window_padding_right);
-            break :padding_right @intFromFloat(@floor(padding_right * x_dpi / 72));
-        };
-
-        return .{
-            .top = padding_top,
-            .bottom = padding_bottom,
-            .left = padding_left,
-            .right = padding_right,
-        };
+        return (rendererpkg.Padding{
+            .top = self.window_padding_top,
+            .bottom = self.window_padding_bottom,
+            .left = self.window_padding_left,
+            .right = self.window_padding_right,
+        }).scaledDpi(x_dpi, y_dpi);
     }
 };
 
