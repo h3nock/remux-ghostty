@@ -640,6 +640,32 @@ test "control client hydrates as one group and keeps later command independent" 
     try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n"));
 }
 
+test "control client close notifications produce no outbound work" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try client.feed("%window-close @0\n", &actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try testing.expectEqual(1, client.viewer.windows.items.len);
+    try testing.expectEqual(1, client.viewer.panes.count());
+
+    try client.feed(
+        "%unlinked-window-close @0\n" ** 4,
+        &actions,
+    );
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try testing.expectEqual(0, client.viewer.windows.items.len);
+    try testing.expectEqual(0, client.viewer.panes.count());
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+}
+
 test "control client hydration error skips only its group" {
     const testing = std.testing;
 

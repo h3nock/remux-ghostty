@@ -413,6 +413,37 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_add = .{ .id = id } };
+        } else if (std.mem.eql(u8, cmd, "%window-close") or
+            std.mem.eql(u8, cmd, "%unlinked-window-close"))
+        cmd: {
+            if (line.len <= cmd.len + 2 or
+                line[cmd.len] != ' ' or
+                line[cmd.len + 1] != '@')
+            {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            }
+
+            const id_text = line[cmd.len + 2 ..];
+            for (id_text) |byte| if (!std.ascii.isDigit(byte)) {
+                log.warn("failed to parse window close id line=\"{s}\"", .{line});
+                break :cmd;
+            };
+            const id = std.fmt.parseInt(
+                usize,
+                id_text,
+                10,
+            ) catch {
+                log.warn("failed to parse window close id line=\"{s}\"", .{line});
+                break :cmd;
+            };
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return if (std.mem.eql(u8, cmd, "%window-close"))
+                .{ .window_close = .{ .id = id } }
+            else
+                .{ .unlinked_window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-renamed @([0-9]+) (.+)$",
@@ -671,6 +702,16 @@ pub const Notification = union(enum) {
 
     /// The window with ID window-id was linked to the current session.
     window_add: struct {
+        id: usize,
+    },
+
+    /// A window still linked to the current session was unlinked elsewhere.
+    window_close: struct {
+        id: usize,
+    },
+
+    /// The window with ID window-id was unlinked from the current session.
+    unlinked_window_close: struct {
         id: usize,
     },
 
@@ -1073,6 +1114,59 @@ test "tmux window-add" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_add);
     try testing.expectEqual(14, n.window_add.id);
+}
+
+test "tmux window-close notifications are distinct" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    for ("%window-close @14") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    var n = (try c.put('\n')).?;
+    try testing.expect(n == .window_close);
+    try testing.expectEqual(14, n.window_close.id);
+
+    for ("%unlinked-window-close @15") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    n = (try c.put('\n')).?;
+    try testing.expect(n == .unlinked_window_close);
+    try testing.expectEqual(15, n.unlinked_window_close.id);
+}
+
+test "tmux malformed window-close notifications are ignored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_][]const u8{
+        "%window-close",
+        "%window-close 14",
+        "%window-close @invalid",
+        "%window-close @+14",
+        "%window-close @14 trailing",
+        "%unlinked-window-close",
+        "%unlinked-window-close 14",
+        "%unlinked-window-close @invalid",
+        "%unlinked-window-close @+14",
+        "%unlinked-window-close @14 trailing",
+    }) |input| {
+        var c: Parser = .{ .buffer = .init(alloc) };
+        defer c.deinit();
+
+        for (input) |byte| try testing.expect(try c.put(byte) == null);
+        try testing.expect(try c.put('\n') == null);
+        try testing.expect(!c.isBroken());
+
+        for ("%sessions-changed") |byte| {
+            try testing.expect(try c.put(byte) == null);
+        }
+        const n = (try c.put('\n')).?;
+        try testing.expect(n == .sessions_changed);
+    }
 }
 
 test "tmux window-renamed" {

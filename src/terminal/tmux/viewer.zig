@@ -701,6 +701,20 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // Another session unlinked a window that is still linked here.
+            .window_close => {},
+
+            // This session no longer links the window. Removing known state
+            // is local and idempotent because duplicate notifications are
+            // normal tmux behavior.
+            .unlinked_window_close => |info| self.unlinkedWindowClosed(
+                &actions,
+                info.id,
+            ) catch {
+                log.warn("failed to remove unlinked window, becoming defunct", .{});
+                return self.defunct();
+            },
+
             // We ignore this one. It means a session was created or
             // destroyed. If it was our own session we will get an exit
             // notification very soon. If it is another session we don't
@@ -899,6 +913,27 @@ pub const Viewer = struct {
 
         // Queue list-windows to get the updated window list
         try self.queueCommands(&.{.list_windows});
+    }
+
+    fn unlinkedWindowClosed(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
+        window_id: usize,
+    ) !void {
+        const index = for (self.windows.items, 0..) |window, i| {
+            if (window.id == window_id) break i;
+        } else return;
+
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try actions.ensureUnusedCapacity(arena.allocator(), 1);
+
+        var removed = self.windows.orderedRemove(index);
+        errdefer self.windows.insertAssumeCapacity(index, removed);
+        try self.syncLayouts(self.windows.items);
+
+        removed.deinit(self.alloc);
+        actions.appendAssumeCapacity(.{ .windows = self.windows.items });
     }
 
     fn syncLayouts(
@@ -3335,6 +3370,109 @@ test "layout_change returns command when queue was empty" {
             .contains_tags = &.{.exit},
         },
     });
+}
+
+fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
+    viewer.state = .command_queue;
+    viewer.session_id = 42;
+    const initial_topology =
+        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1
+    ;
+    {
+        var arena = viewer.action_arena.promote(viewer.alloc);
+        defer viewer.action_arena = arena.state;
+        var actions: std.ArrayList(Viewer.Action) = .empty;
+        try viewer.receivedListWindows(
+            arena.allocator(),
+            &actions,
+            initial_topology,
+        );
+    }
+    viewer.command_queue.clear();
+    viewer.sent_command_count = 0;
+}
+
+test "window_close from another session does not change current topology" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    const actions = viewer.next(.{ .tmux = .{ .window_close = .{ .id = 1 } } });
+    try testing.expectEqual(0, actions.len);
+    try testing.expectEqual(2, viewer.windows.items.len);
+    try testing.expectEqual(2, viewer.panes.count());
+    try testing.expectEqual(0, viewer.command_queue.len());
+    try testing.expectEqual(0, viewer.sent_command_count);
+}
+
+test "unlinked_window_close removes once without commands" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    var actions = viewer.next(.{ .tmux = .{ .unlinked_window_close = .{ .id = 1 } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqual(1, viewer.windows.items.len);
+    try testing.expectEqual(0, viewer.windows.items[0].id);
+    try testing.expectEqual(1, viewer.panes.count());
+    try testing.expect(viewer.panes.contains(0));
+    try testing.expect(!viewer.panes.contains(1));
+    try testing.expectEqual(0, viewer.command_queue.len());
+    try testing.expectEqual(0, viewer.sent_command_count);
+
+    actions = viewer.next(.{ .tmux = .{ .unlinked_window_close = .{ .id = 1 } } });
+    try testing.expectEqual(0, actions.len);
+    try testing.expectEqual(1, viewer.windows.items.len);
+    try testing.expectEqual(1, viewer.panes.count());
+    try testing.expectEqual(0, viewer.command_queue.len());
+}
+
+test "session active-window change precedes unlinked_window_close" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    var actions = viewer.next(.{ .tmux = .{ .session_window_changed = .{
+        .session_id = 42,
+        .window_id = 1,
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expect(!viewer.windows.items[0].is_active);
+    try testing.expect(viewer.windows.items[1].is_active);
+
+    actions = viewer.next(.{ .tmux = .{ .unlinked_window_close = .{ .id = 0 } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqual(1, viewer.windows.items.len);
+    try testing.expectEqual(1, viewer.windows.items[0].id);
+    try testing.expect(viewer.windows.items[0].is_active);
+    try testing.expectEqual(1, viewer.panes.count());
+    try testing.expect(viewer.panes.contains(1));
+    try testing.expectEqual(0, viewer.command_queue.len());
+}
+
+test "unlinked_window_close preserves an in-flight command group" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    try viewer.queueCommands(&.{.list_windows});
+    {
+        var actions: std.ArrayList(Viewer.Action) = .empty;
+        try viewer.appendQueuedCommandActions(&actions);
+    }
+    try testing.expectEqual(1, viewer.command_queue.len());
+    try testing.expectEqual(1, viewer.sent_command_count);
+
+    const actions = viewer.next(.{ .tmux = .{ .unlinked_window_close = .{ .id = 1 } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    for (actions) |action| try testing.expect(action != .command);
+    try testing.expectEqual(1, viewer.command_queue.len());
+    try testing.expectEqual(1, viewer.sent_command_count);
 }
 
 test "window_add queues list_windows when queue empty" {
