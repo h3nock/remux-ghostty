@@ -221,6 +221,12 @@ pub const Viewer = struct {
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     pub const Options = struct {
+        /// Byte limit forwarded directly to each newly created pane Terminal's
+        /// local scrollback. Zero disables retained scrollback. This is
+        /// independent of `history_line_limit`, which controls the number of
+        /// remote tmux history rows requested.
+        max_scrollback: usize = 10_000,
+
         /// Maximum history rows requested when a pane is first discovered.
         /// Null captures all available history; zero skips the history
         /// capture. This is independent of Terminal's byte-based scrollback
@@ -900,6 +906,7 @@ pub const Viewer = struct {
                 &self.panes,
                 &panes,
                 window.layout,
+                self.options.max_scrollback,
                 visible_pane,
                 &visible_found,
             );
@@ -1591,6 +1598,7 @@ pub const Viewer = struct {
         panes_old: *const PanesMap,
         panes_new: *PanesMap,
         layout: Layout,
+        max_scrollback: usize,
         visible_pane: ?PaneGeometry,
         visible_found: *bool,
     ) !void {
@@ -1603,6 +1611,7 @@ pub const Viewer = struct {
                         panes_old,
                         panes_new,
                         l,
+                        max_scrollback,
                         visible_pane,
                         visible_found,
                     );
@@ -1654,6 +1663,7 @@ pub const Viewer = struct {
                 gop.value_ptr.* = try Pane.init(gpa_alloc, .{
                     .cols = cols,
                     .rows = rows,
+                    .max_scrollback = max_scrollback,
                 });
             },
         }
@@ -2160,8 +2170,11 @@ test "minimum tmux version" {
     try testing.expect(!Viewer.supportsTmuxVersion("unknown"));
 }
 
-test "active window and pane topology" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+test "active topology creates configured pane terminals" {
+    const max_scrollback: usize = 123_456;
+    var viewer = try Viewer.init(testing.allocator, .{
+        .max_scrollback = max_scrollback,
+    });
     defer viewer.deinit();
     viewer.state = .command_queue;
     viewer.session_id = 42;
@@ -2188,6 +2201,15 @@ test "active window and pane topology" {
     try testing.expectEqual(0, viewer.windows.items[0].active_pane_id);
     try testing.expect(!viewer.windows.items[1].is_active);
     try testing.expectEqual(1, viewer.windows.items[1].active_pane_id);
+    {
+        const terminal_owner = viewer.panes.get(0).?.terminal_owner;
+        terminal_owner.mutex.lock();
+        defer terminal_owner.mutex.unlock();
+        try testing.expectEqual(
+            max_scrollback,
+            terminal_owner.terminal.screens.get(.primary).?.pages.explicit_max_size,
+        );
+    }
 
     const queue_len = viewer.command_queue.len();
     const sent_command_count = viewer.sent_command_count;
