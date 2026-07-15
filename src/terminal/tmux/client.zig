@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const SharedTerminal = @import("../Shared.zig");
 const channel_pkg = @import("channel.zig");
 const Viewer = @import("viewer.zig").Viewer;
 
@@ -55,6 +56,18 @@ pub const ControlClient = struct {
         n: usize,
     ) channel_pkg.Channel.ConsumeError!void {
         return self.channel.consumeOutbound(n);
+    }
+
+    /// Retain the canonical terminal for `pane_id`, or return null if that
+    /// pane is unknown. Serialize this lookup with other ControlClient calls.
+    /// The caller must release the returned owner. It may outlive the pane and
+    /// this client; every Terminal access must hold the owner's mutex.
+    pub fn retainPaneTerminal(
+        self: *ControlClient,
+        pane_id: usize,
+    ) ?*SharedTerminal {
+        const pane = self.viewer.panes.get(pane_id) orelse return null;
+        return pane.retainTerminal();
     }
 
     /// Process bytes received from a tmux control-mode connection.
@@ -397,4 +410,45 @@ test "control client malformed stream exits" {
     try testing.expect(actions.records.items[0] == .exit);
     try client.feed("%", &actions);
     try testing.expectEqual(1, actions.records.items.len);
+}
+
+test "control client retained pane terminal outlives client" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    var client_live = true;
+    defer if (client_live) client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try testing.expect(client.retainPaneTerminal(99) == null);
+
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n" ++
+            "%session-changed $42 main\n" ++
+            "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n" ++
+            "$0 @0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "%end 3 3 1\n",
+        &actions,
+    );
+
+    const retained = client.retainPaneTerminal(0).?;
+    const same_terminal = client.retainPaneTerminal(0).?;
+    try testing.expectEqual(retained, same_terminal);
+    try testing.expectEqual(&retained.terminal, &same_terminal.terminal);
+    same_terminal.release();
+
+    client.deinit();
+    client_live = false;
+    defer retained.release();
+
+    retained.mutex.lock();
+    defer retained.mutex.unlock();
+    try testing.expectEqual(83, retained.terminal.cols);
+    try testing.expectEqual(44, retained.terminal.rows);
+    try retained.terminal.printString("alive");
+    const contents = try retained.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("alive", contents);
 }
