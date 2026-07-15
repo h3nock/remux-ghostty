@@ -900,6 +900,26 @@ typedef enum {
   GHOSTTY_TERMINAL_SURFACE_INPUT_OUT_OF_MEMORY,
 } ghostty_terminal_surface_input_result_e;
 
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  double cell_offset;
+} ghostty_terminal_surface_scrollbar_s;
+
+typedef enum {
+  GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_VIEWPORT,
+  GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_ALTERNATE_SCREEN_CURSOR,
+  GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_REMOTE_MOUSE,
+} ghostty_terminal_surface_scroll_route_e;
+
+typedef struct {
+  ghostty_terminal_surface_scrollbar_s scrollbar;
+  ghostty_terminal_surface_scroll_route_e route;
+  bool mouse_captured;
+  bool has_selection;
+} ghostty_terminal_surface_interaction_state_s;
+
 // Called synchronously from draw or asynchronously from renderer/GPU completion
 // work. The callback must be thread-safe and may only record the value or signal
 // other work. It must not call any ghostty_terminal_surface_* function. Userdata
@@ -1368,6 +1388,28 @@ GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_set_size(
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_size(
     ghostty_terminal_surface_t,
     ghostty_surface_size_s*);
+
+// Returns one synchronized snapshot of scrollbar geometry, fractional top-row
+// presentation offset, input routing, effective mouse capture, and selection.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_interaction_state(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_interaction_state_s*);
+
+// Normalizes cell_offset into row carry plus [0, 1), clamps to the available
+// scrollbar range, and returns the exact state published by the operation.
+// Reaching the bottom resets cell_offset to zero. Non-finite offsets are
+// invalid, as is a row that cannot be represented by the host address size.
+// If renderer notification fails, the updated state remains published and is
+// still written to the output pointer. Repeating the same position is a
+// side-effect-free no-op and does not retry notification; call
+// ghostty_terminal_surface_terminal_changed to retry the wake.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_scroll_to_position(
+    ghostty_terminal_surface_t,
+    uint64_t,
+    double,
+    ghostty_terminal_surface_interaction_state_s*);
 
 // Filter modifiers for native text translation. Pass the original unfiltered
 // modifiers in the following key event.

@@ -57,6 +57,22 @@ pub const SurfaceSize = extern struct {
     cell_height_px: u32,
 };
 
+pub const Scrollbar = extern struct {
+    total: u64,
+    offset: u64,
+    len: u64,
+    cell_offset: f64,
+};
+
+pub const ScrollRoute = renderer.TerminalSurface.ScrollRoute;
+
+pub const InteractionState = extern struct {
+    scrollbar: Scrollbar,
+    route: ScrollRoute,
+    mouse_captured: bool,
+    has_selection: bool,
+};
+
 fn configNew() Config {
     return .{};
 }
@@ -65,6 +81,28 @@ fn inputSlice(data_ptr: ?[*]const u8, len: usize) ?[]const u8 {
     if (len == 0) return &.{};
     const data = data_ptr orelse return null;
     return data[0..len];
+}
+
+fn validCellOffset(value: f64) bool {
+    return std.math.isFinite(value);
+}
+
+fn scrollRow(value: u64) ?usize {
+    return std.math.cast(usize, value);
+}
+
+fn interactionStateC(state: renderer.TerminalSurface.InteractionState) InteractionState {
+    return .{
+        .scrollbar = .{
+            .total = @intCast(state.scrollbar.total),
+            .offset = @intCast(state.scrollbar.offset),
+            .len = @intCast(state.scrollbar.len),
+            .cell_offset = state.scrollbar.cell_offset,
+        },
+        .route = state.route,
+        .mouse_captured = state.mouse_captured,
+        .has_selection = state.has_selection,
+    };
 }
 
 fn validConfig(config: Config) bool {
@@ -328,6 +366,41 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_interaction_state(
+        surface: ?*Surface,
+        out_ptr: ?*InteractionState,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = interactionStateC(value.core.interactionState());
+        return .ok;
+    }
+
+    export fn ghostty_terminal_surface_scroll_to_position(
+        surface: ?*Surface,
+        row: u64,
+        cell_offset: f64,
+        out_ptr: ?*InteractionState,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        if (!validCellOffset(cell_offset)) return .invalid_input;
+        const row_value = scrollRow(row) orelse return .invalid_input;
+        var state: renderer.TerminalSurface.InteractionState = undefined;
+        value.core.scrollToPosition(
+            row_value,
+            cell_offset,
+            &state,
+        ) catch |err| {
+            // scrollToPosition only reports notification failure after it
+            // fills the exact state committed under the terminal lock.
+            out.* = interactionStateC(state);
+            return operationError("scroll to position", err);
+        };
+        out.* = interactionStateC(state);
+        return .ok;
+    }
+
     /// Filter modifiers for native key translation. The original modifiers
     /// must still be passed in the subsequent key event.
     export fn ghostty_terminal_surface_key_translation_mods(
@@ -433,7 +506,24 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expectEqual(@alignOf(Platform), @alignOf(c.ghostty_platform_u));
     try expectStructLayout(Config, c.ghostty_terminal_surface_config_s);
     try expectStructLayout(SurfaceSize, c.ghostty_surface_size_s);
+    try expectStructLayout(Scrollbar, c.ghostty_terminal_surface_scrollbar_s);
+    try expectStructLayout(
+        InteractionState,
+        c.ghostty_terminal_surface_interaction_state_s,
+    );
     try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(ScrollRoute.viewport)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_VIEWPORT),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(ScrollRoute.alternate_screen_cursor)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_ALTERNATE_SCREEN_CURSOR),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(ScrollRoute.remote_mouse)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_REMOTE_MOUSE),
+    );
 }
 
 test "terminal surface C config defaults and validation" {
@@ -485,4 +575,17 @@ test "terminal surface C input validation and key mapping" {
     var invalid = valid;
     invalid.action = 99;
     try testing.expect(invalid.core() == null);
+
+    try testing.expect(!validCellOffset(std.math.nan(f64)));
+    try testing.expect(!validCellOffset(std.math.inf(f64)));
+    try testing.expect(validCellOffset(-0.25));
+    try testing.expectEqual(@as(?usize, 42), scrollRow(42));
+    if (@bitSizeOf(usize) < @bitSizeOf(u64)) {
+        try testing.expect(scrollRow(std.math.maxInt(u64)) == null);
+    } else {
+        try testing.expectEqual(
+            @as(?usize, std.math.maxInt(usize)),
+            scrollRow(std.math.maxInt(u64)),
+        );
+    }
 }

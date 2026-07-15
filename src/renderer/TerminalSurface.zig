@@ -23,6 +23,7 @@ macos_option_as_alt: input.OptionAsAlt,
 vt_kam_allowed: bool,
 selection_clear_on_typing: bool,
 scroll_to_bottom_on_keystroke: bool,
+mouse_reporting: bool,
 explicit_padding: rendererpkg.Padding,
 padding_balance: sizepkg.PaddingBalance,
 /// Scheduling hint shared with terminal producers. Terminal contents remain
@@ -51,6 +52,31 @@ pub const InputResult = enum(c_int) {
     unavailable,
     invalid_input,
     out_of_memory,
+};
+
+pub const ScrollRoute = enum(c_int) {
+    viewport,
+    alternate_screen_cursor,
+    remote_mouse,
+};
+
+pub const Scrollbar = struct {
+    total: usize,
+    offset: usize,
+    len: usize,
+    cell_offset: f64,
+};
+
+pub const InteractionState = struct {
+    scrollbar: Scrollbar,
+    route: ScrollRoute,
+    mouse_captured: bool,
+    has_selection: bool,
+};
+
+const ScrollPosition = struct {
+    row: usize,
+    cell_offset: f64,
 };
 
 pub const Options = struct {
@@ -95,6 +121,7 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .vt_kam_allowed = opts.config.@"vt-kam-allowed",
         .selection_clear_on_typing = opts.config.@"selection-clear-on-typing",
         .scroll_to_bottom_on_keystroke = opts.config.@"scroll-to-bottom".keystroke,
+        .mouse_reporting = opts.config.@"mouse-reporting",
         .explicit_padding = opts.explicit_padding,
         .padding_balance = opts.padding_balance,
         .visible = .init(opts.visible),
@@ -180,6 +207,128 @@ pub fn resize(self: *TerminalSurface, screen: rendererpkg.ScreenSize) !void {
 
 pub fn desiredGridSize(self: *const TerminalSurface) rendererpkg.GridSize {
     return self.size.grid();
+}
+
+/// Return the terminal interaction state from one synchronized snapshot.
+pub fn interactionState(self: *TerminalSurface) InteractionState {
+    self.shared.mutex.lock();
+    defer self.shared.mutex.unlock();
+    return self.normalizeAndSnapshotInteractionLocked();
+}
+
+/// Scroll to an absolute row plus fractional cell offset. The canonical
+/// terminal viewport and renderer presentation offset are published together.
+/// The output is filled before any notification failure is returned. Repeating
+/// the same position is a no-op; retry a failed wake with `terminalChanged`.
+pub fn scrollToPosition(
+    self: *TerminalSurface,
+    row: usize,
+    cell_offset: f64,
+    out: *InteractionState,
+) !void {
+    std.debug.assert(std.math.isFinite(cell_offset));
+
+    self.shared.mutex.lock();
+    const before = self.normalizeAndSnapshotInteractionLocked();
+    const max_row = scrollbarMaxRow(before.scrollbar);
+    const position = normalizeScrollPosition(row, cell_offset, max_row);
+    const row_changed = position.row != before.scrollbar.offset;
+    const fraction_changed = position.cell_offset !=
+        self.runtime.state.scroll_cell_offset;
+
+    if (row_changed) {
+        self.shared.terminal.scrollViewport(.{ .row = position.row });
+    }
+    self.runtime.state.scroll_cell_offset = position.cell_offset;
+    out.* = self.normalizeAndSnapshotInteractionLocked();
+    self.shared.mutex.unlock();
+
+    if (row_changed or fraction_changed) try self.terminalChanged();
+}
+
+fn normalizeAndSnapshotInteractionLocked(
+    self: *TerminalSurface,
+) InteractionState {
+    const term = &self.shared.terminal;
+    const screen = term.screens.active;
+    const scrollbar = screen.pages.scrollbar();
+    const max_row = if (scrollbar.total > scrollbar.len)
+        scrollbar.total - scrollbar.len
+    else
+        0;
+    if (scrollbar.offset >= max_row) {
+        self.runtime.state.scroll_cell_offset = 0;
+    }
+    const mouse_captured = self.mouse_reporting and
+        term.flags.mouse_event != .none;
+
+    return .{
+        .scrollbar = .{
+            .total = scrollbar.total,
+            .offset = scrollbar.offset,
+            .len = scrollbar.len,
+            .cell_offset = self.runtime.state.scroll_cell_offset,
+        },
+        .route = if (mouse_captured)
+            .remote_mouse
+        else if (term.screens.active_key == .alternate and
+            term.flags.mouse_event == .none and
+            term.modes.get(.mouse_alternate_scroll))
+            .alternate_screen_cursor
+        else
+            .viewport,
+        .mouse_captured = mouse_captured,
+        .has_selection = screen.selection != null,
+    };
+}
+
+fn scrollbarMaxRow(scrollbar: Scrollbar) usize {
+    return if (scrollbar.total > scrollbar.len)
+        scrollbar.total - scrollbar.len
+    else
+        0;
+}
+
+fn saturatedFloatToUsize(value: f64) usize {
+    if (!std.math.isFinite(value) or value <= 0) return 0;
+    const max_float: f64 = @floatFromInt(std.math.maxInt(usize));
+    if (value >= max_float) return std.math.maxInt(usize);
+    return @intFromFloat(value);
+}
+
+fn normalizeScrollPosition(
+    row: usize,
+    cell_offset: f64,
+    max_row: usize,
+) ScrollPosition {
+    std.debug.assert(std.math.isFinite(cell_offset));
+
+    var normalized_row = row;
+    var fraction = cell_offset;
+    if (fraction < 0 or fraction >= 1) {
+        const carry = @floor(fraction);
+        fraction -= carry;
+        if (carry > 0) {
+            const carry_usize = saturatedFloatToUsize(carry);
+            normalized_row = if (carry_usize >
+                std.math.maxInt(usize) - normalized_row)
+                std.math.maxInt(usize)
+            else
+                normalized_row + carry_usize;
+        } else if (carry < 0) {
+            const carry_usize = saturatedFloatToUsize(-carry);
+            if (carry_usize > normalized_row) {
+                return .{ .row = 0, .cell_offset = 0 };
+            }
+            normalized_row -= carry_usize;
+        }
+    }
+
+    normalized_row = @min(normalized_row, max_row);
+    if (normalized_row >= max_row) {
+        return .{ .row = max_row, .cell_offset = 0 };
+    }
+    return .{ .row = normalized_row, .cell_offset = fraction };
 }
 
 /// Filter modifiers for native text translation. The original modifiers must
@@ -339,9 +488,15 @@ fn acceptedKey(self: *TerminalSurface, key_value: input.Key) void {
         screen.clearSelection();
         changed = true;
     }
-    if (self.scroll_to_bottom_on_keystroke and !screen.viewportIsBottom()) {
-        self.shared.terminal.scrollViewport(.bottom);
-        changed = true;
+    if (self.scroll_to_bottom_on_keystroke) {
+        if (!screen.viewportIsBottom()) {
+            self.shared.terminal.scrollViewport(.bottom);
+            changed = true;
+        }
+        if (self.runtime.state.scroll_cell_offset != 0) {
+            self.runtime.state.scroll_cell_offset = 0;
+            changed = true;
+        }
     }
     self.shared.mutex.unlock();
 
@@ -353,6 +508,10 @@ fn acceptedPaste(self: *TerminalSurface) void {
     self.shared.mutex.lock();
     if (!self.shared.terminal.screens.active.viewportIsBottom()) {
         self.shared.terminal.scrollViewport(.bottom);
+        changed = true;
+    }
+    if (self.runtime.state.scroll_cell_offset != 0) {
+        self.runtime.state.scroll_cell_offset = 0;
         changed = true;
     }
     self.shared.mutex.unlock();
@@ -404,7 +563,7 @@ fn testSurface(
     shared: *terminal.Shared,
     write_sink: ?WriteSink,
 ) TerminalSurface {
-    return .{
+    var result: TerminalSurface = .{
         .alloc = alloc,
         .runtime = undefined,
         .size = undefined,
@@ -414,6 +573,7 @@ fn testSurface(
         .vt_kam_allowed = false,
         .selection_clear_on_typing = true,
         .scroll_to_bottom_on_keystroke = true,
+        .mouse_reporting = true,
         .explicit_padding = undefined,
         .padding_balance = undefined,
         // Headless tests suppress renderer notification after verifying the
@@ -421,6 +581,11 @@ fn testSurface(
         .visible = .init(false),
         .focused = true,
     };
+    result.runtime.state = .{
+        .terminal = &shared.terminal,
+        .mutex = &shared.mutex,
+    };
+    return result;
 }
 
 fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
@@ -491,6 +656,9 @@ test "terminal surface key admission contract" {
     try testing.expectEqual(@as(usize, 0), sink.calls);
 
     try setTestSelectionAndViewport(shared);
+    shared.mutex.lock();
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    shared.mutex.unlock();
     sink.accept = false;
     try testing.expectEqual(InputResult.not_accepted, surface.key(letter));
     {
@@ -498,6 +666,10 @@ test "terminal surface key admission contract" {
         defer shared.mutex.unlock();
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
     }
 
     sink.accept = true;
@@ -507,6 +679,10 @@ test "terminal surface key admission contract" {
         defer shared.mutex.unlock();
         try testing.expect(shared.terminal.screens.active.selection == null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
+        try testing.expectEqual(
+            @as(f64, 0),
+            surface.runtime.state.scroll_cell_offset,
+        );
     }
     const compression_before_noop_key = testCompressionActivity(shared);
     try testing.expectEqual(InputResult.sent, surface.key(letter));
@@ -600,6 +776,9 @@ test "terminal surface paste admission contract" {
     );
 
     try setTestSelectionAndViewport(shared);
+    shared.mutex.lock();
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    shared.mutex.unlock();
     sink.accept = false;
     try testing.expectEqual(InputResult.not_accepted, surface.paste(unchanged));
     {
@@ -607,6 +786,10 @@ test "terminal surface paste admission contract" {
         defer shared.mutex.unlock();
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
+        try testing.expectEqual(
+            @as(f64, 0.5),
+            surface.runtime.state.scroll_cell_offset,
+        );
     }
     sink.accept = true;
 
@@ -619,6 +802,14 @@ test "terminal surface paste admission contract" {
     try testing.expectEqualStrings("\x1b[200~a\nb c\x1b[201~", sink.data[0..sink.len]);
     try testing.expectEqual(@as(usize, 1), tracking.allocations);
     try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expectEqual(
+            @as(f64, 0),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
 
     shared.mutex.lock();
     shared.terminal.modes.set(.bracketed_paste, false);
@@ -637,4 +828,139 @@ test "terminal surface paste admission contract" {
     sink.calls = 0;
     try testing.expectEqual(InputResult.out_of_memory, surface.paste("line\n"));
     try testing.expectEqual(@as(usize, 0), sink.calls);
+}
+
+test "terminal surface interaction state and position scrolling" {
+    const testing = std.testing;
+
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 0, .cell_offset = 0 },
+        normalizeScrollPosition(0, -0.25, 10),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 0, .cell_offset = 0.75 },
+        normalizeScrollPosition(1, -0.25, 10),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 3, .cell_offset = 0.25 },
+        normalizeScrollPosition(1, 2.25, 10),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 9, .cell_offset = 0.75 },
+        normalizeScrollPosition(10, -0.25, 10),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 10, .cell_offset = 0 },
+        normalizeScrollPosition(std.math.maxInt(usize), -0.25, 10),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 10, .cell_offset = 0 },
+        normalizeScrollPosition(
+            std.math.maxInt(usize),
+            std.math.floatMax(f64),
+            10,
+        ),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 0, .cell_offset = 0 },
+        normalizeScrollPosition(
+            std.math.maxInt(usize),
+            -std.math.floatMax(f64),
+            10,
+        ),
+    );
+    const usize_boundary: f64 = @floatFromInt(std.math.maxInt(usize));
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 0, .cell_offset = 0 },
+        normalizeScrollPosition(
+            std.math.maxInt(usize),
+            -usize_boundary,
+            10,
+        ),
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        saturatedFloatToUsize(usize_boundary),
+    );
+    try testing.expectEqualDeep(
+        ScrollPosition{ .row = 10, .cell_offset = 0 },
+        normalizeScrollPosition(0, usize_boundary, 10),
+    );
+
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("0\r\n1\r\n2\r\n3\r\n4\r\n5");
+    }
+
+    var state = surface.interactionState();
+    try testing.expectEqual(state.scrollbar.total - state.scrollbar.len, state.scrollbar.offset);
+    try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
+    try testing.expectEqual(ScrollRoute.viewport, state.route);
+    try testing.expect(!state.mouse_captured);
+    try testing.expect(!state.has_selection);
+
+    try surface.scrollToPosition(1, -0.25, &state);
+    try testing.expectEqual(@as(usize, 0), state.scrollbar.offset);
+    try testing.expectEqual(@as(f64, 0.75), state.scrollbar.cell_offset);
+    const activity = testCompressionActivity(shared);
+    var retry_state: InteractionState = undefined;
+    try surface.scrollToPosition(0, 0.75, &retry_state);
+    try testing.expectEqualDeep(state, retry_state);
+    try testing.expectEqual(activity, testCompressionActivity(shared));
+
+    try surface.scrollToPosition(
+        std.math.maxInt(usize),
+        std.math.floatMax(f64),
+        &state,
+    );
+    try testing.expectEqual(state.scrollbar.total - state.scrollbar.len, state.scrollbar.offset);
+    try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
+
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049h");
+        const screen = shared.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try screen.select(terminal.Selection.init(pin, pin, false));
+    }
+    state = surface.interactionState();
+    try testing.expectEqual(ScrollRoute.alternate_screen_cursor, state.route);
+    try testing.expect(!state.mouse_captured);
+    try testing.expect(state.has_selection);
+
+    shared.mutex.lock();
+    shared.terminal.flags.mouse_event = .normal;
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    shared.mutex.unlock();
+    state = surface.interactionState();
+    try testing.expectEqual(ScrollRoute.remote_mouse, state.route);
+    try testing.expect(state.mouse_captured);
+    try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
+    {
+        shared.mutex.lock();
+        defer shared.mutex.unlock();
+        try testing.expectEqual(
+            @as(f64, 0),
+            surface.runtime.state.scroll_cell_offset,
+        );
+    }
+
+    surface.mouse_reporting = false;
+    state = surface.interactionState();
+    try testing.expectEqual(ScrollRoute.viewport, state.route);
+    try testing.expect(!state.mouse_captured);
 }
