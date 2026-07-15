@@ -11,6 +11,14 @@ const control = @import("control.zig");
 
 pub const CommandToken = enum(u64) { _ };
 
+/// Identifies which ControlClient layer owns a command's semantic response.
+/// Channel retains this only for FIFO response routing; it does not interpret
+/// either source.
+pub const CommandSource = enum {
+    host,
+    viewer,
+};
+
 pub const CommandFailure = union(enum) {
     /// Tmux executed the command and returned `%error`.
     error_block: []const u8,
@@ -41,11 +49,13 @@ pub const Event = union(enum) {
 
     command_ok: struct {
         token: CommandToken,
+        source: CommandSource,
         body: []const u8,
     },
 
     command_failed: struct {
         token: CommandToken,
+        source: CommandSource,
         failure: CommandFailure,
     },
 
@@ -78,6 +88,7 @@ pub const Channel = struct {
 
     const Pending = struct {
         token: CommandToken,
+        source: CommandSource,
 
         /// True for standalone commands and the final member of a
         /// semicolon-joined group.
@@ -133,6 +144,14 @@ pub const Channel = struct {
         self: *Channel,
         text: []const u8,
     ) EnqueueError!CommandToken {
+        return self.enqueueCommandFrom(.host, text);
+    }
+
+    pub fn enqueueCommandFrom(
+        self: *Channel,
+        source: CommandSource,
+        text: []const u8,
+    ) EnqueueError!CommandToken {
         try self.validateEnqueue();
         if (!isValidCommand(text)) return error.InvalidCommand;
         try self.ensureTokens(1);
@@ -146,6 +165,7 @@ pub const Channel = struct {
         self.outbound.appendAssumeCapacity('\n');
         self.pending.appendAssumeCapacity(.{
             .token = token,
+            .source = source,
             .ends_group = true,
         });
         return token;
@@ -159,6 +179,15 @@ pub const Channel = struct {
     /// Pass null when the caller does not need the per-member tokens.
     pub fn enqueueCommandGroup(
         self: *Channel,
+        texts: []const []const u8,
+        tokens_out: ?[]CommandToken,
+    ) EnqueueError!void {
+        return self.enqueueCommandGroupFrom(.host, texts, tokens_out);
+    }
+
+    pub fn enqueueCommandGroupFrom(
+        self: *Channel,
+        source: CommandSource,
         texts: []const []const u8,
         tokens_out: ?[]CommandToken,
     ) EnqueueError!void {
@@ -193,6 +222,7 @@ pub const Channel = struct {
             const token = self.mintToken();
             self.pending.appendAssumeCapacity(.{
                 .token = token,
+                .source = source,
                 .ends_group = i + 1 == texts.len,
             });
             if (tokens_out) |tokens| tokens[i] = token;
@@ -373,6 +403,7 @@ pub const Channel = struct {
                 if (!is_error) {
                     handler.channelEvent(.{ .command_ok = .{
                         .token = pending.token,
+                        .source = pending.source,
                         .body = block.data,
                     } });
                     return;
@@ -380,6 +411,7 @@ pub const Channel = struct {
 
                 handler.channelEvent(.{ .command_failed = .{
                     .token = pending.token,
+                    .source = pending.source,
                     .failure = .{ .error_block = block.data },
                 } });
 
@@ -391,6 +423,7 @@ pub const Channel = struct {
                     };
                     handler.channelEvent(.{ .command_failed = .{
                         .token = member.token,
+                        .source = member.source,
                         .failure = .{ .skipped_after_error = pending.token },
                     } });
                 }
@@ -428,6 +461,7 @@ pub const Channel = struct {
         while (self.popPending()) |pending| {
             handler.channelEvent(.{ .command_failed = .{
                 .token = pending.token,
+                .source = pending.source,
                 .failure = .channel_closed,
             } });
         }
