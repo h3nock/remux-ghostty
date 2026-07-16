@@ -1408,9 +1408,10 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_retain_pane_terminal(
 // configuration and font resources and must outlive the surface. The platform
 // view is unretained and must also outlive the surface. Creation snapshots the
 // app configuration, theme, content scale, and keyboard-layout-derived
-// OptionAsAlt policy; recreate the surface to adopt changes to any of them. The
-// supplied terminal remains caller-owned because the surface retains its own
-// reference.
+// OptionAsAlt policy. Creation also applies the app's configured terminal color
+// defaults to the supplied canonical terminal while preserving program-owned
+// OSC color overrides. The supplied terminal remains caller-owned because the
+// surface retains its own reference.
 //
 // width_px and height_px are required exact nonzero backing-pixel dimensions of
 // the already-sized platform view. These calls notify the renderer; they do not
@@ -1450,6 +1451,15 @@ GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_new(
     ghostty_terminal_t,
     const ghostty_terminal_surface_config_s*,
     ghostty_terminal_surface_t*);
+// Re-snapshots the owning app's current configuration in place. The terminal,
+// renderer thread, platform view, callbacks, selection, viewport, and
+// per-surface font-size override are retained. Config-owned color defaults are
+// updated while OSC overrides survive. This never changes canonical terminal
+// geometry and performs no terminal I/O. Serialize with app config updates and
+// all presentation-owner operations. A non-OK result leaves the surface and
+// terminal configuration unchanged; retrying the same update is safe.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_update_config(ghostty_terminal_surface_t);
 GHOSTTY_API void ghostty_terminal_surface_free(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_draw(
     ghostty_terminal_surface_t);

@@ -200,6 +200,8 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
 
     pub const Surface = struct {
         alloc: std.mem.Allocator,
+        app: *Runtime.App,
+        font_size: f32,
         renderer_surface: apprt.RendererSurface,
         core: renderer.TerminalSurface,
         userdata: ?*anyopaque,
@@ -352,6 +354,8 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         const scale: f32 = @floatCast(config.scale_factor);
         surface.* = .{
             .alloc = alloc,
+            .app = app,
+            .font_size = config.font_size,
             .renderer_surface = .{
                 .platform = try .init(config.platform_tag, config.platform),
                 .content_scale = .{ .x = scale, .y = scale },
@@ -384,6 +388,30 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             .focused = config.focused,
         });
         return surface;
+    }
+
+    export fn ghostty_terminal_surface_update_config(surface: ?*Surface) Result {
+        const value = surface orelse return .invalid_input;
+        const scale = value.renderer_surface.content_scale.x;
+        var config = configNew();
+        config.scale_factor = scale;
+        config.font_size = value.font_size;
+        config.width_px = value.renderer_surface.size.width;
+        config.height_px = value.renderer_surface.size.height;
+
+        var prepared = prepareLayout(value.app, config) catch |err| {
+            log.err("failed to prepare terminal surface config update err={}", .{err});
+            return mapError(err);
+        };
+        defer prepared.deinit();
+
+        value.core.updateConfig(.{
+            .config = &value.app.config,
+            .prepared_layout = &prepared,
+            .macos_option_as_alt = value.app.config.@"macos-option-as-alt" orelse
+                value.app.keyboardLayout().detectOptionAsAlt(),
+        }) catch |err| return operationError("update config", err);
+        return .ok;
     }
 
     export fn ghostty_terminal_surface_free(surface: ?*Surface) void {
@@ -640,6 +668,7 @@ test "terminal surface C ABI matches ghostty header" {
     const c = @import("ghostty.h");
 
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_input"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_action_renderer_health_e));
@@ -760,6 +789,14 @@ test "terminal surface C invalid platform tag is invalid input" {
     try std.testing.expectEqual(
         Result.invalid_input,
         mapError(error.InvalidEnumTag),
+    );
+}
+
+test "terminal surface C config update rejects a null surface" {
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+    try std.testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_update_config(null),
     );
 }
 

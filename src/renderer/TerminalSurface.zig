@@ -12,6 +12,7 @@ const rendererpkg = @import("../renderer.zig");
 const sizepkg = @import("size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
+const terminal_config = @import("../terminal/config.zig");
 
 const log = std.log.scoped(.terminal_surface);
 
@@ -133,6 +134,12 @@ pub const Options = struct {
     focused: bool = true,
 };
 
+pub const UpdateConfigOptions = struct {
+    config: *const configpkg.Config,
+    prepared_layout: *rendererpkg.Runtime.PreparedLayout,
+    macos_option_as_alt: input.OptionAsAlt,
+};
+
 /// Initialize in stable caller-owned storage and start the renderer thread.
 /// The renderer surface, font-grid set, and event-sink context are borrowed and
 /// must outlive this surface. Config and derived font config are consumed only
@@ -148,6 +155,13 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
 
     try shared.claimRenderer();
     errdefer shared.releaseRenderer();
+
+    shared.mutex.lock();
+    terminal_config.applyColorDefaults(
+        &shared.terminal,
+        terminal_config.colorDefaults(opts.config),
+    );
+    shared.mutex.unlock();
 
     try rendererpkg.Renderer.surfaceInit(opts.rt_surface);
 
@@ -187,6 +201,52 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
 
     try self.runtime.start();
     return metrics;
+}
+
+/// Re-snapshot application configuration without replacing terminal, renderer,
+/// platform surface, or interaction state. All fallible derivation completes
+/// before messages or canonical terminal state are committed.
+pub fn updateConfig(
+    self: *TerminalSurface,
+    opts: UpdateConfigOptions,
+) !void {
+    var interaction_config = try InteractionConfig.init(self.alloc, opts.config);
+    errdefer interaction_config.deinit(self.alloc);
+
+    const renderer_message = try rendererpkg.Message.initChangeConfig(
+        self.alloc,
+        opts.config,
+    );
+
+    const prepared = opts.prepared_layout.*;
+    const defaults = terminal_config.colorDefaults(opts.config);
+
+    self.shared.mutex.lock();
+    terminal_config.applyColorDefaults(&self.shared.terminal, defaults);
+    self.shared.mutex.unlock();
+
+    var old_interaction_config = self.interaction_config;
+    self.interaction_config = interaction_config;
+    self.macos_option_as_alt = opts.macos_option_as_alt;
+    self.vt_kam_allowed = opts.config.@"vt-kam-allowed";
+    self.selection_clear_on_typing = opts.config.@"selection-clear-on-typing";
+    self.scroll_to_bottom_on_keystroke = opts.config.@"scroll-to-bottom".keystroke;
+    self.mouse_reporting = opts.config.@"mouse-reporting";
+    self.explicit_padding = prepared.explicit_padding;
+    self.padding_balance = prepared.padding_balance;
+    self.size = prepared.size;
+    old_interaction_config.deinit(self.alloc);
+
+    self.runtime.setFontGrid(prepared.font_grid_key, prepared.font_grid);
+    opts.prepared_layout.owned = false;
+    _ = self.runtime.thread.mailbox.push(renderer_message, .{ .forever = {} });
+    _ = self.runtime.thread.mailbox.push(.{ .resize = prepared.size }, .{ .forever = {} });
+    self.runtime.thread.wakeup.notify() catch |err| {
+        // The update is fully admitted at this point. Match the main Surface
+        // config path: a lost notification is diagnostic, not a false report
+        // that callers could interpret as a rolled-back config change.
+        log.warn("failed to notify renderer of config change err={}", .{err});
+    };
 }
 
 pub fn deinit(self: *TerminalSurface) void {
@@ -1445,6 +1505,40 @@ fn testSurface(
     };
     result.interaction_config.word_chars = &[_]u21{ ' ', '\t' };
     return result;
+}
+
+test "terminal surface config derivation failure does not partially commit" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    try testing.expect(config.@"selection-word-chars".codepoints.len > 0);
+
+    const before_background = shared.terminal.colors.background;
+    const before_foreground = shared.terminal.colors.foreground;
+    const before_cursor = shared.terminal.colors.cursor;
+    const before_palette = shared.terminal.colors.palette;
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    var surface = testSurface(failing.allocator(), shared, null);
+    var prepared: rendererpkg.Runtime.PreparedLayout = undefined;
+    try testing.expectError(error.OutOfMemory, surface.updateConfig(.{
+        .config = &config,
+        .prepared_layout = &prepared,
+        .macos_option_as_alt = .false,
+    }));
+
+    try testing.expectEqualDeep(before_background, shared.terminal.colors.background);
+    try testing.expectEqualDeep(before_foreground, shared.terminal.colors.foreground);
+    try testing.expectEqualDeep(before_cursor, shared.terminal.colors.cursor);
+    try testing.expectEqualDeep(before_palette, shared.terminal.colors.palette);
 }
 
 fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
