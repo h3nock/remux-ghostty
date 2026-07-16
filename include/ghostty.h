@@ -1334,8 +1334,8 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // serialize all calls for one client. Action payloads, exit details, command
 // response bodies, input failure bodies, session names, and topology views are
 // borrowed only for the action callback. The callback may visit topology,
-// enqueue commands, send pane input, read outbound bytes, or retain a pane
-// terminal.
+// enqueue commands, send pane input, refresh a pane, read outbound bytes, or
+// retain a pane terminal.
 // It must not feed, consume, or free the client. Reentrant feed is rejected;
 // consume and free are rejected while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
@@ -1388,6 +1388,24 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input(
     uint64_t,
     const uint8_t*,
     size_t);
+
+// Rehydrates one live pane into its existing canonical terminal. This does not
+// select, zoom, or otherwise change tmux presentation. Enqueue any required
+// presentation command immediately before this call; both operations remain in
+// one ordered outbound buffer. Successful submission makes the pane HYDRATING
+// immediately. No PANE_CHANGED action is emitted for that pane while it is
+// hydrating; its next PANE_CHANGED action reports deterministic completion with
+// the same terminal identity, refreshed grid/screens/scrollback/parser state,
+// and the pane geometry captured by the refresh group. Dynamic OSC colors,
+// palette entries, title, pwd, and live protocol/mode state not represented by
+// tmux pane state are preserved. If an in-flight refresh member fails, no false
+// PANE_CHANGED is emitted and the pane remains HYDRATING until authoritative
+// topology removes it. Other panes and independent commands remain usable.
+// NOT_READY means the client or pane cannot accept a refresh yet; PANE_UNKNOWN
+// means the pane is not tracked.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_refresh_pane(
+    ghostty_tmux_client_t,
+    uint64_t);
 
 // The topology view is valid only during its topology action callback. The
 // visitor receives each window followed by its panes in layout order.

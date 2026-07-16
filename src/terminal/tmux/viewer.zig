@@ -11,6 +11,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const SharedTerminal = @import("../Shared.zig");
 const Terminal = @import("../Terminal.zig");
 const TerminalStream = @import("../stream_terminal.zig").Stream;
+const RGB = @import("../color.zig").RGB;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
@@ -350,7 +351,7 @@ pub const Viewer = struct {
     pub const Pane = struct {
         terminal_owner: *SharedTerminal,
         stream: TerminalStream,
-        phase: Phase = .hydrating,
+        phase: Phase = .initial_hydrating,
         active_screen: ScreenSet.Key = .primary,
         has_history: bool = false,
         cursor: ?CursorPosition = null,
@@ -358,7 +359,8 @@ pub const Viewer = struct {
         utf8_carry: Utf8Carry = .{},
 
         pub const Phase = enum {
-            hydrating,
+            initial_hydrating,
+            refreshing,
             live,
         };
 
@@ -458,6 +460,72 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.action_arena.promote(self.alloc).deinit();
+    }
+
+    /// Rehydrate one live pane into its existing terminal. The caller owns
+    /// tmux presentation policy and must enqueue any selection or layout
+    /// command before this call. `submitter.submitPaneRefresh` is invoked
+    /// synchronously after the pane enters the hydration barrier and must
+    /// atomically enqueue the supplied semicolon-dependent command group.
+    /// All access to Viewer and the submitter must be caller-serialized.
+    pub fn refreshPane(
+        self: *Viewer,
+        pane_id: usize,
+        submitter: anytype,
+    ) !void {
+        if (self.state != .command_queue) return error.NotReady;
+        const pane = self.panes.get(pane_id) orelse return error.PaneUnknown;
+        if (pane.phase != .live) return error.NotReady;
+
+        // ControlClient submits every Viewer group synchronously. Refusing a
+        // refresh while a group is not yet submitted preserves one FIFO cut
+        // between Viewer semantics and Channel framing.
+        if (self.sent_command_count != self.command_queue.len()) {
+            return error.NotReady;
+        }
+
+        var command_storage: [5]Command = undefined;
+        command_storage[0] = .{ .pane_refresh_state = pane_id };
+        const hydration = self.paneHydrationCommands(
+            pane_id,
+            command_storage[1..],
+        );
+        const commands = command_storage[0 .. hydration.len + 1];
+
+        // The formatted members live only through the synchronous submit.
+        // The arena is independent of the action arena because refresh is
+        // also valid from a host action callback.
+        var arena = ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var members: [5][]const u8 = undefined;
+        for (commands, 0..) |command, i| {
+            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+            command.formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            members[i] = builder.writer.buffered();
+        }
+
+        // Reserve Viewer storage before changing the observable phase. The
+        // Channel submit reserves all of its storage before mutation, so an
+        // enqueue failure can restore the pane without a half-queued group.
+        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
+        const prior_carry = pane.utf8_carry;
+        pane.phase = .refreshing;
+        pane.utf8_carry.clear();
+        submitter.submitPaneRefresh(members[0..commands.len]) catch |err| {
+            pane.phase = .live;
+            pane.utf8_carry = prior_carry;
+            return err;
+        };
+
+        for (commands, 0..) |command, i| {
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = i + 1 == commands.len,
+                .refresh_pane_id = pane_id,
+            });
+        }
+        self.sent_command_count += commands.len;
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -1006,9 +1074,11 @@ pub const Viewer = struct {
             }
         }
         if (added_count > 0) {
-            const capture_history = self.options.history_line_limit == null or
-                self.options.history_line_limit.? > 0;
-            const commands_per_pane: usize = if (capture_history) 4 else 3;
+            var count_storage: [4]Command = undefined;
+            const commands_per_pane = self.paneHydrationCommands(
+                0,
+                &count_storage,
+            ).len;
             const command_count = 1 + commands_per_pane * added_count;
             try self.command_queue.ensureUnusedCapacity(self.alloc, command_count);
             self.command_queue.appendAssumeCapacity(.{
@@ -1023,25 +1093,18 @@ pub const Viewer = struct {
                 if (self.panes.contains(pane_id)) continue;
                 added_index += 1;
 
-                if (capture_history) self.command_queue.appendAssumeCapacity(.{
-                    .command = .{ .pane_history = .{
-                        .id = pane_id,
-                        .line_limit = self.options.history_line_limit,
-                    } },
-                    .group_end = false,
-                });
-                self.command_queue.appendAssumeCapacity(.{
-                    .command = .{ .pane_saved_visible = pane_id },
-                    .group_end = false,
-                });
-                self.command_queue.appendAssumeCapacity(.{
-                    .command = .{ .pane_visible = pane_id },
-                    .group_end = false,
-                });
-                self.command_queue.appendAssumeCapacity(.{
-                    .command = .{ .pane_pending = pane_id },
-                    .group_end = added_index == added_count,
-                });
+                var hydration_storage: [4]Command = undefined;
+                const hydration = self.paneHydrationCommands(
+                    pane_id,
+                    &hydration_storage,
+                );
+                for (hydration, 0..) |command, command_index| {
+                    self.command_queue.appendAssumeCapacity(.{
+                        .command = command,
+                        .group_end = added_index == added_count and
+                            command_index + 1 == hydration.len,
+                    });
+                }
             }
         }
 
@@ -1143,7 +1206,10 @@ pub const Viewer = struct {
         // non-pointer value because we are deleting it from the circular
         // buffer immediately. This shallow copy is all we need since
         // all the memory in Command is owned by GPA.
-        const command: Command = if (self.command_queue.first()) |ptr| switch (ptr.command) {
+        const queued = self.command_queue.first() orelse
+            return error.UnexpectedCommandCompletion;
+        const refresh_pane_id = queued.refresh_pane_id;
+        const command: Command = switch (queued.command) {
             // I truly can't explain this. A simple `ptr.*` copy will cause
             // our memory to become undefined when deleteOldest is called
             // below. I logged all the pointers and they don't match so I
@@ -1154,8 +1220,6 @@ pub const Viewer = struct {
                 @tagName(tag),
                 v,
             ),
-        } else {
-            return error.UnexpectedCommandCompletion;
         };
         self.command_queue.deleteOldest(1);
         self.sent_command_count -= 1;
@@ -1164,6 +1228,14 @@ pub const Viewer = struct {
         const content = switch (completion) {
             .success => |body| body,
             .failure => {
+                // A refresh targets an already-published pane. A capture can
+                // fail if that pane disappears while the group is in flight;
+                // keep the rest of the client alive and leave the pane behind
+                // the hydration barrier until authoritative topology removes
+                // it. Channel supplies failures for every skipped member, so
+                // FIFO correlation remains intact without emitting a false
+                // pane-changed completion.
+                if (refresh_pane_id != null) return null;
                 if (command.isHydration()) return error.HydrationFailed;
                 switch (command) {
                     .user => return null,
@@ -1182,7 +1254,9 @@ pub const Viewer = struct {
         switch (command) {
             .user => {},
 
-            .pane_state => try self.receivedPaneState(content),
+            .pane_state => try self.receivedPaneState(null, content),
+
+            .pane_refresh_state => |id| try self.receivedPaneState(id, content),
 
             .list_windows => try self.receivedListWindows(
                 arena_alloc,
@@ -1362,6 +1436,7 @@ pub const Viewer = struct {
 
     fn receivedPaneState(
         self: *Viewer,
+        refresh_id: ?usize,
         content: []const u8,
     ) !void {
         var it = std.mem.splitScalar(u8, content, '\n');
@@ -1384,11 +1459,50 @@ pub const Viewer = struct {
                 continue;
             };
             const pane: *Pane = entry.value_ptr.*;
-            if (pane.phase == .live) continue;
+            if (refresh_id) |id| {
+                if (data.pane_id != id or pane.phase != .refreshing) continue;
+            } else if (pane.phase != .initial_hydrating) continue;
             const terminal_owner = pane.terminal_owner;
             terminal_owner.mutex.lock();
             defer terminal_owner.mutex.unlock();
             const t: *Terminal = &terminal_owner.terminal;
+
+            const cols = std.math.cast(
+                size.CellCountInt,
+                data.pane_width,
+            ) orelse return error.InvalidPaneGeometry;
+            const rows = std.math.cast(
+                size.CellCountInt,
+                data.pane_height,
+            ) orelse return error.InvalidPaneGeometry;
+            if (cols == 0 or rows == 0) return error.InvalidPaneGeometry;
+
+            if (pane.phase == .refreshing) {
+                // Replace only content that the snapshots reconstruct. A DEC
+                // RIS/fullReset would also discard live protocol state that
+                // tmux does not expose, including charset and Kitty keyboard
+                // state. Title, pwd, colors, palette, and terminal modes stay
+                // intact until the pane-state fields below overwrite the
+                // subset tmux reports.
+                const active_key = t.screens.active_key;
+                for ([_]ScreenSet.Key{ .primary, .alternate }) |key| {
+                    const screen = t.screens.get(key) orelse continue;
+                    t.screens.switchTo(key);
+                    t.eraseDisplay(.scroll_complete, false);
+                    screen.eraseHistory(null);
+                    screen.clearSelection();
+                }
+                t.screens.switchTo(active_key);
+                try t.resize(self.alloc, cols, rows);
+
+                // Snapshot replay starts at a fresh protocol boundary. The
+                // canonical Terminal and SharedTerminal identities remain
+                // unchanged; only the private parser state is replaced.
+                pane.stream.deinit();
+                pane.stream = t.vtStream();
+            } else if (t.cols != cols or t.rows != rows) {
+                try t.resize(self.alloc, cols, rows);
+            }
 
             pane.active_screen = if (data.alternate_on) .alternate else .primary;
             pane.has_history = data.history_size > 0;
@@ -1524,6 +1638,8 @@ pub const Viewer = struct {
         defer stream.deinit();
         stream.nextSlice(content);
 
+        try t.setAttribute(.unset);
+
         // Populate the active area to be empty since this is only history.
         // We'll fill it with blanks and move the cursor to the top-left.
         t.carriageReturn();
@@ -1586,6 +1702,8 @@ pub const Viewer = struct {
         defer replay_state.restore(t);
         _ = try t.switchScreen(screen_key);
 
+        try t.setAttribute(.unset);
+
         // Erase the active area and reset the cursor to the top-left
         // before writing the visible content.
         t.eraseDisplay(.complete, false);
@@ -1644,7 +1762,7 @@ pub const Viewer = struct {
         const pane: *Pane = entry.value_ptr.*;
         const data = control.decodeEscapedOutput(out.data);
         return switch (pane.phase) {
-            .hydrating => hydrating: {
+            .initial_hydrating, .refreshing => hydrating: {
                 pane.utf8_carry.update(data);
                 break :hydrating null;
             },
@@ -1737,6 +1855,34 @@ pub const Viewer = struct {
                 });
             },
         }
+    }
+
+    /// Build the canonical snapshot sequence used by both first hydration and
+    /// in-place refresh. The pane-state command is shared across new panes and
+    /// is prepended separately by each caller.
+    fn paneHydrationCommands(
+        self: *const Viewer,
+        pane_id: usize,
+        storage: []Command,
+    ) []const Command {
+        assert(storage.len >= 4);
+        var len: usize = 0;
+        if (self.options.history_line_limit == null or
+            self.options.history_line_limit.? > 0)
+        {
+            storage[len] = .{ .pane_history = .{
+                .id = pane_id,
+                .line_limit = self.options.history_line_limit,
+            } };
+            len += 1;
+        }
+        storage[len] = .{ .pane_saved_visible = pane_id };
+        len += 1;
+        storage[len] = .{ .pane_visible = pane_id };
+        len += 1;
+        storage[len] = .{ .pane_pending = pane_id };
+        len += 1;
+        return storage[0..len];
     }
 
     /// Enters the command queue state from any other state, queueing and
@@ -1880,6 +2026,7 @@ const State = enum {
 const QueuedCommand = struct {
     command: Command,
     group_end: bool,
+    refresh_pane_id: ?usize = null,
 };
 
 const Command = union(enum) {
@@ -1901,6 +2048,11 @@ const Command = union(enum) {
     /// Capture the pane terminal state as best we can. The pane ID(s)
     /// are part of the output so we can map it back to our panes.
     pane_state,
+
+    /// Capture authoritative state for one in-place pane refresh. A targeted
+    /// display-message returns only this pane, keeping the response small and
+    /// binding its geometry to this group without enumerating siblings.
+    pane_refresh_state: usize,
 
     /// Get the tmux server version.
     tmux_version,
@@ -1925,6 +2077,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_pending,
             .pane_state,
+            .pane_refresh_state,
             .tmux_version,
             .client_size,
             => {},
@@ -1935,6 +2088,7 @@ const Command = union(enum) {
     fn isHydration(self: Command) bool {
         return switch (self) {
             .pane_state,
+            .pane_refresh_state,
             .pane_history,
             .pane_saved_visible,
             .pane_visible,
@@ -2000,6 +2154,11 @@ const Command = union(enum) {
                 .{comptime Format.list_panes.comptimeFormat()},
             )),
 
+            .pane_refresh_state => |id| try writer.print(
+                "display-message -p -t %{d} -F '{s}'",
+                .{ id, comptime Format.list_panes.comptimeFormat() },
+            ),
+
             .tmux_version => try writer.writeAll(std.fmt.comptimePrint(
                 "display-message -p '{s}'",
                 .{comptime Format.tmux_version.comptimeFormat()},
@@ -2028,6 +2187,8 @@ const Format = struct {
         .delim = ';',
         .vars = &.{
             .pane_id,
+            .pane_width,
+            .pane_height,
             // Cursor position & appearance
             .cursor_x,
             .cursor_y,
@@ -2521,8 +2682,8 @@ test "session changed resets state" {
         // before injecting the notification below.
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock(
-                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;19;8,16
-                \\%1;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+                \\%0;83;20;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;19;8,16
+                \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
                 ,
             ) } },
         },
@@ -2718,8 +2879,8 @@ test "initial flow" {
     });
 
     const pane_state =
-        \\%0;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;1;0;19;8,16
-        \\%1;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+        \\%0;83;20;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;1;0;19;8,16
+        \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
     ;
     const first_responses = [_][]const u8{
         pane_state,
@@ -3023,7 +3184,7 @@ test "hydration command errors do not become terminal content" {
     const actions = viewer.next(.{ .tmux = .{ .block_err = testClientBlock("no such pane") } });
     try testing.expectEqual(1, actions.len);
     try testing.expect(actions[0] == .exit);
-    try testing.expectEqual(Viewer.Pane.Phase.hydrating, pane.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.initial_hydrating, pane.phase);
     const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("", actual);
@@ -3619,7 +3780,8 @@ test "alternate pane hydration restores canonical screens" {
     };
 
     try viewer.receivedPaneState(
-        "%7;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;0;;;1;1;3;8,16",
+        null,
+        "%7;20;4;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;0;;;1;1;3;8,16",
     );
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
@@ -3676,4 +3838,189 @@ test "visible snapshot preserves styled trailing cells" {
     const last = screen.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
     try testing.expect(first.style_id != 0);
     try testing.expectEqual(first.style_id, last.style_id);
+}
+
+test "history capture style does not seed visible snapshot blanks" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 2,
+    });
+    pane.has_history = true;
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.receivedPaneHistory(1, "\x1b[48;2;30;30;30mH");
+    try viewer.receivedPaneVisible(1, "A");
+
+    const screen = pane.terminal_owner.terminal.screens.active;
+    const written = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?.cell;
+    const trailing = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?.cell;
+    const blank = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?.cell;
+    try testing.expectEqual(@as(u21, 'A'), written.content.codepoint);
+    try testing.expect(trailing.isZero());
+    try testing.expect(blank.isZero());
+}
+
+test "pane refresh is atomic when transport submission fails" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    pane.phase = .live;
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    const Reject = struct {
+        pane: *Viewer.Pane,
+
+        pub fn submitPaneRefresh(
+            self: @This(),
+            members: []const []const u8,
+        ) !void {
+            try testing.expectEqual(Viewer.Pane.Phase.refreshing, self.pane.phase);
+            try testing.expectEqual(5, members.len);
+            return error.OutOfMemory;
+        }
+    };
+
+    try testing.expectError(
+        error.OutOfMemory,
+        viewer.refreshPane(1, Reject{ .pane = pane }),
+    );
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expect(viewer.command_queue.empty());
+    try testing.expectEqual(0, viewer.sent_command_count);
+}
+
+test "targeted pane refresh preserves protocol state and isolates concurrent groups" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane_1 = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    pane_1.phase = .live;
+    viewer.panes.put(testing.allocator, 1, pane_1) catch |err| {
+        pane_1.deinit(testing.allocator);
+        return err;
+    };
+    const pane_2 = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 11,
+        .rows = 2,
+    });
+    pane_2.phase = .live;
+    viewer.panes.put(testing.allocator, 2, pane_2) catch |err| {
+        pane_2.deinit(testing.allocator);
+        return err;
+    };
+
+    const expected_background: RGB = .{ .r = 10, .g = 11, .b = 12 };
+    const expected_palette: RGB = .{ .r = 13, .g = 14, .b = 15 };
+    {
+        const t = &pane_1.terminal_owner.terminal;
+        try t.printString("stale-one");
+        try t.setTitle("pane title");
+        try t.setPwd("file:///work");
+        t.colors.background.set(expected_background);
+        t.colors.palette.set(3, expected_palette);
+        pane_1.stream.nextSlice("\x1b[31");
+        t.screens.active.kitty_keyboard.push(.{
+            .disambiguate = true,
+            .report_events = false,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        });
+    }
+    try pane_2.terminal_owner.terminal.printString("stale-two");
+    const expected_keyboard = pane_1.terminal_owner.terminal
+        .screens.active.kitty_keyboard.current().int();
+
+    const Accept = struct {
+        expected_id: usize,
+
+        pub fn submitPaneRefresh(
+            self: @This(),
+            members: []const []const u8,
+        ) !void {
+            try testing.expectEqual(5, members.len);
+            var target: [32]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(
+                &target,
+                "display-message -p -t %{d} -F ",
+                .{self.expected_id},
+            );
+            try testing.expect(std.mem.startsWith(u8, members[0], prefix));
+            try testing.expect(std.mem.containsAtLeast(
+                u8,
+                members[0],
+                1,
+                "#{pane_width};#{pane_height}",
+            ));
+            try testing.expect(std.mem.startsWith(u8, members[1], "capture-pane -p -e -N -q -S -"));
+            try testing.expect(std.mem.startsWith(u8, members[2], "capture-pane -p -e -N -a"));
+            try testing.expect(std.mem.startsWith(u8, members[3], "capture-pane -p -e -N -q"));
+            try testing.expect(std.mem.startsWith(u8, members[4], "capture-pane -p -P -C"));
+        }
+    };
+
+    try viewer.refreshPane(1, Accept{ .expected_id = 1 });
+    try viewer.refreshPane(2, Accept{ .expected_id = 2 });
+    try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane_1.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane_2.phase);
+
+    // A later global state query for newly discovered panes must not mutate
+    // either already-refreshing terminal.
+    try viewer.receivedPaneState(
+        null,
+        "%1;5;1;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;0;",
+    );
+    try testing.expectEqual(10, pane_1.terminal_owner.terminal.cols);
+    try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
+
+    try viewer.receivedPaneState(
+        1,
+        "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;2;8",
+    );
+    try testing.expectEqual(12, pane_1.terminal_owner.terminal.cols);
+    try testing.expectEqual(3, pane_1.terminal_owner.terminal.rows);
+    try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
+    const refreshed_contents = try pane_1.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(refreshed_contents);
+    try testing.expectEqualStrings("", refreshed_contents);
+    try testing.expectEqualStrings("pane title", pane_1.terminal_owner.terminal.getTitle().?);
+    try testing.expectEqualStrings("file:///work", pane_1.terminal_owner.terminal.getPwd().?);
+    try testing.expectEqual(expected_background, pane_1.terminal_owner.terminal.colors.background.get().?);
+    try testing.expectEqual(expected_palette, pane_1.terminal_owner.terminal.colors.palette.current[3]);
+    try testing.expectEqual(
+        expected_keyboard,
+        pane_1.terminal_owner.terminal.screens.active.kitty_keyboard.current().int(),
+    );
+    try testing.expect(pane_1.terminal_owner.terminal.tabstops.get(8));
+    try testing.expect(!pane_1.terminal_owner.terminal.tabstops.get(7));
+    pane_1.stream.nextSlice("mX");
+    const parser_reset_contents = try pane_1.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(parser_reset_contents);
+    try testing.expectEqualStrings("mX", parser_reset_contents);
+
+    try viewer.receivedPaneState(
+        2,
+        "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;3;8",
+    );
+    try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
+    try testing.expectEqual(4, pane_2.terminal_owner.terminal.rows);
 }

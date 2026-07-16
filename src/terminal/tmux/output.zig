@@ -147,6 +147,10 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// Current pane width in cells.
+    pane_width,
+    /// Current pane height in cells.
+    pane_height,
     /// Pane tab positions as a comma-separated list of 0-indexed column
     /// numbers (e.g., `8,16,24,32`). Empty string if no tabs are set.
     pane_tabs,
@@ -219,6 +223,8 @@ pub const Variable = enum {
                 try std.fmt.parseInt(usize, value[1..], 10)
             else
                 return error.FormatError,
+            .pane_width => try std.fmt.parseInt(usize, value, 10),
+            .pane_height => try std.fmt.parseInt(usize, value, 10),
             .window_width => try std.fmt.parseInt(usize, value, 10),
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
@@ -262,6 +268,8 @@ pub const Variable = enum {
             .session_id,
             .window_id,
             .pane_id,
+            .pane_width,
+            .pane_height,
             .window_width,
             .window_height,
             => usize,
@@ -499,6 +507,13 @@ test "parse pane_id" {
     try testing.expectError(error.FormatError, Variable.parse(.pane_id, "%"));
     try testing.expectError(error.FormatError, Variable.parse(.pane_id, ""));
     try testing.expectError(error.InvalidCharacter, Variable.parse(.pane_id, "%abc"));
+}
+
+test "parse pane dimensions" {
+    try testing.expectEqual(80, try Variable.parse(.pane_width, "80"));
+    try testing.expectEqual(24, try Variable.parse(.pane_height, "24"));
+    try testing.expectError(error.InvalidCharacter, Variable.parse(.pane_width, "80px"));
+    try testing.expectError(error.Overflow, Variable.parse(.pane_height, "-1"));
 }
 
 test "parse cursor_colour" {

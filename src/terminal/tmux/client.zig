@@ -50,7 +50,10 @@ pub const ControlClient = struct {
         };
     };
     pub const Options = Viewer.Options;
-    pub const PanePhase = Viewer.Pane.Phase;
+    pub const PanePhase = enum {
+        hydrating,
+        live,
+    };
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
         error{ ClientFailed, PaneUnknown };
@@ -102,7 +105,10 @@ pub const ControlClient = struct {
         pane_id: usize,
     ) ?PanePhase {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
-        return pane.phase;
+        return switch (pane.phase) {
+            .initial_hydrating, .refreshing => .hydrating,
+            .live => .live,
+        };
     }
 
     /// Retain the canonical terminal for `pane_id`, or return null if that
@@ -115,6 +121,37 @@ pub const ControlClient = struct {
     ) ?*SharedTerminal {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
         return pane.retainTerminal();
+    }
+
+    /// Rehydrate one live pane into its existing canonical terminal. This does
+    /// not select, zoom, or otherwise change tmux presentation. The host may
+    /// enqueue those commands immediately before this call; Channel preserves
+    /// that outbound order without requiring an intervening transport write.
+    /// Successful submission moves the pane to `hydrating` synchronously. Its
+    /// next pane-changed action is the deterministic live completion.
+    pub fn refreshPane(
+        self: *ControlClient,
+        pane_id: usize,
+    ) Error!void {
+        try self.validateCommandAdmission();
+
+        const Submitter = struct {
+            channel: *channel_pkg.Channel,
+
+            pub fn submitPaneRefresh(
+                value: @This(),
+                members: []const []const u8,
+            ) channel_pkg.Channel.EnqueueError!void {
+                try value.channel.enqueueCommandGroupFrom(
+                    .viewer,
+                    members,
+                    null,
+                );
+            }
+        };
+        try self.viewer.refreshPane(pane_id, Submitter{
+            .channel = &self.channel,
+        });
     }
 
     /// Send already-encoded terminal bytes to one known pane as an independent
@@ -688,7 +725,7 @@ test "control client hydration error skips only its group" {
     try client.enqueueCommandGroup(&.{"display-message -p pending-host"}, &pending_host);
     try client.feed(
         "%begin 4 4 1\n" ++
-            "%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
+            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
             "%end 4 4 1\n" ++
             "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
             "%begin 6 6 1\n%end 6 6 1\n" ++
@@ -947,6 +984,166 @@ test "control client exposes pane phase and retained terminal lifetime" {
     const contents = try retained.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("alive", contents);
+}
+
+test "control client pane refresh admission and command order" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try testing.expectError(error.NotReady, client.refreshPane(0));
+    try openHydratingPaneTestClient(&client, &actions);
+    try testing.expectError(error.NotReady, client.refreshPane(0));
+    try testing.expectError(error.PaneUnknown, client.refreshPane(99));
+
+    try client.feed(
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n",
+        &actions,
+    );
+    actions.records.clearRetainingCapacity();
+
+    _ = try client.enqueueCommand("select-pane -Z -t %0");
+    try client.refreshPane(0);
+    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    try testing.expectError(error.NotReady, client.refreshPane(0));
+
+    const outbound = client.outboundBytes();
+    try testing.expect(std.mem.startsWith(
+        u8,
+        outbound,
+        "select-pane -Z -t %0\ndisplay-message -p -t %0 -F ",
+    ));
+    const state_index = std.mem.indexOf(
+        u8,
+        outbound,
+        "display-message -p -t %0 -F ",
+    ).?;
+    const history_index = std.mem.indexOf(u8, outbound, "capture-pane -p -e -N -q -S -").?;
+    const saved_index = std.mem.indexOf(u8, outbound, "capture-pane -p -e -N -a").?;
+    const visible_index = std.mem.indexOfPos(u8, outbound, saved_index + 1, "capture-pane -p -e -N -q -t %0").?;
+    const pending_index = std.mem.indexOf(u8, outbound, "capture-pane -p -P -C -t %0").?;
+    try testing.expect(state_index < history_index);
+    try testing.expect(history_index < saved_index);
+    try testing.expect(saved_index < visible_index);
+    try testing.expect(visible_index < pending_index);
+    try testing.expectEqual(4, std.mem.count(u8, outbound[state_index..], " ; "));
+}
+
+test "control client pane refresh preserves identity and output cut" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const retained = client.retainPaneTerminal(0).?;
+    defer retained.release();
+    {
+        retained.mutex.lock();
+        defer retained.mutex.unlock();
+        try retained.terminal.setTitle("pane title");
+        try retained.terminal.setPwd("file:///work");
+        retained.terminal.colors.background.set(.{ .r = 10, .g = 11, .b = 12 });
+        retained.terminal.colors.palette.set(3, .{ .r = 13, .g = 14, .b = 15 });
+    }
+
+    try client.feed("%output %0 before\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    actions.records.clearRetainingCapacity();
+
+    try client.refreshPane(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%output %0 during\n", &actions);
+    try testing.expectEqual(0, actions.records.items.len);
+
+    try client.feed(
+        "%begin 9 9 1\n" ++
+            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
+            "%end 9 9 1\n",
+        &actions,
+    );
+    try testing.expectEqual(0, actions.records.items.len);
+    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    const same = client.retainPaneTerminal(0).?;
+    defer same.release();
+    try testing.expectEqual(retained, same);
+    {
+        retained.mutex.lock();
+        defer retained.mutex.unlock();
+        try testing.expectEqual(100, retained.terminal.cols);
+        try testing.expectEqual(40, retained.terminal.rows);
+        const blank = try retained.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(blank);
+        try testing.expectEqualStrings("", blank);
+        try testing.expectEqualStrings("pane title", retained.terminal.getTitle().?);
+        try testing.expectEqualStrings("file:///work", retained.terminal.getPwd().?);
+        try testing.expectEqual(@as(u8, 10), retained.terminal.colors.background.get().?.r);
+        try testing.expectEqual(@as(u8, 13), retained.terminal.colors.palette.current[3].r);
+    }
+
+    try client.feed(
+        "%begin 10 10 1\n%end 10 10 1\n" ++
+            "%begin 11 11 1\n%end 11 11 1\n" ++
+            "%begin 12 12 1\nbeforeduring\n%end 12 12 1\n" ++
+            "%begin 13 13 1\n%end 13 13 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[0].pane_changed);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    actions.records.clearRetainingCapacity();
+
+    try client.feed("%output %0 after\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    retained.mutex.lock();
+    defer retained.mutex.unlock();
+    const contents = try retained.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("beforeduringafter", contents);
+}
+
+test "control client refresh failure is pane local" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    try client.refreshPane(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 9 9 1\npane gone\n%error 9 9 1\n", &actions);
+    try testing.expectEqual(0, actions.records.items.len);
+    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    try testing.expect(client.viewer.command_queue.empty());
+    try testing.expectEqual(0, client.viewer.sent_command_count);
+
+    const token = try client.enqueueCommand("display-message -p still-alive");
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 10 10 1\nstill-alive\n%end 10 10 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+    actions.records.clearRetainingCapacity();
+
+    try client.feed("%unlinked-window-close @0\n", &actions);
+    try testing.expect(client.panePhase(0) == null);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
 }
 
 test "control client serializes exact binary pane input" {

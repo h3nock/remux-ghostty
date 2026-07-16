@@ -423,6 +423,16 @@ export fn ghostty_tmux_client_send_pane_input(
     return .ok;
 }
 
+export fn ghostty_tmux_client_refresh_pane(
+    client: ?*Client,
+    pane_id: u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const id = std.math.cast(usize, pane_id) orelse return .invalid_input;
+    value.control.refreshPane(id) catch |err| return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_retain_pane_terminal(
     client: ?*Client,
     pane_id: u64,
@@ -1087,6 +1097,77 @@ test "tmux C client pane input validation and action mapping" {
     try testing.expectEqualStrings(
         "pane input rejected",
         context.input_failure_body[0..context.input_failure_len],
+    );
+}
+
+test "tmux C client pane refresh boundary" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_refresh_pane(null, 0),
+    );
+    try testing.expectEqual(
+        Result.not_ready,
+        ghostty_tmux_client_refresh_pane(&client, 0),
+    );
+    try openPaneTestClient(&client);
+    try testing.expectEqual(
+        Result.pane_unknown,
+        ghostty_tmux_client_refresh_pane(&client, 99),
+    );
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_refresh_pane(&client, 0),
+    );
+    try testing.expectEqual(
+        Result.not_ready,
+        ghostty_tmux_client_refresh_pane(&client, 0),
+    );
+    try testing.expectEqual(
+        ControlClient.PanePhase.hydrating,
+        client.control.panePhase(0).?,
+    );
+
+    var outbound: Bytes = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_outbound(&client, &outbound),
+    );
+    const bytes = try outbound.slice();
+    try testing.expect(std.mem.startsWith(
+        u8,
+        bytes,
+        "display-message -p -t %0 -F '",
+    ));
+    try testing.expect(std.mem.indexOf(u8, bytes, "#{pane_width}") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "#{pane_height}") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, " ; capture-pane -p -e -N -q -S -") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, " ; capture-pane -p -e -N -a -q -t %0") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, " ; capture-pane -p -e -N -q -t %0") != null);
+    try testing.expect(std.mem.endsWith(u8, bytes, " ; capture-pane -p -P -C -t %0\n"));
+
+    context.pane_changed_count = 0;
+    try consumeAllTest(&client);
+    try feedTest(
+        &client,
+        "%begin 9 9 1\n" ++
+            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
+            "%end 9 9 1\n" ++
+            "%begin 10 10 1\n%end 10 10 1\n" ++
+            "%begin 11 11 1\n%end 11 11 1\n" ++
+            "%begin 12 12 1\nrefreshed\n%end 12 12 1\n" ++
+            "%begin 13 13 1\n%end 13 13 1\n",
+    );
+    try testing.expectEqual(1, context.pane_changed_count);
+    try testing.expectEqual(0, context.pane_changed_ids[0]);
+    try testing.expectEqual(
+        ControlClient.PanePhase.live,
+        client.control.panePhase(0).?,
     );
 }
 
