@@ -26,6 +26,7 @@ pub const State = enum {
     dcs_passthrough,
     dcs_ignore,
     osc_string,
+    screen_title_string,
     sos_pm_apc_string,
 };
 
@@ -267,7 +268,9 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
     return [3]?Action{
         // Exit depends on current state
         if (self.state == next_state) null else switch (self.state) {
-            .osc_string => if (self.osc_parser.end(c)) |cmd|
+            .osc_string,
+            .screen_title_string,
+            => if (self.osc_parser.end(c)) |cmd|
                 Action{ .osc_dispatch = cmd.* }
             else
                 null,
@@ -287,6 +290,14 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
             .osc_string => osc_string: {
                 self.osc_parser.reset();
                 break :osc_string null;
+            },
+            .screen_title_string => screen_title_string: {
+                // GNU screen's title string is equivalent to an OSC 2 title,
+                // but omits the OSC command prefix.
+                self.osc_parser.reset();
+                self.osc_parser.next('2');
+                self.osc_parser.next(';');
+                break :screen_title_string null;
             },
             .dcs_passthrough => dcs_hook: {
                 // Ignore too many parameters

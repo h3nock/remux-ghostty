@@ -132,7 +132,8 @@ fn genTable() Table {
         // => ground
         range(&result, 0x30, 0x4F, source, .ground, .esc_dispatch);
         range(&result, 0x51, 0x57, source, .ground, .esc_dispatch);
-        range(&result, 0x60, 0x7E, source, .ground, .esc_dispatch);
+        range(&result, 0x60, 0x6A, source, .ground, .esc_dispatch);
+        range(&result, 0x6C, 0x7E, source, .ground, .esc_dispatch);
         single(&result, 0x59, source, .ground, .esc_dispatch);
         single(&result, 0x5A, source, .ground, .esc_dispatch);
         single(&result, 0x5C, source, .ground, .esc_dispatch);
@@ -153,6 +154,9 @@ fn genTable() Table {
 
         // => osc_string
         single(&result, 0x5D, source, .osc_string, .none);
+
+        // => screen_title_string
+        single(&result, 0x6B, source, .screen_title_string, .none);
     }
 
     // dcs_entry
@@ -339,6 +343,22 @@ fn genTable() Table {
         // sequences, and when returning information, uses the same
         // terminator used in a query.
         single(&result, 0x07, source, .ground, .none);
+    }
+
+    // screen_title_string
+    {
+        const source = State.screen_title_string;
+
+        // Screen-style title strings end at ST or a line boundary. Other bytes
+        // are title content and are parsed through the OSC title path.
+        range(&result, 0, 0x09, source, source, .ignore);
+        single(&result, 0x0A, source, .ground, .none);
+        range(&result, 0x0B, 0x0C, source, source, .ignore);
+        single(&result, 0x0D, source, .ground, .none);
+        range(&result, 0x0E, 0x17, source, source, .ignore);
+        single(&result, 0x19, source, source, .ignore);
+        range(&result, 0x1C, 0x1F, source, source, .ignore);
+        range(&result, 0x20, 0xFF, source, source, .osc_put);
     }
 
     // Create our immutable version

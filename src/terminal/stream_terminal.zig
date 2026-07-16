@@ -1886,6 +1886,31 @@ test "window_title effect is called" {
     try testing.expectEqual(@as(usize, 1), S.title_changed_count);
 }
 
+test "screen title is consumed without changing the grid" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    // GNU screen and programs running under tmux use ESC k title ST. Split
+    // the terminator across writes to prove the parser retains string state.
+    s.nextSlice("\x1bkcd\x1b");
+    s.nextSlice("\\%   \r \r\x1b[J");
+
+    try testing.expectEqualStrings("cd", t.getTitle().?);
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("", str);
+
+    // CR is also a valid terminator and is consumed as part of the title.
+    s.nextSlice("\x1bkhome\rX");
+    try testing.expectEqualStrings("home", t.getTitle().?);
+    const terminated = try t.plainString(testing.allocator);
+    defer testing.allocator.free(terminated);
+    try testing.expectEqualStrings("X", terminated);
+}
+
 test "window_title effect not called without callback" {
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
