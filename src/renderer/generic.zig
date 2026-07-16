@@ -60,6 +60,26 @@ fn visibleRenderGrid(
     return result;
 }
 
+const ScreenSizeUniformInputs = struct {
+    screen: renderer.ScreenSize,
+    padding: renderer.Padding,
+    cell: renderer.CellSize,
+    visible_grid: renderer.GridSize,
+};
+
+fn screenSizeUniformInputs(
+    size: renderer.Size,
+    cells_size: renderer.GridSize,
+    state: *const terminal.RenderState,
+) ScreenSizeUniformInputs {
+    return .{
+        .screen = size.screen,
+        .padding = size.padding,
+        .cell = size.cell,
+        .visible_grid = visibleRenderGrid(cells_size, state),
+    };
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -174,6 +194,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
+
+        /// Inputs used to derive the current screen-size uniforms. The cell
+        /// contents can catch up after an asynchronous surface resize, so the
+        /// surface pixel size alone is not sufficient invalidation.
+        screen_size_uniform_inputs: ScreenSizeUniformInputs = undefined,
 
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
@@ -1589,8 +1614,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .width = surface_size.width,
                     .height = surface_size.height,
                 };
-                self.updateScreenSizeUniforms();
             }
+            if (!std.meta.eql(
+                self.screen_size_uniform_inputs,
+                screenSizeUniformInputs(
+                    self.size,
+                    self.cells.size,
+                    &self.terminal_state,
+                ),
+            )) self.updateScreenSizeUniforms();
 
             // If this frame's target isn't the correct size, or the target
             // config has changed (such as when the blending mode changes),
@@ -1999,24 +2031,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Caller must hold the draw mutex.
         fn updateScreenSizeUniforms(self: *Self) void {
-            const terminal_size = self.size.terminal();
+            const inputs = screenSizeUniformInputs(
+                self.size,
+                self.cells.size,
+                &self.terminal_state,
+            );
+            const terminal_size = inputs.screen.subPadding(inputs.padding);
 
             // Blank space around the grid.
-            const blank: renderer.Padding = self.size.screen.blankPadding(
-                self.size.padding,
-                visibleRenderGrid(self.cells.size, &self.terminal_state),
-                .{
-                    .width = self.grid_metrics.cell_width,
-                    .height = self.grid_metrics.cell_height,
-                },
-            ).add(self.size.padding);
+            const blank = inputs.screen.blankPadding(
+                inputs.padding,
+                inputs.visible_grid,
+                inputs.cell,
+            ).add(inputs.padding);
 
             // Setup our uniforms
             self.uniforms.projection_matrix = math.ortho2d(
-                -1 * @as(f32, @floatFromInt(self.size.padding.left)),
-                @floatFromInt(terminal_size.width + self.size.padding.right),
-                @floatFromInt(terminal_size.height + self.size.padding.bottom),
-                -1 * @as(f32, @floatFromInt(self.size.padding.top)),
+                -1 * @as(f32, @floatFromInt(inputs.padding.left)),
+                @floatFromInt(terminal_size.width + inputs.padding.right),
+                @floatFromInt(terminal_size.height + inputs.padding.bottom),
+                -1 * @as(f32, @floatFromInt(inputs.padding.top)),
             );
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
@@ -2025,9 +2059,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(blank.left),
             };
             self.uniforms.screen_size = .{
-                @floatFromInt(self.size.screen.width),
-                @floatFromInt(self.size.screen.height),
+                @floatFromInt(inputs.screen.width),
+                @floatFromInt(inputs.screen.height),
             };
+            self.screen_size_uniform_inputs = inputs;
         }
 
         /// Update the background image vertex buffer (CPU-side).
@@ -3470,6 +3505,65 @@ test "visible render grid preserves asynchronous cell geometry" {
         renderer.GridSize{ .columns = 80, .rows = 24 },
         visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state),
     );
+}
+
+test "screen-size uniform inputs track asynchronous grid catch-up" {
+    const testing = std.testing;
+
+    const size: renderer.Size = .{
+        .screen = .{ .width = 800, .height = 720 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    var state: terminal.RenderState = .empty;
+    state.rows = 22;
+    state.cols = 80;
+    state.render_rows = 22;
+
+    const before = screenSizeUniformInputs(
+        size,
+        .{ .columns = 80, .rows = 22 },
+        &state,
+    );
+    const before_padding = before.screen.blankPadding(
+        before.padding,
+        before.visible_grid,
+        before.cell,
+    );
+    try testing.expectEqual(@as(u32, 280), before_padding.bottom);
+
+    state.rows = 36;
+    state.render_rows = 36;
+    const after = screenSizeUniformInputs(
+        size,
+        .{ .columns = 80, .rows = 36 },
+        &state,
+    );
+    const after_padding = after.screen.blankPadding(
+        after.padding,
+        after.visible_grid,
+        after.cell,
+    );
+    try testing.expect(!std.meta.eql(before, after));
+    try testing.expectEqual(@as(u32, 0), after_padding.bottom);
+
+    try testing.expect(std.meta.eql(
+        after,
+        screenSizeUniformInputs(
+            size,
+            .{ .columns = 80, .rows = 36 },
+            &state,
+        ),
+    ));
+    state.render_rows = 37;
+    try testing.expect(std.meta.eql(
+        after,
+        screenSizeUniformInputs(
+            size,
+            .{ .columns = 80, .rows = 37 },
+            &state,
+        ),
+    ));
 }
 
 test "scrollbar delivery remains dirty until accepted" {
