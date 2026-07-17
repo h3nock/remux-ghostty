@@ -725,7 +725,7 @@ test "control client hydration error skips only its group" {
     try client.enqueueCommandGroup(&.{"display-message -p pending-host"}, &pending_host);
     try client.feed(
         "%begin 4 4 1\n" ++
-            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
+            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
             "%end 4 4 1\n" ++
             "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
             "%begin 6 6 1\n%end 6 6 1\n" ++
@@ -1069,7 +1069,7 @@ test "control client pane refresh preserves identity and output cut" {
 
     try client.feed(
         "%begin 9 9 1\n" ++
-            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
+            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
             "%end 9 9 1\n",
         &actions,
     );

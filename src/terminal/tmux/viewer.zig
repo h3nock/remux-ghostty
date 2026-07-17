@@ -11,6 +11,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const SharedTerminal = @import("../Shared.zig");
 const Terminal = @import("../Terminal.zig");
 const TerminalStream = @import("../stream_terminal.zig").Stream;
+const mouse = @import("../mouse.zig");
 const RGB = @import("../color.zig").RGB;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
@@ -1571,12 +1572,7 @@ pub const Viewer = struct {
             t.modes.set(.origin, data.origin_flag);
 
             // Mouse modes
-            t.modes.set(.mouse_event_any, data.mouse_all_flag);
-            t.modes.set(.mouse_event_button, data.mouse_any_flag);
-            t.modes.set(.mouse_event_normal, data.mouse_button_flag);
-            t.modes.set(.mouse_event_x10, data.mouse_standard_flag);
-            t.modes.set(.mouse_format_utf8, data.mouse_utf8_flag);
-            t.modes.set(.mouse_format_sgr, data.mouse_sgr_flag);
+            reconcileMouseState(t, data);
 
             // Focus and bracketed paste
             t.modes.set(.focus_event, data.focus_flag);
@@ -1607,6 +1603,47 @@ pub const Viewer = struct {
                     t.tabstops.set(col_cell);
                 }
             }
+        }
+    }
+
+    /// Reconcile the subset of mouse state exposed by a tmux pane snapshot.
+    /// ModeState retains independently enabled DEC modes while the flags hold
+    /// their effective order. Tmux supplies new ordering for reported modes,
+    /// but no disable evidence for X10 events or URXVT/SGR-pixels formats, so
+    /// those raw bits must remain untouched.
+    fn reconcileMouseState(
+        terminal: *Terminal,
+        data: Format.list_panes.Struct(),
+    ) void {
+        const event_any = data.mouse_all_flag;
+        const event_button = !event_any and data.mouse_button_flag;
+        const event_normal = !event_any and
+            !event_button and
+            data.mouse_standard_flag;
+        terminal.modes.set(.mouse_event_any, event_any);
+        terminal.modes.set(.mouse_event_button, event_button);
+        terminal.modes.set(.mouse_event_normal, event_normal);
+        if (event_any) {
+            terminal.flags.mouse_event = .any;
+        } else if (event_button) {
+            terminal.flags.mouse_event = .button;
+        } else if (event_normal) {
+            terminal.flags.mouse_event = .normal;
+        } else if (terminal.flags.mouse_event != .x10) {
+            terminal.flags.mouse_event = .none;
+        }
+
+        const format_sgr = data.mouse_sgr_flag;
+        const format_utf8 = !format_sgr and data.mouse_utf8_flag;
+        terminal.modes.set(.mouse_format_sgr, format_sgr);
+        terminal.modes.set(.mouse_format_utf8, format_utf8);
+        if (format_sgr) {
+            terminal.flags.mouse_format = .sgr;
+        } else if (format_utf8) {
+            terminal.flags.mouse_format = .utf8;
+        } else switch (terminal.flags.mouse_format) {
+            .urxvt, .sgr_pixels => {},
+            else => terminal.flags.mouse_format = .x10,
         }
     }
 
@@ -2208,7 +2245,6 @@ const Format = struct {
             .origin_flag,
             // Mouse modes
             .mouse_all_flag,
-            .mouse_any_flag,
             .mouse_button_flag,
             .mouse_standard_flag,
             .mouse_utf8_flag,
@@ -2260,6 +2296,46 @@ fn testClientBlock(data: []const u8) control.Notification.Block {
         .data = data,
         .meta = .{ .time = 0, .number = 0, .flags = 1 },
     };
+}
+
+const TestPaneState = struct {
+    pane_id: usize = 1,
+    alternate_on: bool = false,
+    mouse_all: bool = false,
+    mouse_button: bool = false,
+    mouse_standard: bool = false,
+    mouse_utf8: bool = false,
+    mouse_sgr: bool = false,
+};
+
+fn testPaneState(
+    buffer: []u8,
+    state: TestPaneState,
+) std.fmt.BufPrintError![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "%{d};10;3;0;0;1;block;;0;{d};4294967295;4294967295;" ++
+            "0;1;0;0;0;{d};{d};{d};{d};{d};0;0;0;0;2;",
+        .{
+            state.pane_id,
+            @intFromBool(state.alternate_on),
+            @intFromBool(state.mouse_all),
+            @intFromBool(state.mouse_button),
+            @intFromBool(state.mouse_standard),
+            @intFromBool(state.mouse_utf8),
+            @intFromBool(state.mouse_sgr),
+        },
+    );
+}
+
+fn addTestPane(viewer: *Viewer) Allocator.Error!*Viewer.Pane {
+    const pane = try Viewer.Pane.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    errdefer pane.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, pane);
+    return pane;
 }
 
 const TestStep = struct {
@@ -2415,6 +2491,106 @@ test "minimum tmux version" {
     try testing.expect(!Viewer.supportsTmuxVersion("3"));
     try testing.expect(!Viewer.supportsTmuxVersion("3.x"));
     try testing.expect(!Viewer.supportsTmuxVersion("unknown"));
+}
+
+test "pane state query excludes aggregate tmux mouse flag" {
+    for ([_]output.Variable{
+        .mouse_all_flag,
+        .mouse_button_flag,
+        .mouse_standard_flag,
+        .mouse_utf8_flag,
+        .mouse_sgr_flag,
+    }) |variable| {
+        try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, variable) != null);
+    }
+    try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, .mouse_any_flag) == null);
+}
+
+test "pane hydration restores tmux mouse modes and effective flags" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try addTestPane(&viewer);
+    const terminal = &pane.terminal_owner.terminal;
+    var state_buffer: [256]u8 = undefined;
+
+    const cases = [_]struct {
+        state: TestPaneState,
+        event: mouse.Event,
+        format: mouse.Format,
+        screen: ScreenSet.Key = .primary,
+    }{
+        .{
+            .state = .{ .mouse_standard = true, .mouse_utf8 = true },
+            .event = .normal,
+            .format = .utf8,
+        },
+        .{
+            // The alternate-screen case proves routing observes the hydrated
+            // effective mode before the application emits any live output.
+            .state = .{
+                .alternate_on = true,
+                .mouse_button = true,
+                .mouse_sgr = true,
+            },
+            .event = .button,
+            .format = .sgr,
+            .screen = .alternate,
+        },
+        .{
+            // Conflicting input also proves all-motion and SGR precedence.
+            .state = .{
+                .mouse_all = true,
+                .mouse_button = true,
+                .mouse_standard = true,
+                .mouse_utf8 = true,
+                .mouse_sgr = true,
+            },
+            .event = .any,
+            .format = .sgr,
+        },
+        .{ .state = .{}, .event = .none, .format = .x10 },
+    };
+
+    for (cases) |case| {
+        try viewer.receivedPaneState(null, try testPaneState(&state_buffer, case.state));
+        try testing.expectEqual(case.screen, pane.active_screen);
+        try testing.expectEqual(terminal.screens.get(case.screen).?, terminal.screens.active);
+        try testing.expectEqual(case.event, terminal.flags.mouse_event);
+        try testing.expectEqual(case.event == .normal, terminal.modes.get(.mouse_event_normal));
+        try testing.expectEqual(case.event == .button, terminal.modes.get(.mouse_event_button));
+        try testing.expectEqual(case.event == .any, terminal.modes.get(.mouse_event_any));
+        try testing.expect(!terminal.modes.get(.mouse_event_x10));
+        try testing.expectEqual(case.format, terminal.flags.mouse_format);
+        try testing.expectEqual(case.format == .utf8, terminal.modes.get(.mouse_format_utf8));
+        try testing.expectEqual(case.format == .sgr, terminal.modes.get(.mouse_format_sgr));
+        try testing.expect(!terminal.modes.get(.mouse_format_urxvt));
+        try testing.expect(!terminal.modes.get(.mouse_format_sgr_pixels));
+    }
+}
+
+test "pane refresh preserves parser-only mouse modes" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try addTestPane(&viewer);
+    const terminal = &pane.terminal_owner.terminal;
+    var state_buffer: [256]u8 = undefined;
+
+    try viewer.receivedPaneState(null, try testPaneState(&state_buffer, .{}));
+    pane.stream.nextSlice("\x1b[?9h\x1b[?1015h");
+    pane.phase = .refreshing;
+    try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
+    try testing.expectEqual(.x10, terminal.flags.mouse_event);
+    try testing.expect(terminal.modes.get(.mouse_event_x10));
+    try testing.expectEqual(.urxvt, terminal.flags.mouse_format);
+    try testing.expect(terminal.modes.get(.mouse_format_urxvt));
+
+    pane.stream.nextSlice("\x1b[?1016h");
+    try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
+    try testing.expectEqual(.x10, terminal.flags.mouse_event);
+    try testing.expect(terminal.modes.get(.mouse_event_x10));
+    try testing.expectEqual(.sgr_pixels, terminal.flags.mouse_format);
+    try testing.expect(terminal.modes.get(.mouse_format_urxvt));
+    try testing.expect(terminal.modes.get(.mouse_format_sgr_pixels));
 }
 
 test "active topology creates configured pane terminals" {
@@ -2682,8 +2858,8 @@ test "session changed resets state" {
         // before injecting the notification below.
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock(
-                \\%0;83;20;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;19;8,16
-                \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+                \\%0;83;20;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;19;8,16
+                \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16
                 ,
             ) } },
         },
@@ -2879,8 +3055,8 @@ test "initial flow" {
     });
 
     const pane_state =
-        \\%0;83;20;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;1;0;19;8,16
-        \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;0;22;8,16
+        \\%0;83;20;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;1;0;19;8,16
+        \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16
     ;
     const first_responses = [_][]const u8{
         pane_state,
@@ -3781,7 +3957,7 @@ test "alternate pane hydration restores canonical screens" {
 
     try viewer.receivedPaneState(
         null,
-        "%7;20;4;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;0;;;1;1;3;8,16",
+        "%7;20;4;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;;;1;1;3;8,16",
     );
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
@@ -3987,14 +4163,14 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
     // either already-refreshing terminal.
     try viewer.receivedPaneState(
         null,
-        "%1;5;1;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;0;",
+        "%1;5;1;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;",
     );
     try testing.expectEqual(10, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
 
     try viewer.receivedPaneState(
         1,
-        "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;2;8",
+        "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;8",
     );
     try testing.expectEqual(12, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(3, pane_1.terminal_owner.terminal.rows);
@@ -4019,7 +4195,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
 
     try viewer.receivedPaneState(
         2,
-        "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;0;3;8",
+        "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;3;8",
     );
     try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
     try testing.expectEqual(4, pane_2.terminal_owner.terminal.rows);
