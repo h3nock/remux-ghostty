@@ -115,6 +115,26 @@ pub const InteractionState = struct {
     has_selection: bool,
 };
 
+pub const SelectionEndpoint = enum(c_int) {
+    start = 0,
+    end = 1,
+};
+
+pub const SelectionRect = extern struct {
+    x_px: f64 = 0,
+    y_px: f64 = 0,
+    width_px: u32 = 0,
+    height_px: u32 = 0,
+    visible: bool = false,
+};
+
+pub const SelectionSnapshot = extern struct {
+    start: SelectionRect = .{},
+    end: SelectionRect = .{},
+    active: bool = false,
+    rectangle: bool = false,
+};
+
 const ScrollPosition = struct {
     row: usize,
     cell_offset: f64,
@@ -321,6 +341,110 @@ pub fn interactionState(self: *TerminalSurface) InteractionState {
     self.shared.mutex.lock();
     defer self.shared.mutex.unlock();
     return self.normalizeAndSnapshotInteractionLocked();
+}
+
+/// Snapshot the canonical selection in the current presentation viewport.
+pub fn selectionSnapshot(self: *TerminalSurface) SelectionSnapshot {
+    self.shared.mutex.lock();
+    defer self.shared.mutex.unlock();
+    return self.selectionSnapshotLocked();
+}
+
+/// Select the canonical Ghostty word at a presentation point. An unwritten
+/// cell clears the selection. The committed snapshot is filled before a wake
+/// can fail.
+pub fn selectWord(
+    self: *TerminalSurface,
+    x: f64,
+    y: f64,
+    out: *SelectionSnapshot,
+) !void {
+    const changed = changed: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+
+        const pin = self.selectionPinLocked(x, y) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        };
+        const screen = self.shared.terminal.screens.active;
+        const selection = if (pin) |value|
+            screen.selectWord(
+                value,
+                self.interaction_config.word_chars,
+            )
+        else
+            null;
+        const did_change = self.applySelectionLocked(selection) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        };
+        out.* = self.selectionSnapshotLocked();
+        break :changed did_change;
+    };
+
+    if (changed) try self.terminalChanged();
+}
+
+/// Move one role-stable canonical endpoint to a presentation point. Crossing
+/// the other endpoint preserves the endpoint roles and selection direction.
+pub fn setSelectionEndpoint(
+    self: *TerminalSurface,
+    endpoint: SelectionEndpoint,
+    x: f64,
+    y: f64,
+    out: *SelectionSnapshot,
+) !void {
+    const changed = changed: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+
+        const screen = self.shared.terminal.screens.active;
+        var selection = screen.selection orelse {
+            out.* = self.selectionSnapshotLocked();
+            return error.InvalidInput;
+        };
+        const pin = (self.selectionPinLocked(x, y) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        }) orelse {
+            out.* = self.selectionSnapshotLocked();
+            return error.InvalidInput;
+        };
+        const target = switch (endpoint) {
+            .start => selection.startPtr(),
+            .end => selection.endPtr(),
+        };
+        if (target.*.eql(pin)) {
+            out.* = self.selectionSnapshotLocked();
+            break :changed false;
+        }
+
+        target.* = pin;
+        // The selection is already tracked. Reinstalling the same tracked
+        // pins marks selection damage without allocating replacement pins.
+        screen.select(selection) catch unreachable;
+        out.* = self.selectionSnapshotLocked();
+        break :changed true;
+    };
+
+    if (changed) try self.terminalChanged();
+}
+
+/// Clear the canonical selection. This is idempotent.
+pub fn clearSelection(
+    self: *TerminalSurface,
+    out: *SelectionSnapshot,
+) !void {
+    const changed = changed: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+        const did_change = self.clearSelectionLocked();
+        out.* = self.selectionSnapshotLocked();
+        break :changed did_change;
+    };
+
+    if (changed) try self.terminalChanged();
 }
 
 /// Scroll to an absolute row plus fractional cell offset. The canonical
@@ -776,6 +900,64 @@ fn pointerPinLocked(
     return self.shared.terminal.screens.active.pages.pin(.{
         .viewport = viewport,
     });
+}
+
+fn selectionPinLocked(
+    self: *const TerminalSurface,
+    x: f64,
+    y: f64,
+) error{InvalidInput}!?terminal.Pin {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y) or
+        x < 0 or y < 0 or
+        x >= @as(f64, @floatFromInt(self.size.screen.width)) or
+        y >= @as(f64, @floatFromInt(self.size.screen.height)))
+    {
+        return error.InvalidInput;
+    }
+    return self.pointerPinLocked(x, y);
+}
+
+fn selectionSnapshotLocked(self: *const TerminalSurface) SelectionSnapshot {
+    const screen = self.shared.terminal.screens.active;
+    const selection = screen.selection orelse return .{};
+    return .{
+        .start = self.selectionRectLocked(selection.start()),
+        .end = self.selectionRectLocked(selection.end()),
+        .active = true,
+        .rectangle = selection.rectangle,
+    };
+}
+
+fn selectionRectLocked(
+    self: *const TerminalSurface,
+    pin: terminal.Pin,
+) SelectionRect {
+    const point = self.shared.terminal.screens.active.pages.pointFromPin(
+        .viewport,
+        pin,
+    ) orelse return .{};
+    const coord = point.viewport;
+    const cell_width: f64 = @floatFromInt(self.size.cell.width);
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+    const grid = self.size.grid();
+    const left: f64 = @floatFromInt(self.size.padding.left);
+    const top: f64 = @floatFromInt(self.size.padding.top);
+    const right = left + @as(f64, @floatFromInt(grid.columns)) * cell_width;
+    const bottom = top + @as(f64, @floatFromInt(grid.rows)) * cell_height;
+    const x = left + @as(f64, @floatFromInt(coord.x)) * cell_width;
+    const y = top +
+        (@as(f64, @floatFromInt(coord.y)) -
+            self.runtime.state.scroll_cell_offset) * cell_height;
+    if (x >= right or x + cell_width <= left or
+        y >= bottom or y + cell_height <= top) return .{};
+
+    return .{
+        .x_px = x,
+        .y_px = y,
+        .width_px = self.size.cell.width,
+        .height_px = self.size.cell.height,
+        .visible = true,
+    };
 }
 
 fn applySelectionLocked(
@@ -1507,6 +1689,14 @@ fn testSurface(
     return result;
 }
 
+fn testFeed(shared: *terminal.Shared, bytes: []const u8) void {
+    shared.mutex.lock();
+    defer shared.mutex.unlock();
+    var stream = shared.terminal.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(bytes);
+}
+
 test "terminal surface config derivation failure does not partially commit" {
     const testing = std.testing;
     const shared = try terminal.Shared.init(testing.allocator, .{
@@ -2063,6 +2253,213 @@ test "terminal surface interaction state and position scrolling" {
     state = surface.interactionState();
     try testing.expectEqual(ScrollRoute.viewport, state.route);
     try testing.expect(!state.mouse_captured);
+}
+
+test "terminal surface selection snapshot follows viewport and active screen" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size = .{
+        .screen = .{ .width = 104, .height = 64 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 2, .bottom = 2, .left = 2, .right = 2 },
+    };
+
+    try testing.expect(!surface.selectionSnapshot().active);
+    testFeed(shared, "zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        const screen = shared.terminal.screens.active;
+        shared.terminal.scrollViewport(.top);
+        try screen.select(terminal.Selection.init(
+            screen.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            screen.pages.pin(.{ .screen = .{ .x = 2, .y = 3 } }).?,
+            true,
+        ));
+    }
+
+    var snapshot = surface.selectionSnapshot();
+    try testing.expect(snapshot.active);
+    try testing.expect(snapshot.rectangle);
+    try testing.expect(snapshot.start.visible);
+    try testing.expectEqual(@as(f64, 2), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 2), snapshot.start.y_px);
+    try testing.expect(!snapshot.end.visible);
+
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    snapshot = surface.selectionSnapshot();
+    try testing.expect(snapshot.start.visible);
+    try testing.expectEqual(@as(f64, -8), snapshot.start.y_px);
+    // The renderer materializes one row beyond the viewport for this peek.
+    try testing.expect(snapshot.end.visible);
+    try testing.expectEqual(@as(f64, 22), snapshot.end.x_px);
+    try testing.expectEqual(@as(f64, 52), snapshot.end.y_px);
+
+    testFeed(shared, "\x1b[?1049hALT");
+    try testing.expect(!surface.selectionSnapshot().active);
+    surface.runtime.state.scroll_cell_offset = 0;
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        const screen = shared.terminal.screens.active;
+        try screen.select(terminal.Selection.init(
+            screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+            screen.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
+            false,
+        ));
+    }
+    snapshot = surface.selectionSnapshot();
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 2), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 22), snapshot.end.x_px);
+
+    testFeed(shared, "\x1b[?1049l");
+    snapshot = surface.selectionSnapshot();
+    // Ghostty clears the destination screen's prior selection on a switch.
+    try testing.expect(!snapshot.active);
+}
+
+test "terminal surface word selection is local and refreshes after reflow" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+    surface.size.screen.width = 200;
+    testFeed(shared, "hello\x1b[41m \x1b[0mworld.foo");
+    shared.mutex.lock();
+    shared.terminal.flags.mouse_event = .normal;
+    shared.mutex.unlock();
+
+    surface.interaction_config.word_chars = &[_]u21{ ' ', '\t', '.' };
+    var snapshot: SelectionSnapshot = undefined;
+    try surface.selectWord(75, 5, &snapshot);
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 60), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 100), snapshot.end.x_px);
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+
+    surface.interaction_config.word_chars = &[_]u21{ ' ', '\t' };
+    try surface.selectWord(75, 5, &snapshot);
+    try testing.expectEqual(@as(f64, 140), snapshot.end.x_px);
+    try surface.selectWord(55, 5, &snapshot);
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 50), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 50), snapshot.end.x_px);
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+
+    try surface.selectWord(75, 5, &snapshot);
+    try surface.selectWord(5, 45, &snapshot);
+    try testing.expect(!snapshot.active);
+
+    try surface.selectWord(75, 5, &snapshot);
+    try testing.expectError(
+        error.InvalidInput,
+        surface.selectWord(std.math.nan(f64), 5, &snapshot),
+    );
+    try testing.expect(snapshot.active);
+    try testing.expectError(
+        error.InvalidInput,
+        surface.selectWord(200, 5, &snapshot),
+    );
+    try testing.expect(snapshot.active);
+
+    shared.mutex.lock();
+    try shared.terminal.resize(testing.allocator, 10, 3);
+    shared.mutex.unlock();
+    snapshot = surface.selectionSnapshot();
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 40), snapshot.end.x_px);
+    try testing.expectEqual(@as(f64, 20), snapshot.end.y_px);
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+}
+
+test "terminal surface selection endpoints preserve roles and allocation" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    testFeed(shared, "abc defgh");
+
+    const initial_pins = shared.terminal.screens.active.pages.countTrackedPins();
+    var snapshot: SelectionSnapshot = undefined;
+    try surface.selectWord(15, 5, &snapshot);
+    try testing.expectEqual(
+        initial_pins + 2,
+        shared.terminal.screens.active.pages.countTrackedPins(),
+    );
+
+    try surface.setSelectionEndpoint(.start, 55, 5, &snapshot);
+    try testing.expectEqual(@as(f64, 50), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 20), snapshot.end.x_px);
+    try testing.expectEqual(
+        initial_pins + 2,
+        shared.terminal.screens.active.pages.countTrackedPins(),
+    );
+    try surface.setSelectionEndpoint(.end, 75, 5, &snapshot);
+    try testing.expectEqual(@as(f64, 50), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 70), snapshot.end.x_px);
+
+    shared.mutex.lock();
+    shared.terminal.screens.active.selection.?.rectangle = true;
+    shared.terminal.screens.active.dirty.selection = false;
+    shared.mutex.unlock();
+    try surface.setSelectionEndpoint(.end, 75, 5, &snapshot);
+    try testing.expect(snapshot.rectangle);
+    shared.mutex.lock();
+    try testing.expect(!shared.terminal.screens.active.dirty.selection);
+    shared.mutex.unlock();
+
+    try testing.expectError(
+        error.InvalidInput,
+        surface.setSelectionEndpoint(.end, 100, 5, &snapshot),
+    );
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 70), snapshot.end.x_px);
+
+    try surface.clearSelection(&snapshot);
+    try testing.expect(!snapshot.active);
+    try testing.expectEqual(
+        initial_pins,
+        shared.terminal.screens.active.pages.countTrackedPins(),
+    );
+    shared.mutex.lock();
+    shared.terminal.screens.active.dirty.selection = false;
+    shared.mutex.unlock();
+    try surface.clearSelection(&snapshot);
+    shared.mutex.lock();
+    try testing.expect(!shared.terminal.screens.active.dirty.selection);
+    shared.mutex.unlock();
+    try testing.expectError(
+        error.InvalidInput,
+        surface.setSelectionEndpoint(.start, 5, 5, &snapshot),
+    );
+    try testing.expect(!snapshot.active);
+
+    const xev = @import("../global.zig").xev;
+    var closed_wakeup = try xev.Async.init();
+    closed_wakeup.deinit();
+    surface.runtime.thread.wakeup = closed_wakeup;
+    surface.visible.store(true, .monotonic);
+    var wake_failed = false;
+    surface.selectWord(15, 5, &snapshot) catch {
+        wake_failed = true;
+    };
+    try testing.expect(wake_failed);
+    try testing.expect(snapshot.active);
+    try testing.expect(shared.terminal.screens.active.selection != null);
 }
 
 test "terminal surface local pointer selection pressure and text ownership" {
