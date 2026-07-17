@@ -9,6 +9,7 @@ const crash = @import("../crash/main.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const rendererpkg = @import("../renderer.zig");
+const renderer_link = @import("link.zig");
 const sizepkg = @import("size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
@@ -62,22 +63,31 @@ const InteractionConfig = struct {
     word_chars: []const u21,
     click_repeat_interval: u64,
     scroll_multiplier: configpkg.Config.MouseScrollMultiplier,
+    links: renderer_link.Set,
 
     fn init(
         alloc: std.mem.Allocator,
         config: *const configpkg.Config,
-    ) std.mem.Allocator.Error!InteractionConfig {
+    ) !InteractionConfig {
+        const word_chars = try alloc.dupe(
+            u21,
+            config.@"selection-word-chars".codepoints,
+        );
+        errdefer alloc.free(word_chars);
+
         return .{
-            .word_chars = try alloc.dupe(
-                u21,
-                config.@"selection-word-chars".codepoints,
-            ),
+            .word_chars = word_chars,
             .click_repeat_interval = @as(u64, config.@"click-repeat-interval") * 1_000_000,
             .scroll_multiplier = config.@"mouse-scroll-multiplier",
+            .links = try renderer_link.Set.fromConfig(
+                alloc,
+                config.link.links.items,
+            ),
         };
     }
 
     fn deinit(self: *InteractionConfig, alloc: std.mem.Allocator) void {
+        self.links.deinit(alloc);
         alloc.free(self.word_chars);
         self.* = undefined;
     }
@@ -384,6 +394,73 @@ pub fn selectWord(
     };
 
     if (changed) try self.terminalChanged();
+}
+
+/// Select a configured or OSC 8 link at a presentation point. A successful
+/// no-match leaves the canonical selection untouched. `out_target` is owned by
+/// this surface only for OSC 8, whose target can differ from visible text.
+pub fn selectLink(
+    self: *TerminalSurface,
+    x: f64,
+    y: f64,
+    out: *SelectionSnapshot,
+    out_matched: *bool,
+    out_target: *?[:0]const u8,
+) !void {
+    out_matched.* = false;
+    out_target.* = null;
+    const changed = changed: {
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+
+        const pin = self.selectionPinLocked(x, y) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        } orelse {
+            out.* = self.selectionSnapshotLocked();
+            break :changed false;
+        };
+        const screen = self.shared.terminal.screens.active;
+        var selection: terminal.Selection = undefined;
+        var target: ?[:0]const u8 = null;
+        if (screen.selectHyperlink(pin)) |hyperlink| {
+            selection = hyperlink.selection;
+            target = self.alloc.dupeZ(u8, hyperlink.uri) catch |err| {
+                out.* = self.selectionSnapshotLocked();
+                return err;
+            };
+        } else if (self.interaction_config.links.matchAtPin(
+            self.alloc,
+            screen,
+            pin,
+            null,
+        ) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        }) |configured| {
+            selection = configured.selection;
+        } else {
+            out.* = self.selectionSnapshotLocked();
+            break :changed false;
+        }
+        errdefer if (target) |value| self.alloc.free(value);
+
+        const changed = self.applySelectionLocked(selection) catch |err| {
+            out.* = self.selectionSnapshotLocked();
+            return err;
+        };
+        out.* = self.selectionSnapshotLocked();
+        out_matched.* = true;
+        out_target.* = target;
+        break :changed changed;
+    };
+
+    if (changed) self.terminalChanged() catch |err| {
+        if (out_target.*) |target| self.alloc.free(target);
+        out_target.* = null;
+        out_matched.* = false;
+        return err;
+    };
 }
 
 /// Move one role-stable canonical endpoint to a presentation point. Crossing
@@ -1667,6 +1744,7 @@ fn testSurface(
             .word_chars = &.{},
             .click_repeat_interval = 500 * std.time.ns_per_ms,
             .scroll_multiplier = .{},
+            .links = .{ .links = &.{} },
         },
         .interaction = .{},
         .explicit_padding = undefined,
@@ -2381,6 +2459,121 @@ test "terminal surface word selection is local and refreshes after reflow" {
     try testing.expectEqual(@as(f64, 40), snapshot.end.x_px);
     try testing.expectEqual(@as(f64, 20), snapshot.end.y_px);
     try testing.expectEqual(@as(usize, 0), sink.calls);
+}
+
+test "terminal surface link selection preserves no-match and target ownership" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 8,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size.screen.width = 80;
+
+    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+        .regex = "https://[^ ]+",
+        .action = .{ .open = {} },
+        .highlight = .{ .hover_mods = .{ .ctrl = true } },
+    }});
+    defer links.deinit(testing.allocator);
+    surface.interaction_config.links = links;
+
+    testFeed(shared, "xxhttps://example.com ");
+    var snapshot: SelectionSnapshot = undefined;
+    var matched: bool = undefined;
+    var target: ?[:0]const u8 = undefined;
+    try surface.selectLink(25, 25, &snapshot, &matched, &target);
+    try testing.expect(matched);
+    try testing.expect(snapshot.active);
+    try testing.expect(target == null);
+    const selected = try surface.selectedText();
+    defer surface.freeSelectedText(selected);
+    try testing.expectEqualStrings("https://example.com", selected);
+
+    const before = snapshot;
+    try surface.selectLink(65, 45, &snapshot, &matched, &target);
+    try testing.expect(!matched);
+    try testing.expectEqualDeep(before, snapshot);
+    try testing.expect(target == null);
+
+    const surface_alloc = surface.alloc;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    surface.alloc = failing.allocator();
+    try testing.expectError(
+        error.OutOfMemory,
+        surface.selectLink(25, 25, &snapshot, &matched, &target),
+    );
+    surface.alloc = surface_alloc;
+    try testing.expectEqualDeep(before, snapshot);
+    try testing.expect(!matched);
+    try testing.expect(target == null);
+}
+
+test "terminal surface OSC 8 link selection takes precedence over configured links" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size.screen.width = 50;
+
+    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+        .regex = "https://[^ ]+",
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }});
+    defer links.deinit(testing.allocator);
+    surface.interaction_config.links = links;
+
+    shared.mutex.lock();
+    try shared.terminal.screens.active.startHyperlink(
+        "https://example.com/target",
+        null,
+    );
+    try shared.terminal.screens.active.testWriteString("https://a");
+    shared.terminal.screens.active.endHyperlink();
+    shared.mutex.unlock();
+
+    var snapshot: SelectionSnapshot = undefined;
+    var matched: bool = undefined;
+    var target: ?[:0]const u8 = undefined;
+    try surface.selectLink(5, 25, &snapshot, &matched, &target);
+    try testing.expect(matched);
+    try testing.expect(snapshot.active);
+    try testing.expectEqual(@as(f64, 0), snapshot.start.x_px);
+    try testing.expectEqual(@as(f64, 0), snapshot.start.y_px);
+    try testing.expectEqual(@as(f64, 30), snapshot.end.x_px);
+    try testing.expectEqual(@as(f64, 20), snapshot.end.y_px);
+    try testing.expectEqualStrings(
+        "https://example.com/target",
+        target.?,
+    );
+    surface.freeSelectedText(target.?);
+
+    const selected = try surface.selectedText();
+    defer surface.freeSelectedText(selected);
+    try testing.expectEqualStrings("https://a", selected);
+
+    var cleared: SelectionSnapshot = undefined;
+    try surface.clearSelection(&cleared);
+    const xev = @import("../global.zig").xev;
+    var closed_wakeup = try xev.Async.init();
+    closed_wakeup.deinit();
+    surface.runtime.thread.wakeup = closed_wakeup;
+    surface.visible.store(true, .monotonic);
+    var wake_failed = false;
+    surface.selectLink(5, 25, &snapshot, &matched, &target) catch {
+        wake_failed = true;
+    };
+    try testing.expect(wake_failed);
+    try testing.expect(!matched);
+    try testing.expect(snapshot.active);
+    try testing.expect(target == null);
 }
 
 test "terminal surface selection endpoints preserve roles and allocation" {

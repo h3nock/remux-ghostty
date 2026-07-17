@@ -87,6 +87,17 @@ pub const Text = extern struct {
     text_len: usize,
 };
 
+fn emptyText() Text {
+    return .{
+        .tl_px_x = -1,
+        .tl_px_y = -1,
+        .offset_start = 0,
+        .offset_len = 0,
+        .text = null,
+        .text_len = 0,
+    };
+}
+
 fn configNew() Config {
     return .{};
 }
@@ -545,6 +556,40 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_select_link(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        out_snapshot_ptr: ?*SelectionSnapshot,
+        out_matched_ptr: ?*bool,
+        out_target_ptr: ?*Text,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out_snapshot = out_snapshot_ptr orelse return .invalid_input;
+        const out_matched = out_matched_ptr orelse return .invalid_input;
+        const out_target = out_target_ptr orelse return .invalid_input;
+
+        out_matched.* = false;
+        out_target.* = emptyText();
+        var target: ?[:0]const u8 = null;
+        value.core.selectLink(
+            x,
+            y,
+            out_snapshot,
+            out_matched,
+            &target,
+        ) catch |err| {
+            std.debug.assert(!out_matched.*);
+            std.debug.assert(target == null);
+            return operationError("select link", err);
+        };
+        if (target) |text| {
+            out_target.text = text.ptr;
+            out_target.text_len = text.len;
+        }
+        return .ok;
+    }
+
     export fn ghostty_terminal_surface_set_selection_endpoint(
         surface: ?*Surface,
         endpoint_raw: c_int,
@@ -676,14 +721,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
     ) InputResult {
         const value = surface orelse return .invalid_input;
         const out = out_ptr orelse return .invalid_input;
-        out.* = .{
-            .tl_px_x = -1,
-            .tl_px_y = -1,
-            .offset_start = 0,
-            .offset_len = 0,
-            .text = null,
-            .text_len = 0,
-        };
+        out.* = emptyText();
         const text = value.core.selectedText() catch |err| return switch (err) {
             error.NoSelection => .consumed_no_output,
             error.OutOfMemory => .out_of_memory,
@@ -701,14 +739,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         const text = text_ptr orelse return .invalid_input;
         const ptr = text.text orelse return .invalid_input;
         value.core.freeSelectedText(ptr[0..text.text_len :0]);
-        text.* = .{
-            .tl_px_x = -1,
-            .tl_px_y = -1,
-            .offset_start = 0,
-            .offset_len = 0,
-            .text = null,
-            .text_len = 0,
-        };
+        text.* = emptyText();
         return .consumed_no_output;
     }
 
@@ -740,6 +771,7 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_selection_snapshot"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_word"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_link"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_set_selection_endpoint"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_clear_selection"));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
@@ -901,11 +933,35 @@ test "terminal surface C selection validation" {
         .active = true,
     };
     var out = sentinel;
+    const target_sentinel: Text = .{
+        .tl_px_x = 1,
+        .tl_px_y = 2,
+        .offset_start = 3,
+        .offset_len = 4,
+        .text = @ptrFromInt(1),
+        .text_len = 5,
+    };
+    var matched = true;
+    var target = target_sentinel;
     try testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_selection_snapshot(null, &out),
     );
     try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_link(
+            null,
+            0,
+            0,
+            &out,
+            &matched,
+            &target,
+        ),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expect(matched);
+    try testing.expectEqualDeep(target_sentinel, target);
     try testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_select_word(null, 0, 0, &out),
@@ -937,6 +993,44 @@ test "terminal surface C selection validation" {
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_select_word(fake_surface, 0, 0, null),
     );
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_link(
+            fake_surface,
+            0,
+            0,
+            null,
+            &matched,
+            &target,
+        ),
+    );
+    try testing.expectEqualDeep(target_sentinel, target);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_link(
+            fake_surface,
+            0,
+            0,
+            &out,
+            null,
+            &target,
+        ),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqualDeep(target_sentinel, target);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_link(
+            fake_surface,
+            0,
+            0,
+            &out,
+            &matched,
+            null,
+        ),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expect(matched);
     try testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_set_selection_endpoint(

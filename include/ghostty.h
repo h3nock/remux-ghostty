@@ -1582,6 +1582,28 @@ ghostty_terminal_surface_select_word(
     double,
     ghostty_terminal_surface_selection_snapshot_s*);
 
+// Selects the configured or OSC 8 link at the point. A successful no-match
+// leaves the prior selection untouched, writes matched=false, and returns OK.
+// A match selects its exact visible span and writes matched=true. For OSC 8,
+// target contains the owned URI because it can differ from the selected text;
+// configured regex links leave target empty because their target is the
+// selected text. Release a non-NULL target exactly once with
+// ghostty_terminal_surface_free_text.
+//
+// With all required pointers valid, outputs are initialized on every return.
+// Invalid input and pre-commit failures leave matched=false and target empty.
+// Renderer notification can fail after the selection commits; that failure
+// also resets matched and target while snapshot still reports the committed
+// selection. Do not replay select_link: retry only terminal_changed.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_select_link(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_terminal_surface_selection_snapshot_s*,
+    bool*,
+    ghostty_text_s*);
+
 // Moves exactly one canonical endpoint. Crossing the other endpoint creates a
 // backwards selection without changing endpoint roles. With no active
 // selection this is invalid and writes an inactive snapshot.

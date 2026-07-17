@@ -2749,6 +2749,87 @@ pub fn selectionString(
     return text;
 }
 
+pub const HyperlinkSelection = struct {
+    selection: Selection,
+
+    /// Borrowed from page storage and valid only while the screen is locked
+    /// against mutation.
+    uri: []const u8,
+};
+
+const HyperlinkRef = struct {
+    page: *const Page,
+    entry: *const hyperlink.PageEntry,
+
+    fn init(pin: Pin) ?HyperlinkRef {
+        const page = pin.node.page();
+        const id = page.lookupHyperlink(pin.rowAndCell().cell) orelse
+            return null;
+        return .{
+            .page = page,
+            .entry = page.hyperlink_set.get(page.memory, id),
+        };
+    }
+
+    fn eql(self: HyperlinkRef, other: HyperlinkRef) bool {
+        return self.entry.eql(
+            self.page.memory,
+            other.entry,
+            other.page.memory,
+        );
+    }
+};
+
+/// Return the borrowed OSC 8 target at `pin` in constant time. The returned
+/// slice is valid only while the screen is locked against mutation.
+pub fn hyperlinkURI(self: *const Screen, pin: Pin) ?[]const u8 {
+    _ = self;
+    const link = HyperlinkRef.init(pin) orelse return null;
+    return link.entry.uri.slice(link.page.memory);
+}
+
+/// Return the contiguous OSC 8 hyperlink run containing `pin`.
+///
+/// Hyperlink identifiers are page-local, so equality is based on the decoded
+/// hyperlink identity and URI rather than the numeric page entry ID. The URI
+/// borrows page memory and must not escape synchronization around the screen.
+pub fn selectHyperlink(
+    self: *const Screen,
+    pin: Pin,
+) ?HyperlinkSelection {
+    _ = self;
+    const origin = HyperlinkRef.init(pin) orelse return null;
+
+    const start: Pin = start: {
+        var result = pin;
+        var it = pin.cellIterator(.left_up, null);
+        _ = it.next(); // Skip `pin` itself.
+        while (it.next()) |candidate| {
+            const candidate_link = HyperlinkRef.init(candidate) orelse break;
+            if (!origin.eql(candidate_link)) break;
+            result = candidate;
+        }
+        break :start result;
+    };
+
+    const end: Pin = end: {
+        var result = pin;
+        var it = pin.cellIterator(.right_down, null);
+        _ = it.next(); // Skip `pin` itself.
+        while (it.next()) |candidate| {
+            const candidate_link = HyperlinkRef.init(candidate) orelse break;
+            if (!origin.eql(candidate_link)) break;
+            result = candidate;
+        }
+        break :end result;
+    };
+
+    return .{
+        .selection = .init(start, end, false),
+        .uri = origin.entry.uri.slice(origin.page.memory),
+    };
+}
+
 pub const SelectLine = struct {
     /// The pin of some part of the line to select.
     pin: Pin,
@@ -10078,6 +10159,66 @@ test "Screen: hyperlink start/end" {
         const page = s.cursor.page_pin.node.page();
         try testing.expectEqual(0, page.hyperlink_set.count());
     }
+}
+
+test "Screen: selectHyperlink exact contiguous span" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
+    defer s.deinit();
+
+    try s.startHyperlink("https://example.com/target", null);
+    try s.testWriteString("abcdefg");
+    s.endHyperlink();
+    try s.testWriteString("x");
+
+    const match = s.selectHyperlink(s.pages.pin(.{ .active = .{
+        .x = 0,
+        .y = 1,
+    } }).?).?;
+    try testing.expectEqualStrings("https://example.com/target", match.uri);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, match.selection.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, match.selection.end()).?);
+
+    try testing.expect(s.selectHyperlink(s.pages.pin(.{ .active = .{
+        .x = 2,
+        .y = 1,
+    } }).?) == null);
+}
+
+test "Screen: selectHyperlink separates adjacent implicit links" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 8, .rows = 2, .max_scrollback = 0 });
+    defer s.deinit();
+
+    try s.startHyperlink("https://example.com/same", null);
+    try s.testWriteString("abc");
+    s.endHyperlink();
+    try s.startHyperlink("https://example.com/same", null);
+    try s.testWriteString("de");
+    s.endHyperlink();
+
+    const match = s.selectHyperlink(s.pages.pin(.{ .active = .{
+        .x = 3,
+        .y = 0,
+    } }).?).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, match.selection.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, match.selection.end()).?);
 }
 
 test "Screen: hyperlink accepts its current values" {
