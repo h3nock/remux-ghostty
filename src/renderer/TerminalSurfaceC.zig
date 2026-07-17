@@ -74,6 +74,10 @@ pub const InteractionState = extern struct {
     has_selection: bool,
 };
 
+pub const SelectionEndpoint = renderer.TerminalSurface.SelectionEndpoint;
+pub const SelectionRect = renderer.TerminalSurface.SelectionRect;
+pub const SelectionSnapshot = renderer.TerminalSurface.SelectionSnapshot;
+
 pub const Text = extern struct {
     tl_px_x: f64,
     tl_px_y: f64,
@@ -130,6 +134,10 @@ fn scrollRow(value: u64) ?usize {
     return std.math.cast(usize, value);
 }
 
+fn selectionEndpoint(raw: c_int) ?SelectionEndpoint {
+    return std.meta.intToEnum(SelectionEndpoint, raw) catch null;
+}
+
 fn interactionStateC(state: renderer.TerminalSurface.InteractionState) InteractionState {
     return .{
         .scrollbar = .{
@@ -180,6 +188,7 @@ fn surfaceDpi(config: Config) f32 {
 
 fn mapError(err: anyerror) Result {
     return switch (err) {
+        error.InvalidInput => .invalid_input,
         error.OutOfMemory => .out_of_memory,
         error.RendererAlreadyClaimed => .renderer_in_use,
         error.InvalidEnumTag,
@@ -512,6 +521,66 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_selection_snapshot(
+        surface: ?*Surface,
+        out_ptr: ?*SelectionSnapshot,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = value.core.selectionSnapshot();
+        return .ok;
+    }
+
+    export fn ghostty_terminal_surface_select_word(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        out_ptr: ?*SelectionSnapshot,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        value.core.selectWord(x, y, out) catch |err| {
+            return operationError("select word", err);
+        };
+        return .ok;
+    }
+
+    export fn ghostty_terminal_surface_set_selection_endpoint(
+        surface: ?*Surface,
+        endpoint_raw: c_int,
+        x: f64,
+        y: f64,
+        out_ptr: ?*SelectionSnapshot,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        const endpoint = selectionEndpoint(endpoint_raw) orelse {
+            out.* = value.core.selectionSnapshot();
+            return .invalid_input;
+        };
+        value.core.setSelectionEndpoint(
+            endpoint,
+            x,
+            y,
+            out,
+        ) catch |err| {
+            return operationError("set selection endpoint", err);
+        };
+        return .ok;
+    }
+
+    export fn ghostty_terminal_surface_clear_selection(
+        surface: ?*Surface,
+        out_ptr: ?*SelectionSnapshot,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        value.core.clearSelection(out) catch |err| {
+            return operationError("clear selection", err);
+        };
+        return .ok;
+    }
+
     /// Filter modifiers for native key translation. The original modifiers
     /// must still be passed in the subsequent key event.
     export fn ghostty_terminal_surface_key_translation_mods(
@@ -669,8 +738,13 @@ test "terminal surface C ABI matches ghostty header" {
 
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_input"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_selection_snapshot"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_word"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_set_selection_endpoint"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_clear_selection"));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
+    try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_selection_endpoint_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_action_renderer_health_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_input_mouse_state_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_input_mouse_button_e));
@@ -744,6 +818,11 @@ test "terminal surface C ABI matches ghostty header" {
         InteractionState,
         c.ghostty_terminal_surface_interaction_state_s,
     );
+    try expectStructLayout(SelectionRect, c.ghostty_terminal_surface_selection_rect_s);
+    try expectStructLayout(
+        SelectionSnapshot,
+        c.ghostty_terminal_surface_selection_snapshot_s,
+    );
     try expectStructLayout(Text, c.ghostty_text_s);
     try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
     try testing.expectEqual(
@@ -757,6 +836,14 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expectEqual(
         @as(c_int, @intFromEnum(ScrollRoute.remote_mouse)),
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_REMOTE_MOUSE),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(SelectionEndpoint.start)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SELECTION_ENDPOINT_START),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(SelectionEndpoint.end)),
+        @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SELECTION_ENDPOINT_END),
     );
 }
 
@@ -797,6 +884,72 @@ test "terminal surface C config update rejects a null surface" {
     try std.testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_update_config(null),
+    );
+}
+
+test "terminal surface C selection validation" {
+    const testing = std.testing;
+    try testing.expectEqual(SelectionEndpoint.start, selectionEndpoint(0).?);
+    try testing.expectEqual(SelectionEndpoint.end, selectionEndpoint(1).?);
+    try testing.expect(selectionEndpoint(-1) == null);
+    try testing.expect(selectionEndpoint(2) == null);
+    try testing.expectEqual(Result.invalid_input, mapError(error.InvalidInput));
+
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+    const sentinel: SelectionSnapshot = .{
+        .start = .{ .x_px = 1, .visible = true },
+        .active = true,
+    };
+    var out = sentinel;
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_selection_snapshot(null, &out),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_word(null, 0, 0, &out),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_set_selection_endpoint(
+            null,
+            0,
+            0,
+            0,
+            &out,
+        ),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_clear_selection(null, &out),
+    );
+    try testing.expectEqualDeep(sentinel, out);
+
+    const fake_surface: *CAPI.Surface = @ptrFromInt(@alignOf(CAPI.Surface));
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_selection_snapshot(fake_surface, null),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_select_word(fake_surface, 0, 0, null),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_set_selection_endpoint(
+            fake_surface,
+            0,
+            0,
+            0,
+            null,
+        ),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_clear_selection(fake_surface, null),
     );
 }
 

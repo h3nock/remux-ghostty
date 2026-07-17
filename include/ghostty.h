@@ -955,6 +955,37 @@ typedef struct {
   bool has_selection;
 } ghostty_terminal_surface_interaction_state_s;
 
+typedef enum {
+  GHOSTTY_TERMINAL_SURFACE_SELECTION_ENDPOINT_START = 0,
+  GHOSTTY_TERMINAL_SURFACE_SELECTION_ENDPOINT_END = 1,
+} ghostty_terminal_surface_selection_endpoint_e;
+
+// A point-in-time backing-pixel rectangle for one selected terminal cell.
+// Coordinates use the full surface's top-left origin and therefore include
+// surface padding. Fractional viewport scrolling is reflected in y_px. When
+// visible is true, the full unclipped cell rectangle intersects the terminal-
+// grid clip. When visible is false, all rectangle fields are zero.
+typedef struct {
+  double x_px;
+  double y_px;
+  uint32_t width_px;
+  uint32_t height_px;
+  bool visible;
+} ghostty_terminal_surface_selection_rect_s;
+
+// start and end preserve Ghostty's canonical endpoint roles. They are not
+// ordered by content position and are not swapped when a selection crosses
+// over. rectangle identifies canonical block-selection semantics. Geometry is
+// only a presentation snapshot: re-query after terminal output or reflow,
+// viewport or fractional-scroll changes, surface size/config changes, or an
+// active-screen change. No terminal/grid reference escapes this value.
+typedef struct {
+  ghostty_terminal_surface_selection_rect_s start;
+  ghostty_terminal_surface_selection_rect_s end;
+  bool active;
+  bool rectangle;
+} ghostty_terminal_surface_selection_snapshot_s;
+
 // Called synchronously from draw or asynchronously from renderer/GPU completion
 // work. The callback must be thread-safe and may only record the value or signal
 // other work. It must not call any ghostty_terminal_surface_* function. Userdata
@@ -1520,6 +1551,54 @@ ghostty_terminal_surface_scroll_to_position(
     uint64_t,
     double,
     ghostty_terminal_surface_interaction_state_s*);
+
+// Returns the current canonical selection and endpoint geometry without
+// changing terminal state or waking the renderer.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_selection_snapshot(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_selection_snapshot_s*);
+
+// The following local selection operations never route through terminal mouse
+// reporting and never invoke write_cb. Points are finite backing-pixel surface
+// coordinates. Points outside [0, width) x [0, height) are invalid; points in
+// padding use the surface's existing padding-to-grid conversion.
+//
+// With a valid surface and output pointer, the output is written on every
+// return, including invalid points, allocation failure, and renderer wake
+// failure. A wake failure occurs after the reported mutation was committed.
+// Do not replay that mutation: retry only
+// ghostty_terminal_surface_terminal_changed. A NULL surface or output pointer
+// is invalid and cannot provide an output snapshot.
+
+// Selects the canonical Ghostty word at the point. Words are consecutive runs
+// of boundary or non-boundary characters, so whitespace runs are selectable.
+// A valid unwritten cell clears any prior selection and succeeds with
+// active=false.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_select_word(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_terminal_surface_selection_snapshot_s*);
+
+// Moves exactly one canonical endpoint. Crossing the other endpoint creates a
+// backwards selection without changing endpoint roles. With no active
+// selection this is invalid and writes an inactive snapshot.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_set_selection_endpoint(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_selection_endpoint_e,
+    double,
+    double,
+    ghostty_terminal_surface_selection_snapshot_s*);
+
+// Clears the canonical selection. Clearing an inactive selection is a
+// side-effect-free success and does not wake the renderer.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_clear_selection(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_selection_snapshot_s*);
 
 // Filter modifiers for native text translation. Pass the original unfiltered
 // modifiers in the following key event.
