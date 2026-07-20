@@ -59,6 +59,13 @@ pub const InputResult = enum(c_int) {
     out_of_memory,
 };
 
+/// Scheme-less loopback host:port spans (`127.0.0.1:8000`, `localhost:5173`)
+/// are selectable link targets on retained terminal surfaces. The configured
+/// URL regex requires a scheme or a slash, so without this supplement word
+/// selection splits such spans at the colon.
+pub const loopback_host_port_regex =
+    "(?<![\\w.\\-])(?:localhost|127(?:\\.\\d{1,3}){3}|0\\.0\\.0\\.0|\\[::1\\]):\\d{1,5}(?!\\d)(?:/[\\w\\-.~:/?#@!$&*+;=%]*)?";
+
 const InteractionConfig = struct {
     word_chars: []const u21,
     click_repeat_interval: u64,
@@ -75,13 +82,24 @@ const InteractionConfig = struct {
         );
         errdefer alloc.free(word_chars);
 
+        // Configured links come first so schemed URL matches keep precedence
+        // over the loopback supplement.
+        var link_items: std.ArrayList(input.Link) = .empty;
+        defer link_items.deinit(alloc);
+        try link_items.appendSlice(alloc, config.link.links.items);
+        try link_items.append(alloc, .{
+            .regex = loopback_host_port_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .always = {} },
+        });
+
         return .{
             .word_chars = word_chars,
             .click_repeat_interval = @as(u64, config.@"click-repeat-interval") * 1_000_000,
             .scroll_multiplier = config.@"mouse-scroll-multiplier",
             .links = try renderer_link.Set.fromConfig(
                 alloc,
-                config.link.links.items,
+                link_items.items,
             ),
         };
     }
@@ -2508,6 +2526,41 @@ test "terminal surface link selection preserves no-match and target ownership" {
     );
     surface.alloc = surface_alloc;
     try testing.expectEqualDeep(before, snapshot);
+    try testing.expect(!matched);
+    try testing.expect(target == null);
+}
+
+test "terminal surface selects scheme-less loopback host:port spans" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 26,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size.screen.width = 260;
+
+    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+        .regex = loopback_host_port_regex,
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }});
+    defer links.deinit(testing.allocator);
+    surface.interaction_config.links = links;
+
+    testFeed(shared, "srv on 127.0.0.1:8000, ok");
+    var snapshot: SelectionSnapshot = undefined;
+    var matched: bool = undefined;
+    var target: ?[:0]const u8 = undefined;
+    try surface.selectLink(125, 10, &snapshot, &matched, &target);
+    try testing.expect(matched);
+    try testing.expect(target == null);
+    const selected = try surface.selectedText();
+    defer surface.freeSelectedText(selected);
+    try testing.expectEqualStrings("127.0.0.1:8000", selected);
+
+    // Text after the span stays ordinary; the comma is not over-captured.
+    try surface.selectLink(235, 10, &snapshot, &matched, &target);
     try testing.expect(!matched);
     try testing.expect(target == null);
 }
