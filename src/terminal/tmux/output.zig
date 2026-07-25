@@ -178,6 +178,8 @@ pub const Variable = enum {
     /// Layout currently visible to the client. This equals window_layout when
     /// unzoomed and contains the zoomed pane at full size when zoomed.
     window_visible_layout,
+    /// The tmux-managed window name, whether automatic or explicitly set.
+    window_name,
     /// Pane wrap flag.
     wrap_flag,
 
@@ -233,6 +235,7 @@ pub const Variable = enum {
             .version,
             .window_layout,
             .window_visible_layout,
+            .window_name,
             => value,
         };
     }
@@ -279,6 +282,7 @@ pub const Variable = enum {
             .version,
             .window_layout,
             .window_visible_layout,
+            .window_name,
             => []const u8,
         };
     }

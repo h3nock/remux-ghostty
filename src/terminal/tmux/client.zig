@@ -543,7 +543,7 @@ test "control client sends startup commands before either response" {
     try testing.expectEqual(0, actions.records.items.len);
     try testing.expectEqualStrings(
         "display-message -p '#{version}'\n" ++
-            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
         client.outboundBytes(),
     );
 }
@@ -565,7 +565,7 @@ test "control client reports initial size between version and topology" {
     try testing.expectEqualStrings(
         "display-message -p '#{version}'\n" ++
             "refresh-client -C 117x41\n" ++
-            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
         client.outboundBytes(),
     );
     try testing.expectEqual(3, client.viewer.sent_command_count);
@@ -674,7 +674,7 @@ test "control client hydrates as one group and keeps later command independent" 
         1,
         "list-panes -s",
     ));
-    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n"));
+    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n"));
 }
 
 test "control client close notifications produce no outbound work" {

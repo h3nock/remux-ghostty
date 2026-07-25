@@ -335,6 +335,7 @@ pub const Viewer = struct {
 
     pub const Window = struct {
         id: usize,
+        name: []const u8,
         width: usize,
         height: usize,
         is_zoomed: bool,
@@ -345,6 +346,7 @@ pub const Viewer = struct {
         visible_layout: Layout,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
+            if (self.name.len > 0) alloc.free(self.name);
             self.layout_arena.promote(alloc).deinit();
         }
     };
@@ -697,6 +699,16 @@ pub const Viewer = struct {
                 self.singleAction(.{ .windows = self.windows.items })
             else
                 &.{},
+            .window_renamed => |info| {
+                const changed = self.windowRenamed(info.id, info.name) catch {
+                    log.warn("failed to retain window name, becoming defunct", .{});
+                    return self.defunct();
+                };
+                return if (changed)
+                    self.singleAction(.{ .windows = self.windows.items })
+                else
+                    &.{};
+            },
             else => {},
         }
 
@@ -722,6 +734,7 @@ pub const Viewer = struct {
             .output,
             .window_pane_changed,
             .session_window_changed,
+            .window_renamed,
             => unreachable,
 
             // Session changed means we switched to a different tmux session.
@@ -790,8 +803,8 @@ pub const Viewer = struct {
             // care.
             .sessions_changed => {},
 
-            // We don't use window names for anything, currently.
-            .window_renamed => {},
+            // This window is not linked to our current session.
+            .unlinked_window_renamed => {},
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
@@ -840,6 +853,26 @@ pub const Viewer = struct {
             changed = true;
         }
         return changed;
+    }
+
+    fn windowRenamed(
+        self: *Viewer,
+        window_id: usize,
+        name: []const u8,
+    ) Allocator.Error!bool {
+        for (self.windows.items) |*window| {
+            if (window.id != window_id) continue;
+            if (std.mem.eql(u8, window.name, name)) return false;
+
+            const retained: []const u8 = if (name.len == 0)
+                ""
+            else
+                try self.alloc.dupe(u8, name);
+            if (window.name.len > 0) self.alloc.free(window.name);
+            window.name = retained;
+            return true;
+        }
+        return false;
     }
 
     fn nextCommandCompletion(
@@ -1259,10 +1292,27 @@ pub const Viewer = struct {
 
             .pane_refresh_state => |id| try self.receivedPaneState(id, content),
 
-            .list_windows => try self.receivedListWindows(
+            .list_windows => self.receivedListWindows(
                 arena_alloc,
                 actions,
                 content,
+                .with_names,
+            ) catch |err| switch (err) {
+                error.InvalidWindowRecord => {
+                    log.warn(
+                        "window names are not line-safe; retrying authoritative topology without names",
+                        .{},
+                    );
+                    try self.queueCommands(&.{.list_windows_topology});
+                },
+                else => return err,
+            },
+
+            .list_windows_topology => try self.receivedListWindows(
+                arena_alloc,
+                actions,
+                content,
+                .topology_only,
             ),
 
             .pane_history => |capture| try self.receivedPaneHistory(capture.id, content),
@@ -1348,11 +1398,88 @@ pub const Viewer = struct {
         return .{ .major = major, .minor = minor };
     }
 
+    const WindowListMode = enum {
+        with_names,
+        topology_only,
+    };
+
+    const WindowListData = struct {
+        session_id: usize,
+        window_id: usize,
+        window_active: bool,
+        pane_id: usize,
+        window_width: usize,
+        window_height: usize,
+        window_layout: []const u8,
+        window_visible_layout: []const u8,
+        window_name: []const u8,
+    };
+
+    fn parseWindowTopology(
+        line: []const u8,
+    ) error{InvalidWindowRecord}!WindowListData {
+        const data = output.parseFormatStruct(
+            Format.list_windows_topology.Struct(),
+            line,
+            Format.list_windows_topology.delim,
+        ) catch return error.InvalidWindowRecord;
+        return .{
+            .session_id = data.session_id,
+            .window_id = data.window_id,
+            .window_active = data.window_active,
+            .pane_id = data.pane_id,
+            .window_width = data.window_width,
+            .window_height = data.window_height,
+            .window_layout = data.window_layout,
+            .window_visible_layout = data.window_visible_layout,
+            .window_name = "",
+        };
+    }
+
+    fn parseWindowListLine(
+        line: []const u8,
+        mode: WindowListMode,
+    ) error{InvalidWindowRecord}!WindowListData {
+        if (mode == .topology_only) return parseWindowTopology(line);
+
+        var field_start: usize = 0;
+        var prefix_end: ?usize = null;
+        for (0..Format.list_windows_topology.vars.len) |field_index| {
+            const relative = std.mem.indexOfScalar(
+                u8,
+                line[field_start..],
+                Format.list_windows.delim,
+            ) orelse break;
+            const delimiter_index = field_start + relative;
+            if (field_index + 1 == Format.list_windows_topology.vars.len) {
+                prefix_end = delimiter_index;
+                break;
+            }
+            field_start = delimiter_index + 1;
+        }
+
+        // Accept the old topology-only shape as an empty name. This is useful
+        // for callers replaying captured output while the live command always
+        // includes the final window_name field.
+        const end = prefix_end orelse return parseWindowTopology(line);
+        var data = try parseWindowTopology(line[0..end]);
+        data.window_name = line[end + 1 ..];
+        return data;
+    }
+
+    fn existingWindowName(self: *const Viewer, window_id: usize) []const u8 {
+        for (self.windows.items) |window| {
+            if (window.id == window_id) return window.name;
+        }
+        return "";
+    }
+
     fn receivedListWindows(
         self: *Viewer,
         arena_alloc: Allocator,
         actions: *std.ArrayList(Action),
         content: []const u8,
+        mode: WindowListMode,
     ) !void {
         // Reserve the action before mutating our model so a failure can't
         // publish new state without its corresponding notification.
@@ -1360,18 +1487,20 @@ pub const Viewer = struct {
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
-        defer windows.deinit(self.alloc);
+        var owns_windows = true;
+        defer {
+            if (owns_windows) {
+                for (windows.items) |*window| window.deinit(self.alloc);
+            }
+            windows.deinit(self.alloc);
+        }
 
         // Parse all our windows
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \t\r");
+            const line = std.mem.trimRight(u8, line_raw, "\r");
             if (line.len == 0) continue;
-            const data = output.parseFormatStruct(
-                Format.list_windows.Struct(),
-                line,
-                Format.list_windows.delim,
-            ) catch |err| {
+            const data = parseWindowListLine(line, mode) catch |err| {
                 log.info("failed to parse list-windows line: {s}", .{line});
                 return err;
             };
@@ -1409,8 +1538,19 @@ pub const Viewer = struct {
             else
                 layout;
 
+            const name_source = if (mode == .with_names)
+                data.window_name
+            else
+                self.existingWindowName(data.window_id);
+            const name: []const u8 = if (name_source.len == 0)
+                ""
+            else
+                try self.alloc.dupe(u8, name_source);
+            errdefer if (name.len > 0) self.alloc.free(name);
+
             try windows.append(self.alloc, .{
                 .id = data.window_id,
+                .name = name,
                 .width = data.window_width,
                 .height = data.window_height,
                 .is_zoomed = is_zoomed,
@@ -1424,6 +1564,7 @@ pub const Viewer = struct {
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
+        owns_windows = false;
 
         // A complete list-windows response is the authoritative topology cut.
         // Carries not claimed by one of its panes cannot belong to this
@@ -2070,6 +2211,13 @@ const Command = union(enum) {
     /// List all windows so we can sync our window state.
     list_windows,
 
+    /// Topology-only fallback when a tmux name cannot be represented by the
+    /// newline-delimited list-windows output.
+    /// Retry authoritative topology without names when a rich window record
+    /// is not line-safe. While such a name remains, each later full topology
+    /// refresh retries the rich command before taking this fallback.
+    list_windows_topology,
+
     /// Capture history for the given pane ID.
     pane_history: CaptureHistory,
 
@@ -2109,6 +2257,7 @@ const Command = union(enum) {
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
+            .list_windows_topology,
             .pane_history,
             .pane_saved_visible,
             .pane_visible,
@@ -2131,7 +2280,12 @@ const Command = union(enum) {
             .pane_visible,
             .pane_pending,
             => true,
-            .list_windows, .tmux_version, .client_size, .user => false,
+            .list_windows,
+            .list_windows_topology,
+            .tmux_version,
+            .client_size,
+            .user,
+            => false,
         };
     }
 
@@ -2144,6 +2298,11 @@ const Command = union(enum) {
             .list_windows => try writer.writeAll(std.fmt.comptimePrint(
                 "list-windows -F '{s}'",
                 .{comptime Format.list_windows.comptimeFormat()},
+            )),
+
+            .list_windows_topology => try writer.writeAll(std.fmt.comptimePrint(
+                "list-windows -F '{s}'",
+                .{comptime Format.list_windows_topology.comptimeFormat()},
             )),
 
             .pane_history => |capture| {
@@ -2272,7 +2431,13 @@ const Format = struct {
             .window_height,
             .window_layout,
             .window_visible_layout,
+            .window_name,
         },
+    };
+
+    const list_windows_topology: Format = .{
+        .delim = ' ',
+        .vars = Format.list_windows.vars[0 .. Format.list_windows.vars.len - 1],
     };
 
     const tmux_version: Format = .{
@@ -2493,6 +2658,70 @@ test "minimum tmux version" {
     try testing.expect(!Viewer.supportsTmuxVersion("unknown"));
 }
 
+test "list-windows parses the complete final window name" {
+    const prefix =
+        "$42 @7 1 %3 83 44 b7dd,83x44,0,0,3 b7dd,83x44,0,0,3";
+
+    const named = try Viewer.parseWindowListLine(
+        prefix ++ " editor window",
+        .with_names,
+    );
+    try testing.expectEqual(42, named.session_id);
+    try testing.expectEqual(7, named.window_id);
+    try testing.expectEqualStrings("editor window", named.window_name);
+
+    const padded = try Viewer.parseWindowListLine(
+        prefix ++ "  padded name  ",
+        .with_names,
+    );
+    try testing.expectEqualStrings(" padded name  ", padded.window_name);
+
+    const empty = try Viewer.parseWindowListLine(
+        prefix ++ " ",
+        .with_names,
+    );
+    try testing.expectEqualStrings("", empty.window_name);
+
+    const escaped_control = try Viewer.parseWindowListLine(
+        prefix ++ " a\\001b",
+        .with_names,
+    );
+    try testing.expectEqualStrings("a\\001b", escaped_control.window_name);
+
+    const escaped_sequence = try Viewer.parseWindowListLine(
+        prefix ++ " e\\033]x",
+        .with_names,
+    );
+    try testing.expectEqualStrings("e\\033]x", escaped_sequence.window_name);
+
+    const escaped_invalid = try Viewer.parseWindowListLine(
+        prefix ++ " f\\377g",
+        .with_names,
+    );
+    try testing.expectEqualStrings("f\\377g", escaped_invalid.window_name);
+
+    const raw_tab = try Viewer.parseWindowListLine(
+        prefix ++ " tab\tname",
+        .with_names,
+    );
+    try testing.expectEqualStrings("tab\tname", raw_tab.window_name);
+
+    const legacy = try Viewer.parseWindowListLine(prefix, .with_names);
+    try testing.expectEqualStrings("", legacy.window_name);
+}
+
+test "list-windows command requests the standard tmux window name" {
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    const command: Command = .list_windows;
+    try command.formatCommand(&builder.writer);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        builder.writer.buffered(),
+        " #{window_name}'",
+    ));
+}
+
 test "pane state query excludes aggregate tmux mouse flag" {
     for ([_]output.Variable{
         .mouse_all_flag,
@@ -2614,6 +2843,7 @@ test "active topology creates configured pane terminals" {
             arena.allocator(),
             &actions,
             topology,
+            .with_names,
         );
         try testing.expectEqual(1, actions.items.len);
         try testing.expect(actions.items[0] == .windows);
@@ -2702,6 +2932,7 @@ test "active topology creates configured pane terminals" {
             arena.allocator(),
             &actions,
             topology,
+            .with_names,
         );
         try testing.expectEqual(1, actions.items.len);
     }
@@ -3713,8 +3944,8 @@ fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
     viewer.state = .command_queue;
     viewer.session_id = 42;
     const initial_topology =
-        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1
+        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 zero
+        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1 one
     ;
     {
         var arena = viewer.action_arena.promote(viewer.alloc);
@@ -3724,10 +3955,84 @@ fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
             arena.allocator(),
             &actions,
             initial_topology,
+            .with_names,
         );
     }
     viewer.command_queue.clear();
     viewer.sent_command_count = 0;
+}
+
+test "window rename replaces the owned name and publishes topology" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    var actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "editor window",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqualStrings("editor window", viewer.windows.items[0].name);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "editor window",
+    } } });
+    try testing.expectEqual(0, actions.len);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expectEqualStrings("", viewer.windows.items[0].name);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 99,
+        .name = "unknown",
+    } } });
+    try testing.expectEqual(0, actions.len);
+}
+
+test "invalid named snapshot retries topology without publishing a partial cut" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    try viewer.queueCommands(&.{.list_windows});
+    {
+        var arena = viewer.action_arena.promote(viewer.alloc);
+        defer viewer.action_arena = arena.state;
+        var queued_actions: std.ArrayList(Viewer.Action) = .empty;
+        try viewer.appendQueuedCommandActionsWithAllocator(
+            &queued_actions,
+            arena.allocator(),
+        );
+    }
+
+    const rich =
+        "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 " ++
+        "b7dd,83x44,0,0,0 first\nname continuation";
+    var actions = viewer.next(.{ .command_complete = .{ .success = rich } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .command);
+    try testing.expectEqual(2, viewer.windows.items.len);
+    try testing.expectEqualStrings("zero", viewer.windows.items[0].name);
+    try testing.expectEqualStrings("one", viewer.windows.items[1].name);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        actions[0].command.members[0],
+        "#{window_name}",
+    ) == null);
+
+    const topology =
+        "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0";
+    actions = viewer.next(.{ .command_complete = .{ .success = topology } });
+    try testing.expect(actions.len >= 1);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqual(1, viewer.windows.items.len);
+    try testing.expectEqualStrings("zero", viewer.windows.items[0].name);
 }
 
 test "window_close from another session does not change current topology" {

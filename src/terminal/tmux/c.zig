@@ -81,6 +81,7 @@ pub const WindowRecord = extern struct {
     width: usize,
     height: usize,
     active_pane_id: u64,
+    name: Bytes,
 };
 
 pub const PaneRecord = extern struct {
@@ -464,6 +465,7 @@ export fn ghostty_tmux_topology_visit(
                 .width = window.width,
                 .height = window.height,
                 .active_pane_id = @intCast(window.active_pane_id),
+                .name = .fromSlice(window.name),
             } },
         };
         visitor(userdata, &record);
@@ -987,7 +989,7 @@ test "tmux C client initial size and structured exits" {
         try testing.expectEqualStrings(
             "display-message -p '#{version}'\n" ++
                 "refresh-client -C 117x41\n" ++
-                "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+                "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
             try outbound.slice(),
         );
         try feedTest(
@@ -1188,7 +1190,7 @@ test "tmux C client topology and retained terminal lifetime" {
         &client,
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$42 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]\n" ++
+            "$42 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] editor window\n" ++
             "%end 3 3 1\n",
     );
 
@@ -1203,6 +1205,7 @@ test "tmux C client topology and retained terminal lifetime" {
     try testing.expectEqual(83, window.width);
     try testing.expectEqual(44, window.height);
     try testing.expectEqual(0, window.active_pane_id);
+    try testing.expectEqualStrings("editor window", try window.name.slice());
 
     try testing.expectEqual(TopologyRecordTag.pane, context.records[1].tag);
     const first = context.records[1].value.pane;
