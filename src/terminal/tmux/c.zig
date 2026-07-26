@@ -81,6 +81,7 @@ pub const WindowRecord = extern struct {
     width: usize,
     height: usize,
     active_pane_id: u64,
+    name: Bytes,
 };
 
 pub const PaneRecord = extern struct {
@@ -464,6 +465,7 @@ export fn ghostty_tmux_topology_visit(
                 .width = window.width,
                 .height = window.height,
                 .active_pane_id = @intCast(window.active_pane_id),
+                .name = .fromSlice(window.name),
             } },
         };
         visitor(userdata, &record);
@@ -681,7 +683,7 @@ fn openPaneTestClient(client: *Client) !void {
         client,
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
             "%end 3 3 1\n",
     );
     try consumeAllTest(client);
@@ -830,16 +832,7 @@ test "tmux C client config and invalid boundaries" {
     );
     try testing.expect(terminal == null);
 
-    try feedTest(
-        client,
-        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
-    );
-    try consumeAllTest(client);
-    try feedTest(
-        client,
-        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
-            "%begin 3 3 1\n%end 3 3 1\n",
-    );
+    try openPaneTestClient(client);
     try testing.expectEqual(
         Result.invalid_command,
         ghostty_tmux_client_enqueue_command(client, .{}, &token),
@@ -878,13 +871,26 @@ test "tmux C client transport batching and callback contract" {
     try feedTest(
         &client,
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
-            "%begin 3 3 1\n%end 3 3 1\n",
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
+            "%end 3 3 1\n",
     );
     try testing.expectEqual(1, context.topology_count);
     try testing.expectEqualStrings("main", context.session_name[0..context.session_name_len]);
     try testing.expectEqual(Result.callback_active, context.callback_consume_result);
     try testing.expectEqual(Result.callback_active, context.callback_free_result);
     try testing.expectEqual(Result.ok, context.callback_enqueue_result);
+
+    try consumeAllTest(&client);
+    try feedTest(
+        &client,
+        "%begin 4 4 1\ncallback\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n" ++
+            "%begin 9 9 1\n%end 9 9 1\n",
+    );
 
     var one: u64 = undefined;
     var two: u64 = undefined;
@@ -900,8 +906,7 @@ test "tmux C client transport batching and callback contract" {
     ));
     try testing.expectEqual(Result.ok, ghostty_tmux_client_outbound(&client, &outbound));
     try testing.expectEqualStrings(
-        "display-message -p callback\n" ++
-            "display-message -p one\n" ++
+        "display-message -p one\n" ++
             "display-message -p two\n",
         try outbound.slice(),
     );
@@ -909,9 +914,8 @@ test "tmux C client transport batching and callback contract" {
 
     try feedTest(
         &client,
-        "%begin 4 4 1\ncallback\n%end 4 4 1\n" ++
-            "%begin 5 5 1\none\n%end 5 5 1\n" ++
-            "%begin 6 6 1\ntwo\n%end 6 6 1\n",
+        "%begin 10 10 1\none\n%end 10 10 1\n" ++
+            "%begin 11 11 1\ntwo\n%end 11 11 1\n",
     );
     try testing.expectEqual(3, context.completion_count);
     try testing.expectEqual(context.callback_token, context.completions[0].token);
@@ -946,10 +950,10 @@ test "tmux C client transport batching and callback contract" {
     context.completion_count = 0;
     try feedTest(
         &client,
-        "%begin 7 7 1\n%end 7 7 1\n" ++
-            "%begin 8 8 1\nfailed\n%error 8 8 1\n" ++
-            "%begin 9 9 1\n%end 9 9 1\n" ++
-            "%begin 10 10 1\nlater\n%end 10 10 1\n",
+        "%begin 12 12 1\n%end 12 12 1\n" ++
+            "%begin 13 13 1\nfailed\n%error 13 13 1\n" ++
+            "%begin 14 14 1\n%end 14 14 1\n" ++
+            "%begin 15 15 1\nlater\n%end 15 15 1\n",
     );
     try testing.expectEqual(4, context.completion_count);
     try testing.expectEqual(CommandStatus.success, context.completions[0].status);
@@ -987,7 +991,7 @@ test "tmux C client initial size and structured exits" {
         try testing.expectEqualStrings(
             "display-message -p '#{version}'\n" ++
                 "refresh-client -C 117x41\n" ++
-                "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+                "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
             try outbound.slice(),
         );
         try feedTest(
@@ -1188,7 +1192,7 @@ test "tmux C client topology and retained terminal lifetime" {
         &client,
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$42 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]\n" ++
+            "$42 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] editor window\n" ++
             "%end 3 3 1\n",
     );
 
@@ -1203,6 +1207,7 @@ test "tmux C client topology and retained terminal lifetime" {
     try testing.expectEqual(83, window.width);
     try testing.expectEqual(44, window.height);
     try testing.expectEqual(0, window.active_pane_id);
+    try testing.expectEqualStrings("editor window", try window.name.slice());
 
     try testing.expectEqual(TopologyRecordTag.pane, context.records[1].tag);
     const first = context.records[1].value.pane;

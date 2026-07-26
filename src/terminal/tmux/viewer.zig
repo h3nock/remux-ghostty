@@ -335,6 +335,7 @@ pub const Viewer = struct {
 
     pub const Window = struct {
         id: usize,
+        name: []const u8,
         width: usize,
         height: usize,
         is_zoomed: bool,
@@ -345,6 +346,7 @@ pub const Viewer = struct {
         visible_layout: Layout,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
+            if (self.name.len > 0) alloc.free(self.name);
             self.layout_arena.promote(alloc).deinit();
         }
     };
@@ -697,6 +699,16 @@ pub const Viewer = struct {
                 self.singleAction(.{ .windows = self.windows.items })
             else
                 &.{},
+            .window_renamed => |info| {
+                const changed = self.windowRenamed(info.id, info.name) catch {
+                    log.warn("failed to retain window name, becoming defunct", .{});
+                    return self.defunct();
+                };
+                return if (changed)
+                    self.singleAction(.{ .windows = self.windows.items })
+                else
+                    &.{};
+            },
             else => {},
         }
 
@@ -722,6 +734,7 @@ pub const Viewer = struct {
             .output,
             .window_pane_changed,
             .session_window_changed,
+            .window_renamed,
             => unreachable,
 
             // Session changed means we switched to a different tmux session.
@@ -790,8 +803,8 @@ pub const Viewer = struct {
             // care.
             .sessions_changed => {},
 
-            // We don't use window names for anything, currently.
-            .window_renamed => {},
+            // This window is not linked to our current session.
+            .unlinked_window_renamed => {},
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
@@ -840,6 +853,26 @@ pub const Viewer = struct {
             changed = true;
         }
         return changed;
+    }
+
+    fn windowRenamed(
+        self: *Viewer,
+        window_id: usize,
+        name: []const u8,
+    ) Allocator.Error!bool {
+        for (self.windows.items) |*window| {
+            if (window.id != window_id) continue;
+            if (std.mem.eql(u8, window.name, name)) return false;
+
+            const retained: []const u8 = if (name.len == 0)
+                ""
+            else
+                try self.alloc.dupe(u8, name);
+            if (window.name.len > 0) self.alloc.free(window.name);
+            window.name = retained;
+            return true;
+        }
+        return false;
     }
 
     fn nextCommandCompletion(
@@ -1348,6 +1381,64 @@ pub const Viewer = struct {
         return .{ .major = major, .minor = minor };
     }
 
+    const WindowListData = struct {
+        session_id: usize,
+        window_id: usize,
+        window_active: bool,
+        pane_id: usize,
+        window_width: usize,
+        window_height: usize,
+        window_layout: []const u8,
+        window_visible_layout: []const u8,
+        window_name: []const u8,
+    };
+
+    fn parseWindowListPrefix(
+        line: []const u8,
+    ) error{InvalidWindowRecord}!WindowListData {
+        const data = output.parseFormatStruct(
+            Format.list_windows_prefix.Struct(),
+            line,
+            Format.list_windows_prefix.delim,
+        ) catch return error.InvalidWindowRecord;
+        return .{
+            .session_id = data.session_id,
+            .window_id = data.window_id,
+            .window_active = data.window_active,
+            .pane_id = data.pane_id,
+            .window_width = data.window_width,
+            .window_height = data.window_height,
+            .window_layout = data.window_layout,
+            .window_visible_layout = data.window_visible_layout,
+            .window_name = "",
+        };
+    }
+
+    fn parseWindowListLine(
+        line: []const u8,
+    ) error{InvalidWindowRecord}!WindowListData {
+        var field_start: usize = 0;
+        var prefix_end: ?usize = null;
+        for (0..Format.list_windows_prefix.vars.len) |field_index| {
+            const relative = std.mem.indexOfScalar(
+                u8,
+                line[field_start..],
+                Format.list_windows.delim,
+            ) orelse break;
+            const delimiter_index = field_start + relative;
+            if (field_index + 1 == Format.list_windows_prefix.vars.len) {
+                prefix_end = delimiter_index;
+                break;
+            }
+            field_start = delimiter_index + 1;
+        }
+
+        const end = prefix_end orelse return error.InvalidWindowRecord;
+        var data = try parseWindowListPrefix(line[0..end]);
+        data.window_name = line[end + 1 ..];
+        return data;
+    }
+
     fn receivedListWindows(
         self: *Viewer,
         arena_alloc: Allocator,
@@ -1360,70 +1451,50 @@ pub const Viewer = struct {
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
-        defer windows.deinit(self.alloc);
+        var owns_windows = true;
+        defer {
+            if (owns_windows) {
+                for (windows.items) |*window| window.deinit(self.alloc);
+            }
+            windows.deinit(self.alloc);
+        }
 
-        // Parse all our windows
+        var pending: ?WindowListData = null;
+        var pending_name: std.ArrayList(u8) = .empty;
+        defer pending_name.deinit(self.alloc);
+
+        // The name is the final field and may contain newlines. A line that
+        // is not a complete record therefore continues the preceding name.
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \t\r");
-            if (line.len == 0) continue;
-            const data = output.parseFormatStruct(
-                Format.list_windows.Struct(),
-                line,
-                Format.list_windows.delim,
-            ) catch |err| {
-                log.info("failed to parse list-windows line: {s}", .{line});
-                return err;
-            };
-
-            // Parse the layout
-            var arena: ArenaAllocator = .init(self.alloc);
-            errdefer arena.deinit();
-            const window_alloc = arena.allocator();
-            const layout: Layout = Layout.parseWithChecksum(
-                window_alloc,
-                data.window_layout,
-            ) catch |err| {
-                log.info(
-                    "failed to parse window layout id={} layout={s}",
-                    .{ data.window_id, data.window_layout },
-                );
-                return err;
-            };
-            const is_zoomed = !std.mem.eql(
-                u8,
-                data.window_layout,
-                data.window_visible_layout,
-            );
-            const visible_layout: Layout = if (is_zoomed)
-                Layout.parseWithChecksum(
-                    window_alloc,
-                    data.window_visible_layout,
-                ) catch |err| {
-                    log.info(
-                        "failed to parse visible window layout id={} layout={s}",
-                        .{ data.window_id, data.window_visible_layout },
-                    );
-                    return err;
+            const line = std.mem.trimRight(u8, line_raw, "\r");
+            const data = parseWindowListLine(line) catch {
+                if (pending == null) {
+                    log.info("list-windows response does not begin with a record", .{});
+                    return error.InvalidWindowRecord;
                 }
-            else
-                layout;
+                try pending_name.append(self.alloc, '\n');
+                try pending_name.appendSlice(self.alloc, line);
+                continue;
+            };
 
-            try windows.append(self.alloc, .{
-                .id = data.window_id,
-                .width = data.window_width,
-                .height = data.window_height,
-                .is_zoomed = is_zoomed,
-                .is_active = data.window_active,
-                .active_pane_id = data.pane_id,
-                .layout_arena = arena.state,
-                .layout = layout,
-                .visible_layout = visible_layout,
-            });
+            if (pending) |previous| {
+                try self.appendWindowListRecord(
+                    &windows,
+                    previous,
+                    &pending_name,
+                );
+            }
+            pending = data;
+            try pending_name.appendSlice(self.alloc, data.window_name);
         }
+
+        const final = pending orelse return error.InvalidWindowRecord;
+        try self.appendWindowListRecord(&windows, final, &pending_name);
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
+        owns_windows = false;
 
         // A complete list-windows response is the authoritative topology cut.
         // Carries not claimed by one of its panes cannot belong to this
@@ -1433,6 +1504,64 @@ pub const Viewer = struct {
         // Publish the Viewer-owned slice. `windows` is temporary and its
         // backing allocation is freed when this function returns.
         actions.appendAssumeCapacity(.{ .windows = self.windows.items });
+    }
+
+    fn appendWindowListRecord(
+        self: *Viewer,
+        windows: *std.ArrayList(Window),
+        data: WindowListData,
+        pending_name: *std.ArrayList(u8),
+    ) !void {
+        var arena: ArenaAllocator = .init(self.alloc);
+        errdefer arena.deinit();
+        const window_alloc = arena.allocator();
+        const layout: Layout = Layout.parseWithChecksum(
+            window_alloc,
+            data.window_layout,
+        ) catch |err| {
+            log.info(
+                "failed to parse window layout id={} layout={s}",
+                .{ data.window_id, data.window_layout },
+            );
+            return err;
+        };
+        const is_zoomed = !std.mem.eql(
+            u8,
+            data.window_layout,
+            data.window_visible_layout,
+        );
+        const visible_layout: Layout = if (is_zoomed)
+            Layout.parseWithChecksum(
+                window_alloc,
+                data.window_visible_layout,
+            ) catch |err| {
+                log.info(
+                    "failed to parse visible window layout id={} layout={s}",
+                    .{ data.window_id, data.window_visible_layout },
+                );
+                return err;
+            }
+        else
+            layout;
+
+        const name: []const u8 = if (pending_name.items.len == 0)
+            ""
+        else
+            try pending_name.toOwnedSlice(self.alloc);
+        errdefer if (name.len > 0) self.alloc.free(name);
+
+        try windows.append(self.alloc, .{
+            .id = data.window_id,
+            .name = name,
+            .width = data.window_width,
+            .height = data.window_height,
+            .is_zoomed = is_zoomed,
+            .is_active = data.window_active,
+            .active_pane_id = data.pane_id,
+            .layout_arena = arena.state,
+            .layout = layout,
+            .visible_layout = visible_layout,
+        });
     }
 
     fn receivedPaneState(
@@ -2131,7 +2260,11 @@ const Command = union(enum) {
             .pane_visible,
             .pane_pending,
             => true,
-            .list_windows, .tmux_version, .client_size, .user => false,
+            .list_windows,
+            .tmux_version,
+            .client_size,
+            .user,
+            => false,
         };
     }
 
@@ -2272,7 +2405,13 @@ const Format = struct {
             .window_height,
             .window_layout,
             .window_visible_layout,
+            .window_name,
         },
+    };
+
+    const list_windows_prefix: Format = .{
+        .delim = ' ',
+        .vars = Format.list_windows.vars[0 .. Format.list_windows.vars.len - 1],
     };
 
     const tmux_version: Format = .{
@@ -2493,6 +2632,51 @@ test "minimum tmux version" {
     try testing.expect(!Viewer.supportsTmuxVersion("unknown"));
 }
 
+test "list-windows parses the complete final window name" {
+    const prefix =
+        "$42 @7 1 %3 83 44 b7dd,83x44,0,0,3 b7dd,83x44,0,0,3";
+
+    const named = try Viewer.parseWindowListLine(prefix ++ " editor window");
+    try testing.expectEqual(42, named.session_id);
+    try testing.expectEqual(7, named.window_id);
+    try testing.expectEqualStrings("editor window", named.window_name);
+
+    const padded = try Viewer.parseWindowListLine(prefix ++ "  padded name  ");
+    try testing.expectEqualStrings(" padded name  ", padded.window_name);
+
+    const empty = try Viewer.parseWindowListLine(prefix ++ " ");
+    try testing.expectEqualStrings("", empty.window_name);
+
+    const escaped_control = try Viewer.parseWindowListLine(prefix ++ " a\\001b");
+    try testing.expectEqualStrings("a\\001b", escaped_control.window_name);
+
+    const escaped_sequence = try Viewer.parseWindowListLine(prefix ++ " e\\033]x");
+    try testing.expectEqualStrings("e\\033]x", escaped_sequence.window_name);
+
+    const escaped_invalid = try Viewer.parseWindowListLine(prefix ++ " f\\377g");
+    try testing.expectEqualStrings("f\\377g", escaped_invalid.window_name);
+
+    const raw_tab = try Viewer.parseWindowListLine(prefix ++ " tab\tname");
+    try testing.expectEqualStrings("tab\tname", raw_tab.window_name);
+
+    try testing.expectError(
+        error.InvalidWindowRecord,
+        Viewer.parseWindowListLine(prefix),
+    );
+}
+
+test "list-windows command requests the standard tmux window name" {
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    const command: Command = .list_windows;
+    try command.formatCommand(&builder.writer);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        builder.writer.buffered(),
+        " #{window_name}'",
+    ));
+}
+
 test "pane state query excludes aggregate tmux mouse flag" {
     for ([_]output.Variable{
         .mouse_all_flag,
@@ -2603,8 +2787,8 @@ test "active topology creates configured pane terminals" {
     viewer.session_id = 42;
 
     const topology =
-        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1
+        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 zero
+        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1 one
     ;
     {
         var arena = viewer.action_arena.promote(viewer.alloc);
@@ -2758,7 +2942,7 @@ test "zero history limit omits initial history capture" {
         },
         .{
             .input = .{ .tmux = .{
-                .block_end = testClientBlock("$1 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0"),
+                .block_end = testClientBlock("$1 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell"),
             } },
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
@@ -2838,7 +3022,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$1 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    \\$1 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] shell
                     ,
                 ),
             } },
@@ -2907,7 +3091,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$2 @1 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    \\$2 @1 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] shell
                     ,
                 ),
             } },
@@ -3021,7 +3205,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                    \\$0 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] shell
                     ,
                 ),
             } },
@@ -3443,7 +3627,7 @@ test "zoomed geometry follows visible layout" {
         },
         .{
             .input = .{ .tmux = .{
-                .block_end = testClientBlock("$1 @0 1 %0 83 44 " ++ full_layout ++ " b7dd,83x44,0,0,0"),
+                .block_end = testClientBlock("$1 @0 1 %0 83 44 " ++ full_layout ++ " b7dd,83x44,0,0,0 shell"),
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
@@ -3526,7 +3710,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell
                     ,
                 ),
             } },
@@ -3606,7 +3790,7 @@ test "layout_change emits a new group while another group is pending" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell
                     ,
                 ),
             } },
@@ -3664,7 +3848,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell
                     ,
                 ),
             } },
@@ -3713,8 +3897,8 @@ fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
     viewer.state = .command_queue;
     viewer.session_id = 42;
     const initial_topology =
-        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
-        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1
+        \\$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 zero
+        \\$42 @1 0 %1 83 44 b7de,83x44,0,0,1 b7de,83x44,0,0,1 one
     ;
     {
         var arena = viewer.action_arena.promote(viewer.alloc);
@@ -3728,6 +3912,98 @@ fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
     }
     viewer.command_queue.clear();
     viewer.sent_command_count = 0;
+}
+
+test "window rename replaces the owned name and publishes topology" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    var actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "editor window",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqualStrings("editor window", viewer.windows.items[0].name);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "editor window",
+    } } });
+    try testing.expectEqual(0, actions.len);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 0,
+        .name = "",
+    } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expectEqualStrings("", viewer.windows.items[0].name);
+
+    actions = viewer.next(.{ .tmux = .{ .window_renamed = .{
+        .id = 99,
+        .name = "unknown",
+    } } });
+    try testing.expectEqual(0, actions.len);
+}
+
+test "list-windows reconstructs multiline names without another command" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    try viewer.queueCommands(&.{.list_windows});
+    {
+        var arena = viewer.action_arena.promote(viewer.alloc);
+        defer viewer.action_arena = arena.state;
+        var queued_actions: std.ArrayList(Viewer.Action) = .empty;
+        try viewer.appendQueuedCommandActionsWithAllocator(
+            &queued_actions,
+            arena.allocator(),
+        );
+    }
+
+    const rich =
+        "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 " ++
+        "b7dd,83x44,0,0,0 editor\nworkspace\n\n" ++
+        "$42 @1 0 %1 83 44 b7de,83x44,0,0,1 " ++
+        "b7de,83x44,0,0,1 logs";
+    const actions = viewer.next(.{ .command_complete = .{ .success = rich } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .windows);
+    try testing.expectEqual(2, viewer.windows.items.len);
+    try testing.expectEqualStrings(
+        "editor\nworkspace\n",
+        viewer.windows.items[0].name,
+    );
+    try testing.expectEqualStrings("logs", viewer.windows.items[1].name);
+}
+
+test "invalid list-windows response fails without publishing topology" {
+    var viewer = try Viewer.init(testing.allocator, .{});
+    defer viewer.deinit();
+    try seedWindowCloseTestViewer(&viewer);
+
+    try viewer.queueCommands(&.{.list_windows});
+    {
+        var arena = viewer.action_arena.promote(viewer.alloc);
+        defer viewer.action_arena = arena.state;
+        var queued_actions: std.ArrayList(Viewer.Action) = .empty;
+        try viewer.appendQueuedCommandActionsWithAllocator(
+            &queued_actions,
+            arena.allocator(),
+        );
+    }
+
+    const actions = viewer.next(.{
+        .command_complete = .{ .success = "garbage" },
+    });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(State.defunct, viewer.state);
+    try testing.expectEqual(2, viewer.windows.items.len);
+    try testing.expectEqualStrings("zero", viewer.windows.items[0].name);
+    try testing.expectEqualStrings("one", viewer.windows.items[1].name);
 }
 
 test "window_close from another session does not change current topology" {
@@ -3834,7 +4110,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell
                     ,
                 ),
             } },
@@ -3895,7 +4171,7 @@ test "window_add emits list_windows while another group is pending" {
         .{
             .input = .{ .tmux = .{
                 .block_end = testClientBlock(
-                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0
+                    \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell
                     ,
                 ),
             } },

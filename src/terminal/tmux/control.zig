@@ -444,37 +444,38 @@ pub const Parser = struct {
                 .{ .window_close = .{ .id = id } }
             else
                 .{ .unlinked_window_close = .{ .id = id } };
-        } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
-            var re = oni.Regex.init(
-                "^%window-renamed @([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
+        } else if (std.mem.eql(u8, cmd, "%window-renamed") or
+            std.mem.eql(u8, cmd, "%unlinked-window-renamed"))
+        cmd: {
+            const prefix_len = cmd.len + " @".len;
+            if (line.len < prefix_len or
+                !std.mem.eql(u8, line[cmd.len..prefix_len], " @"))
+            {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            }
 
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            const rest = line[prefix_len..];
+            const id_end = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
             const id = std.fmt.parseInt(
                 usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
+                rest[0..id_end],
                 10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+            ) catch {
+                log.warn("failed to parse window rename id line=\"{s}\"", .{line});
+                break :cmd;
+            };
+            const name = rest[id_end + 1 ..];
 
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
-            return .{ .window_renamed = .{ .id = id, .name = name } };
+            return if (std.mem.eql(u8, cmd, "%window-renamed"))
+                .{ .window_renamed = .{ .id = id, .name = name } }
+            else
+                .{ .unlinked_window_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%window-pane-changed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-pane-changed @([0-9]+) %([0-9]+)$",
@@ -717,6 +718,12 @@ pub const Notification = union(enum) {
 
     /// The window with ID window-id was renamed to name.
     window_renamed: struct {
+        id: usize,
+        name: []const u8,
+    },
+
+    /// A window not linked to the current session was renamed.
+    unlinked_window_renamed: struct {
         id: usize,
         name: []const u8,
     },
@@ -1180,6 +1187,20 @@ test "tmux window-renamed" {
     try testing.expect(n == .window_renamed);
     try testing.expectEqual(42, n.window_renamed.id);
     try testing.expectEqualStrings("bar", n.window_renamed.name);
+
+    for ("%window-renamed @42 ") |byte| try testing.expect(try c.put(byte) == null);
+    const empty = (try c.put('\n')).?;
+    try testing.expect(empty == .window_renamed);
+    try testing.expectEqual(42, empty.window_renamed.id);
+    try testing.expectEqualStrings("", empty.window_renamed.name);
+
+    for ("%unlinked-window-renamed @43 other") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const unlinked = (try c.put('\n')).?;
+    try testing.expect(unlinked == .unlinked_window_renamed);
+    try testing.expectEqual(43, unlinked.unlinked_window_renamed.id);
+    try testing.expectEqualStrings("other", unlinked.unlinked_window_renamed.name);
 }
 
 test "tmux window-pane-changed" {

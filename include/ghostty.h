@@ -554,6 +554,8 @@ typedef struct {
   size_t width;
   size_t height;
   uint64_t active_pane_id;
+  // Borrowed for the duration of the topology visitor callback.
+  ghostty_tmux_bytes_s name;
 } ghostty_tmux_window_record_s;
 
 typedef struct {

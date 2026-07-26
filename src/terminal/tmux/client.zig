@@ -477,17 +477,7 @@ fn openReadyTestClient(
     client: *ControlClient,
     actions: *TestActions,
 ) !void {
-    try client.feed(
-        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
-        actions,
-    );
-    try client.consumeOutbound(client.outboundBytes().len);
-    try client.feed(
-        "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
-            "%begin 3 3 1\n%end 3 3 1\n",
-        actions,
-    );
-    actions.records.clearRetainingCapacity();
+    try openPaneTestClient(client, actions);
 }
 
 fn openHydratingPaneTestClient(
@@ -502,7 +492,7 @@ fn openHydratingPaneTestClient(
     try client.feed(
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
             "%end 3 3 1\n",
         actions,
     );
@@ -543,7 +533,7 @@ test "control client sends startup commands before either response" {
     try testing.expectEqual(0, actions.records.items.len);
     try testing.expectEqualStrings(
         "display-message -p '#{version}'\n" ++
-            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
         client.outboundBytes(),
     );
 }
@@ -565,7 +555,7 @@ test "control client reports initial size between version and topology" {
     try testing.expectEqualStrings(
         "display-message -p '#{version}'\n" ++
             "refresh-client -C 117x41\n" ++
-            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n",
+            "list-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n",
         client.outboundBytes(),
     );
     try testing.expectEqual(3, client.viewer.sent_command_count);
@@ -573,13 +563,25 @@ test "control client reports initial size between version and topology" {
     try client.feed(
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
             "%begin 3 3 1\n%end 3 3 1\n" ++
-            "%begin 4 4 1\n%end 4 4 1\n",
+            "%begin 4 4 1\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
+            "%end 4 4 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n" ++
+            "%begin 9 9 1\n%end 9 9 1\n",
         &actions,
     );
     try testing.expectEqual(0, client.viewer.sent_command_count);
     try testing.expect(client.viewer.command_queue.empty());
-    try testing.expectEqual(1, actions.records.items.len);
-    try testing.expect(actions.records.items[0] == .windows);
 }
 
 test "control client size error stays in Viewer FIFO" {
@@ -657,7 +659,7 @@ test "control client hydrates as one group and keeps later command independent" 
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
             "%end 3 3 1\n" ++
             "%window-add @1\n",
         &actions,
@@ -674,7 +676,7 @@ test "control client hydrates as one group and keeps later command independent" 
         1,
         "list-panes -s",
     ));
-    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}'\n"));
+    try testing.expect(std.mem.endsWith(u8, outbound, "\nlist-windows -F '#{session_id} #{window_id} #{window_active} #{pane_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout} #{window_name}'\n"));
 }
 
 test "control client close notifications produce no outbound work" {
@@ -716,7 +718,7 @@ test "control client hydration error skips only its group" {
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
             "%end 3 3 1\n" ++
             "%window-add @1\n",
         &actions,
@@ -944,7 +946,7 @@ test "control client exposes pane phase and retained terminal lifetime" {
             "%session-changed $42 main\n" ++
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
-            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0\n" ++
+            "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
             "%end 3 3 1\n",
         &actions,
     );
@@ -1265,8 +1267,8 @@ test "control client submits independent host commands in one outbound buffer" {
     );
 
     try client.feed(
-        "%begin 4 4 1\none\n%end 4 4 1\n" ++
-            "%begin 5 5 1\ntwo\n%end 5 5 1\n",
+        "%begin 9 9 1\none\n%end 9 9 1\n" ++
+            "%begin 10 10 1\ntwo\n%end 10 10 1\n",
         &actions,
     );
     try testing.expectEqual(2, actions.records.items.len);
@@ -1293,9 +1295,9 @@ test "control client host group failure preserves later independent command" {
     );
 
     try client.feed(
-        "%begin 4 4 1\n%end 4 4 1\n" ++
-            "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
-            "%begin 6 6 1\n%end 6 6 1\n",
+        "%begin 9 9 1\n%end 9 9 1\n" ++
+            "%begin 10 10 1\nfailed\n%error 10 10 1\n" ++
+            "%begin 11 11 1\n%end 11 11 1\n",
         &actions,
     );
     try testing.expectEqual(4, actions.records.items.len);
@@ -1347,14 +1349,29 @@ test "control client callback submission bypasses viewer correlation" {
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
         "%begin 2 2 1\n3.1\n%end 2 2 1\n" ++
-            "%begin 3 3 1\n%end 3 3 1\n",
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
+            "%end 3 3 1\n",
         &handler,
     );
     try testing.expect(handler.token != null);
-    try testing.expectEqualStrings("display-message -p host\n", client.outboundBytes());
+    try testing.expect(std.mem.startsWith(
+        u8,
+        client.outboundBytes(),
+        "display-message -p host\n",
+    ));
     try testing.expectEqual(0, handler.completion_count);
 
-    try client.feed("%begin 4 4 1\nhost\n%end 4 4 1\n", &handler);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 4 4 1\nhost\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n" ++
+            "%begin 9 9 1\n%end 9 9 1\n",
+        &handler,
+    );
     try testing.expectEqual(1, handler.completion_count);
 }
 
