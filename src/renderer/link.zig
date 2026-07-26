@@ -18,6 +18,10 @@ pub const Link = struct {
     /// The situations in which the link should be highlighted.
     highlight: inputpkg.Link.Highlight,
 
+    /// The action associated with a match. Renderers do not interpret this,
+    /// but interaction owners use the same compiled link set.
+    action: inputpkg.Link.Action,
+
     pub fn deinit(self: *Link) void {
         self.regex.deinit();
     }
@@ -57,6 +61,7 @@ pub const Set = struct {
             try links.append(alloc, .{
                 .regex = regex,
                 .highlight = link.highlight,
+                .action = link.action,
             });
         }
 
@@ -66,6 +71,59 @@ pub const Set = struct {
     pub fn deinit(self: *Set, alloc: Allocator) void {
         for (self.links) |*link| link.deinit();
         alloc.free(self.links);
+    }
+
+    /// Return the first configured link match containing `pin`.
+    ///
+    /// A null modifier snapshot intentionally ignores configured modifier
+    /// requirements. This is used by direct-selection gestures such as a
+    /// double click or long press. A non-null snapshot preserves Surface's
+    /// clickable-link policy.
+    pub fn matchAtPin(
+        self: *const Set,
+        alloc: Allocator,
+        screen: *Screen,
+        pin: terminal.Pin,
+        mods: ?inputpkg.Mods,
+    ) !?Match {
+        if (self.links.len == 0) return null;
+
+        const line = screen.selectLine(.{
+            .pin = pin,
+            .whitespace = null,
+            .semantic_prompt_boundary = true,
+        }) orelse return null;
+
+        var map: terminal.StringMap = undefined;
+        alloc.free(try screen.selectionString(alloc, .{
+            .sel = line,
+            .trim = false,
+            .map = &map,
+        }));
+        defer map.deinit(alloc);
+
+        for (self.links) |link| {
+            if (mods) |value| switch (link.highlight) {
+                .always, .hover => {},
+                .always_mods, .hover_mods => |required| {
+                    if (!required.equal(value)) continue;
+                },
+            };
+
+            var it = map.searchIterator(link.regex);
+            while (true) {
+                var match = (try it.next()) orelse break;
+                defer match.deinit();
+                const selection = match.selection();
+                if (!selection.contains(screen, pin)) continue;
+                return .{
+                    .action = link.action,
+                    .selection = selection,
+                };
+            }
+        }
+
+        return null;
     }
 
     /// Fills matches with the matches from regex link matches.
@@ -142,6 +200,11 @@ pub const Set = struct {
             }
         }
     }
+};
+
+pub const Match = struct {
+    action: inputpkg.Link.Action,
+    selection: terminal.Selection,
 };
 
 test "renderCellMap" {
@@ -387,4 +450,97 @@ test "renderCellMap mods no match" {
     try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+}
+
+test "matchAtPin follows soft wraps, config priority, and optional modifiers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screen = try Screen.init(alloc, .{
+        .cols = 8,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString("xxhttps://example.com rest");
+
+    var set = try Set.fromConfig(alloc, &.{
+        .{
+            .regex = "https://[^ ]+",
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = .{ .ctrl = true } },
+        },
+        .{
+            .regex = "example\\.com",
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = .{ .ctrl = true } },
+        },
+    });
+    defer set.deinit(alloc);
+
+    const pin = screen.pages.pin(.{ .active = .{
+        .x = 2,
+        .y = 1,
+    } }).?;
+    try testing.expect(try set.matchAtPin(
+        alloc,
+        &screen,
+        pin,
+        .{},
+    ) == null);
+
+    const match = (try set.matchAtPin(
+        alloc,
+        &screen,
+        pin,
+        null,
+    )).?;
+    try testing.expect(match.action == .open);
+    const text = try screen.selectionString(alloc, .{
+        .sel = match.selection,
+        .trim = false,
+    });
+    defer alloc.free(text);
+    try testing.expectEqualStrings("https://example.com", text);
+
+    try testing.expect((try set.matchAtPin(
+        alloc,
+        &screen,
+        pin,
+        .{ .ctrl = true },
+    )) != null);
+}
+
+test "matchAtPin respects semantic prompt boundaries" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screen = try Screen.init(alloc, .{
+        .cols = 16,
+        .rows = 2,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.{ .prompt = .initial });
+    try screen.testWriteString("p");
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString("target");
+
+    var set = try Set.fromConfig(alloc, &.{.{
+        .regex = "ptarget",
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }});
+    defer set.deinit(alloc);
+
+    const pin = screen.pages.pin(.{ .active = .{
+        .x = 3,
+        .y = 0,
+    } }).?;
+    try testing.expect(try set.matchAtPin(
+        alloc,
+        &screen,
+        pin,
+        null,
+    ) == null);
 }
