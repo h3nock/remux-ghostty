@@ -738,7 +738,10 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         const value = surface orelse return .invalid_input;
         const out = out_ptr orelse return .invalid_input;
         out.* = emptyText();
-        const text = value.core.viewportText() catch return .out_of_memory;
+        const text = value.core.viewportText() catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .unavailable,
+        };
         out.text = text.ptr;
         out.text_len = text.len;
         return .sent;

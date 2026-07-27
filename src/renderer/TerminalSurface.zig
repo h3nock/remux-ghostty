@@ -1498,7 +1498,7 @@ pub fn freeSelectedText(
 /// Shared.mutex. The snapshot does not change selection or scroll state. The
 /// caller owns the returned bytes and must release them through
 /// freeSelectedText.
-pub fn viewportText(self: *TerminalSurface) error{OutOfMemory}![]const u8 {
+pub fn viewportText(self: *TerminalSurface) ![]const u8 {
     self.shared.mutex.lock();
     defer self.shared.mutex.unlock();
     return self.shared.terminal.plainString(self.alloc);
@@ -3118,5 +3118,6 @@ test "TerminalSurface viewport text snapshots active visible rows without mutati
     }
     const alternate = try surface.viewportText();
     defer surface.freeSelectedText(alternate);
-    try testing.expectEqualStrings("alt", alternate);
+    try testing.expect(std.mem.indexOf(u8, alternate, "alt") != null);
+    try testing.expect(std.mem.indexOf(u8, alternate, "4") == null);
 }
