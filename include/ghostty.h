@@ -1717,6 +1717,16 @@ GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_read_selection(
     ghostty_terminal_surface_t,
     ghostty_text_s*);
+
+// Copies only the active screen's currently visible viewport without changing
+// selection or scroll state. SENT means out contains owned UTF-8 text. Release
+// a SENT result exactly once with terminal_surface_free_text before freeing the
+// owning terminal surface.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_read_viewport(
+    ghostty_terminal_surface_t,
+    ghostty_text_s*);
+
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_free_text(
     ghostty_terminal_surface_t,
