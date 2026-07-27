@@ -1489,7 +1489,7 @@ pub fn selectedText(self: *TerminalSurface) SelectedTextError![:0]const u8 {
 
 pub fn freeSelectedText(
     self: *TerminalSurface,
-    text: []const u8,
+    text: [:0]const u8,
 ) void {
     self.alloc.free(text);
 }
@@ -1498,10 +1498,12 @@ pub fn freeSelectedText(
 /// Shared.mutex. The snapshot does not change selection or scroll state. The
 /// caller owns the returned bytes and must release them through
 /// freeSelectedText.
-pub fn viewportText(self: *TerminalSurface) ![]const u8 {
+pub fn viewportText(self: *TerminalSurface) ![:0]const u8 {
     self.shared.mutex.lock();
     defer self.shared.mutex.unlock();
-    return self.shared.terminal.plainString(self.alloc);
+    const text = try self.shared.terminal.plainString(self.alloc);
+    defer self.alloc.free(text);
+    return self.alloc.dupeZ(u8, text);
 }
 
 /// Filter modifiers for native text translation. The original modifiers must
@@ -3103,6 +3105,8 @@ test "TerminalSurface viewport text snapshots active visible rows without mutati
     }
 
     const before = surface.selectionSnapshot();
+    const selected = try surface.selectedText();
+    surface.freeSelectedText(selected);
     const text = try surface.viewportText();
     defer surface.freeSelectedText(text);
     try testing.expectEqualStrings("2\n3\n4", text);

@@ -754,7 +754,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         const value = surface orelse return .invalid_input;
         const text = text_ptr orelse return .invalid_input;
         const ptr = text.text orelse return .invalid_input;
-        value.core.freeSelectedText(ptr[0..text.text_len]);
+        value.core.freeSelectedText(ptr[0..text.text_len :0]);
         text.* = emptyText();
         return .consumed_no_output;
     }
