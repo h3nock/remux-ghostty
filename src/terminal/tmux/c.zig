@@ -424,6 +424,44 @@ export fn ghostty_tmux_client_send_pane_input(
     return .ok;
 }
 
+export fn ghostty_tmux_client_send_pane_input_tracked(
+    client: ?*Client,
+    pane_id: u64,
+    ptr: ?[*]const u8,
+    len: usize,
+    token_out: ?*u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const out = token_out orelse return .invalid_input;
+    const id = std.math.cast(usize, pane_id) orelse return .invalid_input;
+    const bytes = (Bytes{ .ptr = ptr, .len = len }).slice() catch
+        return .invalid_input;
+    if (bytes.len == 0) return .invalid_input;
+    const token = value.control.sendPaneInputTracked(id, bytes) catch |err|
+        return mapClientError(err);
+    out.* = @intFromEnum(token);
+    return .ok;
+}
+
+export fn ghostty_tmux_client_send_pane_literal_input_tracked(
+    client: ?*Client,
+    pane_id: u64,
+    ptr: ?[*]const u8,
+    len: usize,
+    token_out: ?*u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const out = token_out orelse return .invalid_input;
+    const id = std.math.cast(usize, pane_id) orelse return .invalid_input;
+    const bytes = (Bytes{ .ptr = ptr, .len = len }).slice() catch
+        return .invalid_input;
+    if (bytes.len == 0) return .invalid_input;
+    const token = value.control.sendPaneLiteralInputTracked(id, bytes) catch |err|
+        return mapClientError(err);
+    out.* = @intFromEnum(token);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_refresh_pane(
     client: ?*Client,
     pane_id: u64,
@@ -519,6 +557,7 @@ fn mapClientError(err: ControlClient.Error) Result {
         error.ClientFailed => .failed,
         error.ReentrantFeed => .reentrant_feed,
         error.InvalidCommand => .invalid_command,
+        error.InvalidInput => .invalid_input,
         error.InvalidTokenCount => .invalid_input,
         error.TokenExhausted => .token_exhausted,
         error.PaneUnknown => .pane_unknown,
@@ -1102,6 +1141,42 @@ test "tmux C client pane input validation and action mapping" {
         "pane input rejected",
         context.input_failure_body[0..context.input_failure_len],
     );
+}
+
+test "tmux C client tracked literal pane input" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+    try openPaneTestClient(&client);
+
+    const payload = "paste \"$HOME\"\n🙂";
+    var token: u64 = 0;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_send_pane_literal_input_tracked(
+            &client,
+            0,
+            payload.ptr,
+            payload.len,
+            &token,
+        ),
+    );
+    var outbound: Bytes = undefined;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_outbound(&client, &outbound),
+    );
+    try testing.expectEqualStrings(
+        "send-keys -l -t %0 \"paste \\042\\044HOME\\042\\012🙂\"\n",
+        try outbound.slice(),
+    );
+    try consumeAllTest(&client);
+    try feedTest(&client, "%begin 9 9 1\n%end 9 9 1\n");
+    try testing.expectEqual(1, context.completion_count);
+    try testing.expectEqual(token, context.completions[0].token);
+    try testing.expectEqual(CommandStatus.success, context.completions[0].status);
 }
 
 test "tmux C client pane refresh boundary" {

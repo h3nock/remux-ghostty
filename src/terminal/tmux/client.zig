@@ -56,7 +56,7 @@ pub const ControlClient = struct {
     };
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
-        error{ ClientFailed, PaneUnknown };
+        error{ ClientFailed, InvalidInput, PaneUnknown };
 
     pub fn init(
         alloc: Allocator,
@@ -77,8 +77,8 @@ pub const ControlClient = struct {
     }
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
-    /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`, or
-    /// `consumeOutbound` call.
+    /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`,
+    /// `sendPaneLiteralInputTracked`, or `consumeOutbound` call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -167,6 +167,51 @@ pub const ControlClient = struct {
         if (!self.viewer.panes.contains(pane_id)) return error.PaneUnknown;
         if (bytes.len == 0) return;
 
+        _ = try self.enqueuePaneInput(.input, pane_id, bytes);
+    }
+
+    /// Send already-encoded terminal bytes to one known pane and return the
+    /// token that identifies this exact command's eventual completion.
+    pub fn sendPaneInputTracked(
+        self: *ControlClient,
+        pane_id: usize,
+        bytes: []const u8,
+    ) Error!channel_pkg.CommandToken {
+        try self.validateCommandAdmission();
+        if (self.channel.state == .handshake) return error.NotReady;
+        if (!self.viewer.panes.contains(pane_id)) return error.PaneUnknown;
+        if (bytes.len == 0) return error.InvalidInput;
+
+        return self.enqueuePaneInput(.host, pane_id, bytes);
+    }
+
+    /// Send one nonempty UTF-8 terminal payload to a known pane as a single
+    /// literal tmux argument and return this command's completion token.
+    /// Unlike exact key input, this path cannot represent NUL bytes.
+    pub fn sendPaneLiteralInputTracked(
+        self: *ControlClient,
+        pane_id: usize,
+        bytes: []const u8,
+    ) Error!channel_pkg.CommandToken {
+        try self.validateCommandAdmission();
+        if (self.channel.state == .handshake) return error.NotReady;
+        if (!self.viewer.panes.contains(pane_id)) return error.PaneUnknown;
+        if (bytes.len == 0 or
+            std.mem.indexOfScalar(u8, bytes, 0) != null or
+            !std.unicode.utf8ValidateSlice(bytes))
+        {
+            return error.InvalidInput;
+        }
+
+        return self.enqueuePaneLiteralInput(pane_id, bytes);
+    }
+
+    fn enqueuePaneInput(
+        self: *ControlClient,
+        source: channel_pkg.CommandSource,
+        pane_id: usize,
+        bytes: []const u8,
+    ) Error!channel_pkg.CommandToken {
         const prefix = "send-keys -H -t %";
         var id_buffer: [32]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buffer, "{d}", .{pane_id}) catch
@@ -204,7 +249,68 @@ pub const ControlClient = struct {
         }
         std.debug.assert(offset == command.len);
 
-        _ = try self.channel.enqueueCommandFrom(.input, command);
+        return self.channel.enqueueCommandFrom(source, command);
+    }
+
+    fn enqueuePaneLiteralInput(
+        self: *ControlClient,
+        pane_id: usize,
+        bytes: []const u8,
+    ) Error!channel_pkg.CommandToken {
+        const prefix = "send-keys -l -t %";
+        var id_buffer: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buffer, "{d}", .{pane_id}) catch
+            unreachable;
+
+        var encoded_len: usize = 0;
+        for (bytes) |byte| {
+            const width: usize = if (literalByteNeedsEscape(byte)) 4 else 1;
+            encoded_len = std.math.add(usize, encoded_len, width) catch
+                return error.OutOfMemory;
+        }
+        const command_len = std.math.add(
+            usize,
+            prefix.len + id.len + 3,
+            encoded_len,
+        ) catch return error.OutOfMemory;
+
+        var stack: [256]u8 = undefined;
+        const heap = command_len > stack.len;
+        const command = if (heap)
+            try self.channel.alloc.alloc(u8, command_len)
+        else
+            stack[0..command_len];
+        defer if (heap) self.channel.alloc.free(command);
+
+        var offset: usize = 0;
+        @memcpy(command[offset..][0..prefix.len], prefix);
+        offset += prefix.len;
+        @memcpy(command[offset..][0..id.len], id);
+        offset += id.len;
+        command[offset] = ' ';
+        command[offset + 1] = '"';
+        offset += 2;
+        for (bytes) |byte| {
+            if (literalByteNeedsEscape(byte)) {
+                command[offset] = '\\';
+                command[offset + 1] = '0' + (byte >> 6);
+                command[offset + 2] = '0' + ((byte >> 3) & 0x07);
+                command[offset + 3] = '0' + (byte & 0x07);
+                offset += 4;
+            } else {
+                command[offset] = byte;
+                offset += 1;
+            }
+        }
+        command[offset] = '"';
+        std.debug.assert(offset + 1 == command.len);
+
+        return self.channel.enqueueCommandFrom(.host, command);
+    }
+
+    fn literalByteNeedsEscape(byte: u8) bool {
+        return byte < 0x20 or byte == 0x7f or
+            byte == '\\' or byte == '"' or byte == '$' or byte == '~';
     }
 
     /// Submit one standalone command as its own newline-delimited group.
@@ -1162,6 +1268,110 @@ test "control client serializes exact binary pane input" {
         "send-keys -H -t %0 41 00 1b 7f 80 ff\n",
         client.outboundBytes(),
     );
+}
+
+test "control client correlates tracked pane input completion" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const token = try client.sendPaneInputTracked(0, "message");
+    try testing.expectEqualStrings(
+        "send-keys -H -t %0 6d 65 73 73 61 67 65\n",
+        client.outboundBytes(),
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 9 9 1\n%end 9 9 1\n", &actions);
+
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+}
+
+test "control client serializes tracked literal pane input as one argument" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const payload = "\x1b[200~line 1\n'\"$~\\;#{x}\t café🙂\x1b[201~";
+    const token = try client.sendPaneLiteralInputTracked(0, payload);
+    try testing.expectEqualStrings(
+        "send-keys -l -t %0 \"\\033[200\\176line 1\\012'\\042\\044" ++
+            "\\176\\134;#{x}\\011 café🙂\\033[201\\176\"\n",
+        client.outboundBytes(),
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 9 9 1\n%end 9 9 1\n", &actions);
+
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+}
+
+test "control client tracked literal input rejects non-text bytes atomically" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const next_token = client.channel.next_token;
+    try testing.expectError(
+        error.InvalidInput,
+        client.sendPaneLiteralInputTracked(0, &.{ 'a', 0, 'b' }),
+    );
+    try testing.expectError(
+        error.InvalidInput,
+        client.sendPaneLiteralInputTracked(0, &.{ 0x80, 0xff }),
+    );
+    try testing.expectEqual(next_token, client.channel.next_token);
+    try testing.expectEqualStrings("", client.outboundBytes());
+}
+
+test "control client tracked literal input keeps large payload in one argument" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const payload = [_]u8{'x'} ** (64 * 1024);
+    _ = try client.sendPaneLiteralInputTracked(0, &payload);
+    const outbound = client.outboundBytes();
+    try testing.expect(std.mem.startsWith(u8, outbound, "send-keys -l -t %0 \""));
+    try testing.expect(std.mem.endsWith(u8, outbound, "\"\n"));
+    try testing.expectEqual(payload.len + "send-keys -l -t %0 \"\"\n".len, outbound.len);
+}
+
+test "control client tracked literal input formatting failure is allocation atomic" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+
+    var client = try ControlClient.init(failing.allocator(), .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const bytes = [_]u8{'x'} ** 512;
+    const next_token = client.channel.next_token;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        client.sendPaneLiteralInputTracked(0, &bytes),
+    );
+    try testing.expectEqual(next_token, client.channel.next_token);
+    try testing.expectEqualStrings("", client.outboundBytes());
 }
 
 test "control client pane input validates without no-op mutation" {
