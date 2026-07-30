@@ -1169,7 +1169,7 @@ test "tmux C client tracked literal pane input" {
         ghostty_tmux_client_outbound(&client, &outbound),
     );
     try testing.expectEqualStrings(
-        "send-keys -l -t %0 \"paste \\042\\044HOME\\042\\012🙂\"\n",
+        "send-keys -l -t %0 -- \"paste \\042\\044HOME\\042\\012🙂\"\n",
         try outbound.slice(),
     );
     try consumeAllTest(&client);

@@ -258,6 +258,7 @@ pub const ControlClient = struct {
         bytes: []const u8,
     ) Error!channel_pkg.CommandToken {
         const prefix = "send-keys -l -t %";
+        const payload_prefix = " -- \"";
         var id_buffer: [32]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buffer, "{d}", .{pane_id}) catch
             unreachable;
@@ -270,7 +271,7 @@ pub const ControlClient = struct {
         }
         const command_len = std.math.add(
             usize,
-            prefix.len + id.len + 3,
+            prefix.len + id.len + payload_prefix.len + 1,
             encoded_len,
         ) catch return error.OutOfMemory;
 
@@ -287,9 +288,8 @@ pub const ControlClient = struct {
         offset += prefix.len;
         @memcpy(command[offset..][0..id.len], id);
         offset += id.len;
-        command[offset] = ' ';
-        command[offset + 1] = '"';
-        offset += 2;
+        @memcpy(command[offset..][0..payload_prefix.len], payload_prefix);
+        offset += payload_prefix.len;
         for (bytes) |byte| {
             if (literalByteNeedsEscape(byte)) {
                 command[offset] = '\\';
@@ -1303,7 +1303,7 @@ test "control client serializes tracked literal pane input as one argument" {
     const payload = "\x1b[200~line 1\n'\"$~\\;#{x}\t café🙂\x1b[201~";
     const token = try client.sendPaneLiteralInputTracked(0, payload);
     try testing.expectEqualStrings(
-        "send-keys -l -t %0 \"\\033[200\\176line 1\\012'\\042\\044" ++
+        "send-keys -l -t %0 -- \"\\033[200\\176line 1\\012'\\042\\044" ++
             "\\176\\134;#{x}\\011 café🙂\\033[201\\176\"\n",
         client.outboundBytes(),
     );
@@ -1312,6 +1312,22 @@ test "control client serializes tracked literal pane input as one argument" {
 
     try testing.expectEqual(1, actions.records.items.len);
     try testing.expectEqual(token, actions.records.items[0].command_success);
+}
+
+test "control client tracked literal input terminates flags before payload" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    _ = try client.sendPaneLiteralInputTracked(0, "-l");
+    try testing.expectEqualStrings(
+        "send-keys -l -t %0 -- \"-l\"\n",
+        client.outboundBytes(),
+    );
 }
 
 test "control client tracked literal input rejects non-text bytes atomically" {
@@ -1348,9 +1364,9 @@ test "control client tracked literal input keeps large payload in one argument" 
     const payload = [_]u8{'x'} ** (64 * 1024);
     _ = try client.sendPaneLiteralInputTracked(0, &payload);
     const outbound = client.outboundBytes();
-    try testing.expect(std.mem.startsWith(u8, outbound, "send-keys -l -t %0 \""));
+    try testing.expect(std.mem.startsWith(u8, outbound, "send-keys -l -t %0 -- \""));
     try testing.expect(std.mem.endsWith(u8, outbound, "\"\n"));
-    try testing.expectEqual(payload.len + "send-keys -l -t %0 \"\"\n".len, outbound.len);
+    try testing.expectEqual(payload.len + "send-keys -l -t %0 -- \"\"\n".len, outbound.len);
 }
 
 test "control client tracked literal input formatting failure is allocation atomic" {
