@@ -78,7 +78,8 @@ pub const ControlClient = struct {
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
     /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`,
-    /// `sendPaneLiteralInputTracked`, or `consumeOutbound` call.
+    /// `sendPaneInputTracked`, `sendPaneLiteralInputTracked`, or
+    /// `consumeOutbound` call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -308,6 +309,14 @@ pub const ControlClient = struct {
         return self.channel.enqueueCommandFrom(.host, command);
     }
 
+    /// Bytes escaped as octal inside the double-quoted `send-keys -l`
+    /// payload, per tmux(1) PARSING SYNTAX: inside double quotes tmux
+    /// still replaces `$VAR`, expands a leading `~`, and decodes `\`
+    /// escapes, and a raw `"` would terminate the argument. Control
+    /// bytes and DEL are escaped because quoted strings cannot span
+    /// lines and the control channel is newline-delimited. Everything
+    /// else is literal in double quotes — including `;` and `#{...}`,
+    /// which deliberately pass through unescaped.
     fn literalByteNeedsEscape(byte: u8) bool {
         return byte < 0x20 or byte == 0x7f or
             byte == '\\' or byte == '"' or byte == '$' or byte == '~';
