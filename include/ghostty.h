@@ -1422,6 +1422,28 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input(
     const uint8_t*,
     size_t);
 
+// Sends nonempty already-encoded terminal bytes exactly as above, but reports
+// this command through COMMAND_COMPLETE and writes its correlation token to
+// the final argument. This is for callers that must sequence later input after
+// tmux has completed this exact send-keys command.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
+    ghostty_tmux_client_t,
+    uint64_t,
+    const uint8_t*,
+    size_t,
+    uint64_t*);
+
+// Sends one nonempty UTF-8 terminal payload to a known pane as a single
+// send-keys -l argument and reports completion exactly as the tracked exact
+// input API above. NUL and invalid UTF-8 are rejected because tmux literal
+// arguments cannot preserve them; use exact pane input for arbitrary bytes.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_literal_input_tracked(
+    ghostty_tmux_client_t,
+    uint64_t,
+    const uint8_t*,
+    size_t,
+    uint64_t*);
+
 // Rehydrates one live pane into its existing canonical terminal. This does not
 // select, zoom, or otherwise change tmux presentation. Enqueue any required
 // presentation command immediately before this call; both operations remain in
