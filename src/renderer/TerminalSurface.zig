@@ -1527,6 +1527,18 @@ pub fn freeSelectedText(
     self.alloc.free(text);
 }
 
+/// Copy the active screen's currently visible viewport while holding
+/// Shared.mutex. The snapshot does not change selection or scroll state. The
+/// caller owns the returned bytes and must release them through
+/// freeSelectedText.
+pub fn viewportText(self: *TerminalSurface) ![:0]const u8 {
+    self.shared.mutex.lock();
+    defer self.shared.mutex.unlock();
+    const text = try self.shared.terminal.plainString(self.alloc);
+    defer self.alloc.free(text);
+    return self.alloc.dupeZ(u8, text);
+}
+
 /// Filter modifiers for native text translation. The original modifiers must
 /// still be passed to `key` so terminal encoding can apply Alt semantics.
 pub fn keyTranslationMods(
@@ -3169,4 +3181,47 @@ test "terminal surface pointer and pressure validation" {
     try testing.expect(validPointerCoordinate(2_147_483_520, 0));
     try testing.expect(!validPointerCoordinate(2_147_483_648, 0));
     try testing.expect(!validPointerCoordinate(-2_147_483_520, 256));
+}
+
+test "TerminalSurface viewport text snapshots active visible rows without mutation" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("0\r\n1\r\n2\r\n3\r\n4");
+        const screen = shared.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
+        try screen.select(terminal.Selection.init(pin, pin, false));
+        surface.runtime.state.scroll_cell_offset = 0.5;
+    }
+
+    const before = surface.selectionSnapshot();
+    const selected = try surface.selectedText();
+    surface.freeSelectedText(selected);
+    const text = try surface.viewportText();
+    defer surface.freeSelectedText(text);
+    try testing.expectEqualStrings("2\n3\n4", text);
+    try testing.expectEqual(before, surface.selectionSnapshot());
+    try testing.expectEqual(@as(f64, 0.5), surface.runtime.state.scroll_cell_offset);
+
+    shared.mutex.lock();
+    {
+        defer shared.mutex.unlock();
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049halt");
+    }
+    const alternate = try surface.viewportText();
+    defer surface.freeSelectedText(alternate);
+    try testing.expect(std.mem.indexOf(u8, alternate, "alt") != null);
+    try testing.expect(std.mem.indexOf(u8, alternate, "4") == null);
 }

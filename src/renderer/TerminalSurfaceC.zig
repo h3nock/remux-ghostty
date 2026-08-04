@@ -741,6 +741,22 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .sent;
     }
 
+    export fn ghostty_terminal_surface_read_viewport(
+        surface: ?*Surface,
+        out_ptr: ?*Text,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = emptyText();
+        const text = value.core.viewportText() catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .unavailable,
+        };
+        out.text = text.ptr;
+        out.text_len = text.len;
+        return .sent;
+    }
+
     export fn ghostty_terminal_surface_free_text(
         surface: ?*Surface,
         text_ptr: ?*Text,
@@ -785,6 +801,7 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_link"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_set_selection_endpoint"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_clear_selection"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_read_viewport"));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_input_result_e));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(c.ghostty_terminal_surface_selection_endpoint_e));
