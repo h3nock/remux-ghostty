@@ -962,18 +962,18 @@ typedef enum {
   GHOSTTY_TERMINAL_SURFACE_SELECTION_ENDPOINT_END = 1,
 } ghostty_terminal_surface_selection_endpoint_e;
 
-// A point-in-time backing-pixel rectangle for one selected terminal cell.
-// Coordinates use the full surface's top-left origin and therefore include
+// Point-in-time presentation geometry for one terminal cell. Coordinates use
+// the full surface's top-left backing-pixel origin and therefore include
 // surface padding. Fractional viewport scrolling is reflected in y_px. When
 // visible is true, the full unclipped cell rectangle intersects the terminal-
-// grid clip. When visible is false, all rectangle fields are zero.
+// grid clip. When visible is false, all geometry fields are zero.
 typedef struct {
   double x_px;
   double y_px;
   uint32_t width_px;
   uint32_t height_px;
   bool visible;
-} ghostty_terminal_surface_selection_rect_s;
+} ghostty_terminal_surface_cell_geometry_s;
 
 // start and end preserve Ghostty's canonical endpoint roles. They are not
 // ordered by content position and are not swapped when a selection crosses
@@ -982,8 +982,8 @@ typedef struct {
 // viewport or fractional-scroll changes, surface size/config changes, or an
 // active-screen change. No terminal/grid reference escapes this value.
 typedef struct {
-  ghostty_terminal_surface_selection_rect_s start;
-  ghostty_terminal_surface_selection_rect_s end;
+  ghostty_terminal_surface_cell_geometry_s start;
+  ghostty_terminal_surface_cell_geometry_s end;
   bool active;
   bool rectangle;
 } ghostty_terminal_surface_selection_snapshot_s;
@@ -1582,6 +1582,16 @@ GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_selection_snapshot(
     ghostty_terminal_surface_t,
     ghostty_terminal_surface_selection_snapshot_s*);
+
+// Returns the active screen's logical cursor-cell geometry in the current
+// presentation viewport without changing terminal state or waking the
+// renderer. Cursor mode visibility and blink phase do not affect this logical
+// position. Geometry is visible=false while the cursor is outside the current
+// viewport, including when the host is viewing scrollback above it.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_cursor_geometry(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_cell_geometry_s*);
 
 // The following local selection operations never route through terminal mouse
 // reporting and never invoke write_cb. Points are finite backing-pixel surface

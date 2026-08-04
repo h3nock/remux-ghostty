@@ -148,7 +148,7 @@ pub const SelectionEndpoint = enum(c_int) {
     end = 1,
 };
 
-pub const SelectionRect = extern struct {
+pub const CellGeometry = extern struct {
     x_px: f64 = 0,
     y_px: f64 = 0,
     width_px: u32 = 0,
@@ -157,8 +157,8 @@ pub const SelectionRect = extern struct {
 };
 
 pub const SelectionSnapshot = extern struct {
-    start: SelectionRect = .{},
-    end: SelectionRect = .{},
+    start: CellGeometry = .{},
+    end: CellGeometry = .{},
     active: bool = false,
     rectangle: bool = false,
 };
@@ -376,6 +376,14 @@ pub fn selectionSnapshot(self: *TerminalSurface) SelectionSnapshot {
     self.shared.mutex.lock();
     defer self.shared.mutex.unlock();
     return self.selectionSnapshotLocked();
+}
+
+/// Snapshot the active screen's logical cursor-cell geometry in the current
+/// presentation viewport.
+pub fn cursorGeometry(self: *TerminalSurface) CellGeometry {
+    self.shared.mutex.lock();
+    defer self.shared.mutex.unlock();
+    return self.cursorGeometryLocked();
 }
 
 /// Select the canonical Ghostty word at a presentation point. An unwritten
@@ -1016,17 +1024,22 @@ fn selectionSnapshotLocked(self: *const TerminalSurface) SelectionSnapshot {
     const screen = self.shared.terminal.screens.active;
     const selection = screen.selection orelse return .{};
     return .{
-        .start = self.selectionRectLocked(selection.start()),
-        .end = self.selectionRectLocked(selection.end()),
+        .start = self.cellGeometryLocked(selection.start()),
+        .end = self.cellGeometryLocked(selection.end()),
         .active = true,
         .rectangle = selection.rectangle,
     };
 }
 
-fn selectionRectLocked(
+fn cursorGeometryLocked(self: *const TerminalSurface) CellGeometry {
+    const cursor = self.shared.terminal.screens.active.cursor;
+    return self.cellGeometryLocked(cursor.page_pin.*);
+}
+
+fn cellGeometryLocked(
     self: *const TerminalSurface,
     pin: terminal.Pin,
-) SelectionRect {
+) CellGeometry {
     const point = self.shared.terminal.screens.active.pages.pointFromPin(
         .viewport,
         pin,
@@ -2419,6 +2432,55 @@ test "terminal surface selection snapshot follows viewport and active screen" {
     snapshot = surface.selectionSnapshot();
     // Ghostty clears the destination screen's prior selection on a switch.
     try testing.expect(!snapshot.active);
+}
+
+test "terminal surface cursor geometry follows viewport and active screen" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size = .{
+        .screen = .{ .width = 104, .height = 64 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 2, .bottom = 2, .left = 2, .right = 2 },
+    };
+
+    var geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 2), geometry.x_px);
+    try testing.expectEqual(@as(f64, 2), geometry.y_px);
+    try testing.expectEqual(@as(u32, 10), geometry.width_px);
+    try testing.expectEqual(@as(u32, 20), geometry.height_px);
+
+    testFeed(shared, "\x1b[3;4H");
+    geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 32), geometry.x_px);
+    try testing.expectEqual(@as(f64, 42), geometry.y_px);
+
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 32), geometry.y_px);
+
+    surface.runtime.state.scroll_cell_offset = 0;
+    testFeed(shared, "\r\nzero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+    shared.mutex.lock();
+    shared.terminal.scrollViewport(.top);
+    shared.mutex.unlock();
+    geometry = surface.cursorGeometry();
+    try testing.expect(!geometry.visible);
+    try testing.expectEqualDeep(CellGeometry{}, geometry);
+
+    testFeed(shared, "\x1b[?1049h\x1b[2;3H");
+    geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 22), geometry.x_px);
+    try testing.expectEqual(@as(f64, 22), geometry.y_px);
 }
 
 test "terminal surface word selection is local and refreshes after reflow" {
