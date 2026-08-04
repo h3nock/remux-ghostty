@@ -1032,8 +1032,22 @@ fn selectionSnapshotLocked(self: *const TerminalSurface) SelectionSnapshot {
 }
 
 fn cursorGeometryLocked(self: *const TerminalSurface) CellGeometry {
-    const cursor = self.shared.terminal.screens.active.cursor;
-    return self.cellGeometryLocked(cursor.page_pin.*);
+    const screen = self.shared.terminal.screens.active;
+    const cursor = screen.cursor;
+    const scrollbar = screen.pages.scrollbar();
+    const active_top = scrollbar.total - scrollbar.len;
+    const cursor_row = std.math.add(
+        usize,
+        active_top,
+        cursor.y,
+    ) catch return .{};
+    if (cursor_row < scrollbar.offset) return .{};
+    const viewport_y = cursor_row - scrollbar.offset;
+
+    return self.cellGeometryAtViewportCoordinateLocked(.{
+        .x = cursor.x,
+        .y = std.math.cast(u32, viewport_y) orelse return .{},
+    });
 }
 
 fn cellGeometryLocked(
@@ -1044,7 +1058,13 @@ fn cellGeometryLocked(
         .viewport,
         pin,
     ) orelse return .{};
-    const coord = point.viewport;
+    return self.cellGeometryAtViewportCoordinateLocked(point.viewport);
+}
+
+fn cellGeometryAtViewportCoordinateLocked(
+    self: *const TerminalSurface,
+    coord: terminal.point.Coordinate,
+) CellGeometry {
     const cell_width: f64 = @floatFromInt(self.size.cell.width);
     const cell_height: f64 = @floatFromInt(self.size.cell.height);
     const grid = self.size.grid();
@@ -2476,6 +2496,24 @@ test "terminal surface cursor geometry follows viewport and active screen" {
     try testing.expect(!geometry.visible);
     try testing.expectEqualDeep(CellGeometry{}, geometry);
 
+    testFeed(shared, "\x1b[2;3H");
+    shared.mutex.lock();
+    const scrollbar = shared.terminal.screens.active.pages.scrollbar();
+    shared.terminal.scrollViewport(.{ .row = scrollbar.total - scrollbar.len - 1 });
+    shared.mutex.unlock();
+    geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 22), geometry.x_px);
+    try testing.expectEqual(@as(f64, 42), geometry.y_px);
+
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    testFeed(shared, "\x1b[3;3H");
+    geometry = surface.cursorGeometry();
+    try testing.expect(geometry.visible);
+    try testing.expectEqual(@as(f64, 22), geometry.x_px);
+    try testing.expectEqual(@as(f64, 52), geometry.y_px);
+
+    surface.runtime.state.scroll_cell_offset = 0;
     testFeed(shared, "\x1b[?1049h\x1b[2;3H");
     geometry = surface.cursorGeometry();
     try testing.expect(geometry.visible);
