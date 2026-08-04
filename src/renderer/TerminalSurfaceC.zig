@@ -75,7 +75,7 @@ pub const InteractionState = extern struct {
 };
 
 pub const SelectionEndpoint = renderer.TerminalSurface.SelectionEndpoint;
-pub const SelectionRect = renderer.TerminalSurface.SelectionRect;
+pub const CellGeometry = renderer.TerminalSurface.CellGeometry;
 pub const SelectionSnapshot = renderer.TerminalSurface.SelectionSnapshot;
 
 pub const Text = extern struct {
@@ -542,6 +542,16 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_cursor_geometry(
+        surface: ?*Surface,
+        out_ptr: ?*CellGeometry,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = value.core.cursorGeometry();
+        return .ok;
+    }
+
     export fn ghostty_terminal_surface_select_word(
         surface: ?*Surface,
         x: f64,
@@ -770,6 +780,7 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_input"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_selection_snapshot"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_cursor_geometry"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_word"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_link"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_set_selection_endpoint"));
@@ -850,7 +861,7 @@ test "terminal surface C ABI matches ghostty header" {
         InteractionState,
         c.ghostty_terminal_surface_interaction_state_s,
     );
-    try expectStructLayout(SelectionRect, c.ghostty_terminal_surface_selection_rect_s);
+    try expectStructLayout(CellGeometry, c.ghostty_terminal_surface_cell_geometry_s);
     try expectStructLayout(
         SelectionSnapshot,
         c.ghostty_terminal_surface_selection_snapshot_s,
@@ -933,6 +944,14 @@ test "terminal surface C selection validation" {
         .active = true,
     };
     var out = sentinel;
+    const geometry_sentinel: CellGeometry = .{
+        .x_px = 2,
+        .y_px = 3,
+        .width_px = 4,
+        .height_px = 5,
+        .visible = true,
+    };
+    var geometry_out = geometry_sentinel;
     const target_sentinel: Text = .{
         .tl_px_x = 1,
         .tl_px_y = 2,
@@ -948,6 +967,11 @@ test "terminal surface C selection validation" {
         CAPI.ghostty_terminal_surface_selection_snapshot(null, &out),
     );
     try testing.expectEqualDeep(sentinel, out);
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_cursor_geometry(null, &geometry_out),
+    );
+    try testing.expectEqualDeep(geometry_sentinel, geometry_out);
     try testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_select_link(
@@ -988,6 +1012,10 @@ test "terminal surface C selection validation" {
     try testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_selection_snapshot(fake_surface, null),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_cursor_geometry(fake_surface, null),
     );
     try testing.expectEqual(
         Result.invalid_input,

@@ -985,9 +985,14 @@ pub const Viewer = struct {
                 }
             else
                 layout;
+            const active_pane_id = if (is_zoomed) switch (visible_layout.content) {
+                .pane => |id| id,
+                .horizontal, .vertical => return error.InvalidVisibleLayout,
+            } else window.active_pane_id;
             window.width = layout.width;
             window.height = layout.height;
             window.is_zoomed = is_zoomed;
+            window.active_pane_id = active_pane_id;
             window.layout = layout;
             window.visible_layout = visible_layout;
         }
@@ -3673,6 +3678,7 @@ test "zoomed geometry follows visible layout" {
     try testing.expectEqual(1, actions.len);
     try testing.expect(actions[0] == .windows);
     try testing.expect(viewer.windows.items[0].is_zoomed);
+    try testing.expectEqual(1, viewer.windows.items[0].active_pane_id);
     try testing.expectEqual(83, viewer.windows.items[0].width);
     try testing.expectEqual(44, viewer.windows.items[0].height);
     try testing.expectEqual(83, viewer.panes.get(0).?.terminal_owner.terminal.cols);
@@ -3685,6 +3691,25 @@ test "zoomed geometry follows visible layout" {
     try testing.expectEqual(terminal_1, &viewer.panes.get(1).?.terminal_owner.terminal);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
+
+    const successor_actions = viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = "9c1f,83x44,0,0{41x44,0,0,1,41x44,42,0,2}",
+        .visible_layout = "b7de,83x44,0,0,1",
+        .raw_flags = "*",
+    } } });
+    try testing.expect(successor_actions.len > 0);
+    try testing.expect(successor_actions[0] == .windows);
+    try testing.expect(!viewer.panes.contains(0));
+    try testing.expect(viewer.panes.contains(1));
+    try testing.expect(viewer.panes.contains(2));
+    try testing.expectEqual(1, viewer.windows.items[0].active_pane_id);
+
+    const duplicate_active = viewer.next(.{ .tmux = .{ .window_pane_changed = .{
+        .window_id = 0,
+        .pane_id = 1,
+    } } });
+    try testing.expectEqual(0, duplicate_active.len);
 }
 
 test "layout change" {
