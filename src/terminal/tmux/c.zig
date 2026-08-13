@@ -22,6 +22,7 @@ pub const Result = enum(c_int) {
     invalid_consumption,
     pane_unknown,
     callback_active,
+    window_unknown,
 };
 
 pub const Bytes = extern struct {
@@ -474,6 +475,17 @@ export fn ghostty_tmux_client_refresh_pane(
     return .ok;
 }
 
+export fn ghostty_tmux_client_refresh_window_pane_metadata(
+    client: ?*Client,
+    window_id: u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const id = std.math.cast(usize, window_id) orelse return .invalid_input;
+    value.control.refreshWindowPaneMetadata(id) catch |err|
+        return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_retain_pane_terminal(
     client: ?*Client,
     pane_id: u64,
@@ -565,6 +577,7 @@ fn mapClientError(err: ControlClient.Error) Result {
         error.InvalidTokenCount => .invalid_input,
         error.TokenExhausted => .token_exhausted,
         error.PaneUnknown => .pane_unknown,
+        error.WindowUnknown => .window_unknown,
     };
 }
 
@@ -1256,6 +1269,32 @@ test "tmux C client pane refresh boundary" {
     try testing.expectEqual(
         ControlClient.PanePhase.live,
         client.control.panePhase(0).?,
+    );
+}
+
+test "tmux C client window pane metadata refresh boundary" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_refresh_window_pane_metadata(null, 0),
+    );
+    try testing.expectEqual(
+        Result.not_ready,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 0),
+    );
+    try openPaneTestClient(&client);
+    try testing.expectEqual(
+        Result.window_unknown,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 99),
+    );
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 0),
     );
 }
 
