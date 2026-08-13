@@ -54,6 +54,11 @@ pub const ControlClient = struct {
         hydrating,
         live,
     };
+    pub const PaneInfo = struct {
+        phase: PanePhase,
+        current_command: []const u8,
+        current_path: []const u8,
+    };
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
         error{ ClientFailed, InvalidInput, PaneUnknown };
@@ -105,10 +110,23 @@ pub const ControlClient = struct {
         self: *const ControlClient,
         pane_id: usize,
     ) ?PanePhase {
+        return (self.paneInfo(pane_id) orelse return null).phase;
+    }
+
+    /// Borrow topology state for `pane_id`. String values remain valid until
+    /// the next serialized client operation.
+    pub fn paneInfo(
+        self: *const ControlClient,
+        pane_id: usize,
+    ) ?PaneInfo {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
-        return switch (pane.phase) {
-            .initial_hydrating, .refreshing => .hydrating,
-            .live => .live,
+        return .{
+            .phase = switch (pane.phase) {
+                .initial_hydrating, .refreshing => .hydrating,
+                .live => .live,
+            },
+            .current_command = pane.current_command,
+            .current_path = pane.current_path,
         };
     }
 

@@ -566,6 +566,10 @@ typedef struct {
   size_t width;
   size_t height;
   ghostty_tmux_pane_phase_e phase;
+  // Borrowed for the duration of the topology visitor callback.
+  ghostty_tmux_bytes_s current_command;
+  // Borrowed for the duration of the topology visitor callback.
+  ghostty_tmux_bytes_s current_path;
 } ghostty_tmux_pane_record_s;
 
 typedef union {
