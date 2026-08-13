@@ -36,6 +36,35 @@ pub fn parseFormatStruct(
     return result;
 }
 
+/// Parse a formatted record whose final field may contain the delimiter.
+/// All preceding fields remain strict; the final field receives the complete
+/// unconsumed remainder.
+pub fn parseFormatStructFinalRemainder(
+    comptime T: type,
+    str: []const u8,
+    delimiter: u8,
+) ParseError!T {
+    const fields = @typeInfo(T).@"struct".fields;
+    var remaining = str;
+    var result: T = undefined;
+    inline for (fields, 0..) |field, index| {
+        const part = if (index + 1 == fields.len)
+            remaining
+        else part: {
+            const end = std.mem.indexOfScalar(u8, remaining, delimiter) orelse
+                return error.MissingEntry;
+            const value = remaining[0..end];
+            remaining = remaining[end + 1 ..];
+            break :part value;
+        };
+        @field(result, field.name) = Variable.parse(
+            @field(Variable, field.name),
+            part,
+        ) catch return error.FormatError;
+    }
+    return result;
+}
+
 pub fn comptimeFormat(
     comptime vars: []const Variable,
     comptime delimiter: u8,
@@ -147,6 +176,10 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// Current command reported by tmux for the pane process.
+    pane_current_command,
+    /// Current working directory reported by tmux for the pane process.
+    pane_current_path,
     /// Current pane width in cells.
     pane_width,
     /// Current pane height in cells.
@@ -232,6 +265,8 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_current_command,
+            .pane_current_path,
             .version,
             .window_layout,
             .window_visible_layout,
@@ -279,6 +314,8 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_current_command,
+            .pane_current_path,
             .version,
             .window_layout,
             .window_visible_layout,

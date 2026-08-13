@@ -22,6 +22,7 @@ pub const Result = enum(c_int) {
     invalid_consumption,
     pane_unknown,
     callback_active,
+    window_unknown,
 };
 
 pub const Bytes = extern struct {
@@ -92,6 +93,8 @@ pub const PaneRecord = extern struct {
     width: usize,
     height: usize,
     phase: PanePhase,
+    current_command: Bytes,
+    current_path: Bytes,
 };
 
 pub const TopologyRecordValue = extern union {
@@ -472,6 +475,17 @@ export fn ghostty_tmux_client_refresh_pane(
     return .ok;
 }
 
+export fn ghostty_tmux_client_refresh_window_pane_metadata(
+    client: ?*Client,
+    window_id: u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const id = std.math.cast(usize, window_id) orelse return .invalid_input;
+    value.control.refreshWindowPaneMetadata(id) catch |err|
+        return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_retain_pane_terminal(
     client: ?*Client,
     pane_id: u64,
@@ -528,7 +542,7 @@ fn visitLayout(
         .pane => |pane_id| {
             // Published windows and the pane map are synchronized atomically
             // by Viewer before this callback is emitted.
-            const phase = view.client.panePhase(pane_id) orelse unreachable;
+            const info = view.client.paneInfo(pane_id) orelse unreachable;
             var record: TopologyRecord = .{
                 .tag = .pane,
                 .value = .{ .pane = .{
@@ -538,7 +552,9 @@ fn visitLayout(
                     .y = layout.y,
                     .width = layout.width,
                     .height = layout.height,
-                    .phase = switch (phase) {
+                    .current_command = .fromSlice(info.current_command),
+                    .current_path = .fromSlice(info.current_path),
+                    .phase = switch (info.phase) {
                         .hydrating => .hydrating,
                         .live => .live,
                     },
@@ -561,6 +577,7 @@ fn mapClientError(err: ControlClient.Error) Result {
         error.InvalidTokenCount => .invalid_input,
         error.TokenExhausted => .token_exhausted,
         error.PaneUnknown => .pane_unknown,
+        error.WindowUnknown => .window_unknown,
     };
 }
 
@@ -1235,7 +1252,7 @@ test "tmux C client pane refresh boundary" {
     try feedTest(
         &client,
         "%begin 9 9 1\n" ++
-            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
+            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n" ++
             "%begin 10 10 1\n%end 10 10 1\n" ++
             "%begin 11 11 1\n%end 11 11 1\n" ++
@@ -1244,9 +1261,40 @@ test "tmux C client pane refresh boundary" {
     );
     try testing.expectEqual(1, context.pane_changed_count);
     try testing.expectEqual(0, context.pane_changed_ids[0]);
+    try testing.expectEqual(2, context.topology_count);
+    try testing.expectEqual(2, context.record_count);
+    const record = context.records[1].value.pane;
+    try testing.expectEqualStrings("nvim", try record.current_command.slice());
+    try testing.expectEqualStrings("/work/editor", try record.current_path.slice());
     try testing.expectEqual(
         ControlClient.PanePhase.live,
         client.control.panePhase(0).?,
+    );
+}
+
+test "tmux C client window pane metadata refresh boundary" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_tmux_client_refresh_window_pane_metadata(null, 0),
+    );
+    try testing.expectEqual(
+        Result.not_ready,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 0),
+    );
+    try openPaneTestClient(&client);
+    try testing.expectEqual(
+        Result.window_unknown,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 99),
+    );
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_tmux_client_refresh_window_pane_metadata(&client, 0),
     );
 }
 

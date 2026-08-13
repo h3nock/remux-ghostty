@@ -54,9 +54,14 @@ pub const ControlClient = struct {
         hydrating,
         live,
     };
+    pub const PaneInfo = struct {
+        phase: PanePhase,
+        current_command: []const u8,
+        current_path: []const u8,
+    };
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
-        error{ ClientFailed, InvalidInput, PaneUnknown };
+        error{ ClientFailed, InvalidInput, PaneUnknown, WindowUnknown };
 
     pub fn init(
         alloc: Allocator,
@@ -105,10 +110,23 @@ pub const ControlClient = struct {
         self: *const ControlClient,
         pane_id: usize,
     ) ?PanePhase {
+        return (self.paneInfo(pane_id) orelse return null).phase;
+    }
+
+    /// Borrow topology state for `pane_id`. String values remain valid until
+    /// the next serialized client operation.
+    pub fn paneInfo(
+        self: *const ControlClient,
+        pane_id: usize,
+    ) ?PaneInfo {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
-        return switch (pane.phase) {
-            .initial_hydrating, .refreshing => .hydrating,
-            .live => .live,
+        return .{
+            .phase = switch (pane.phase) {
+                .initial_hydrating, .refreshing => .hydrating,
+                .live => .live,
+            },
+            .current_command = pane.current_command,
+            .current_path = pane.current_path,
         };
     }
 
@@ -151,6 +169,30 @@ pub const ControlClient = struct {
             }
         };
         try self.viewer.refreshPane(pane_id, Submitter{
+            .channel = &self.channel,
+        });
+    }
+
+    /// Refresh current command and path metadata for every pane in one window.
+    /// This enqueues one list-panes command and does not capture or rehydrate
+    /// terminal contents.
+    pub fn refreshWindowPaneMetadata(
+        self: *ControlClient,
+        window_id: usize,
+    ) Error!void {
+        try self.validateCommandAdmission();
+
+        const Submitter = struct {
+            channel: *channel_pkg.Channel,
+
+            pub fn submitPaneMetadataRefresh(
+                value: @This(),
+                command: []const u8,
+            ) channel_pkg.Channel.EnqueueError!void {
+                _ = try value.channel.enqueueCommandFrom(.viewer, command);
+            }
+        };
+        try self.viewer.refreshWindowPaneMetadata(window_id, Submitter{
             .channel = &self.channel,
         });
     }
@@ -1153,6 +1195,73 @@ test "control client pane refresh admission and command order" {
     try testing.expectEqual(4, std.mem.count(u8, outbound[state_index..], " ; "));
 }
 
+test "control client refreshes window pane metadata without hydration" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try testing.expectError(error.NotReady, client.refreshWindowPaneMetadata(0));
+    try openPaneTestClient(&client, &actions);
+    try testing.expectError(error.WindowUnknown, client.refreshWindowPaneMetadata(99));
+
+    try client.refreshWindowPaneMetadata(0);
+    try testing.expectEqualStrings(
+        "list-panes -t @0 -F '#{pane_id};#{pane_current_command};#{pane_current_path}'\n",
+        client.outboundBytes(),
+    );
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 9 9 1\n%0;nvim;/work/editor;branch\n%end 9 9 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+    try testing.expectEqualStrings("nvim", client.paneInfo(0).?.current_command);
+    try testing.expectEqualStrings("/work/editor;branch", client.paneInfo(0).?.current_path);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    actions.records.clearRetainingCapacity();
+
+    try client.refreshWindowPaneMetadata(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 10 10 1\n%0;nvim;/work/editor;branch\n%end 10 10 1\n",
+        &actions,
+    );
+    try testing.expectEqual(0, actions.records.items.len);
+}
+
+test "control client window pane metadata failure is nonfatal" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    try client.refreshWindowPaneMetadata(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 9 9 1\ncan't find window: @0\n%error 9 9 1\n",
+        &actions,
+    );
+    try testing.expectEqual(0, actions.records.items.len);
+
+    const token = try client.enqueueCommand("display-message -p still-alive");
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 10 10 1\nstill-alive\n%end 10 10 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+}
+
 test "control client pane refresh preserves identity and output cut" {
     const testing = std.testing;
 
@@ -1186,11 +1295,15 @@ test "control client pane refresh preserves identity and output cut" {
 
     try client.feed(
         "%begin 9 9 1\n" ++
-            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16\n" ++
+            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n",
         &actions,
     );
-    try testing.expectEqual(0, actions.records.items.len);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+    actions.records.clearRetainingCapacity();
+    try testing.expectEqualStrings("nvim", client.paneInfo(0).?.current_command);
+    try testing.expectEqualStrings("/work/editor", client.paneInfo(0).?.current_path);
     try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
     const same = client.retainPaneTerminal(0).?;
     defer same.release();

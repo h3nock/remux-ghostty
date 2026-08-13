@@ -510,6 +510,7 @@ typedef enum {
   GHOSTTY_TMUX_RESULT_INVALID_CONSUMPTION,
   GHOSTTY_TMUX_RESULT_PANE_UNKNOWN,
   GHOSTTY_TMUX_RESULT_CALLBACK_ACTIVE,
+  GHOSTTY_TMUX_RESULT_WINDOW_UNKNOWN,
 } ghostty_tmux_result_e;
 
 typedef struct {
@@ -566,6 +567,10 @@ typedef struct {
   size_t width;
   size_t height;
   ghostty_tmux_pane_phase_e phase;
+  // Borrowed for the duration of the topology visitor callback.
+  ghostty_tmux_bytes_s current_command;
+  // Borrowed for the duration of the topology visitor callback.
+  ghostty_tmux_bytes_s current_path;
 } ghostty_tmux_pane_record_s;
 
 typedef union {
@@ -1459,6 +1464,17 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_literal_input_tr
 // NOT_READY means the client or pane cannot accept a refresh yet; PANE_UNKNOWN
 // means the pane is not tracked.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_refresh_pane(
+    ghostty_tmux_client_t,
+    uint64_t);
+
+// Refreshes current command and path metadata for every pane in one known
+// window using one list-panes command. Terminal contents, pane phases, and tmux
+// presentation are unchanged. Updated metadata is reported through TOPOLOGY
+// only when a value changed. A tmux-side failure is nonfatal and leaves the
+// last observed metadata intact. WINDOW_UNKNOWN means the window is not in the
+// current topology.
+GHOSTTY_API ghostty_tmux_result_e
+ghostty_tmux_client_refresh_window_pane_metadata(
     ghostty_tmux_client_t,
     uint64_t);
 
