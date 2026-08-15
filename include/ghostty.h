@@ -1552,6 +1552,11 @@ ghostty_terminal_surface_update_config(ghostty_terminal_surface_t);
 GHOSTTY_API void ghostty_terminal_surface_free(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_draw(
     ghostty_terminal_surface_t);
+// Asynchronously rebuild and publish a frame from the current terminal state.
+// This works while the surface is hidden and does not change visibility or
+// focus. Multiple requests queued before the renderer wakes may be coalesced.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_request_frame(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_terminal_changed(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e

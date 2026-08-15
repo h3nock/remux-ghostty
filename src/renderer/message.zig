@@ -22,6 +22,9 @@ pub const Message = union(enum) {
     /// and still have focus.
     visible: bool,
 
+    /// Rebuild and publish a frame without changing presentation state.
+    request_frame,
+
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
     reset_cursor_blink,
