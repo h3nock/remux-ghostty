@@ -366,7 +366,7 @@ fn syncDrawTimer(self: *Thread) void {
 }
 
 /// Drain the mailbox.
-fn drainMailbox(self: *Thread) !void {
+fn drainMailbox(self: *Thread, frame_requested: *bool) !void {
     // There's probably a more elegant way to do this...
     //
     // This is effectively an @autoreleasepool{} block, which we need in
@@ -400,7 +400,7 @@ fn drainMailbox(self: *Thread) !void {
                         self.flags.cursor_blink_visible,
                     ) catch |err|
                         log.warn("error rendering on visibility regain err={}", .{err});
-                    self.drawFrame(false);
+                    self.drawFrame(false, false);
                 }
 
                 // Notify the renderer so it can update any state.
@@ -413,6 +413,8 @@ fn drainMailbox(self: *Thread) !void {
                 // so its easier to just let them keep firing and have them
                 // check the visible state themselves to control their behavior.
             },
+
+            .request_frame => frame_requested.* = true,
 
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
@@ -539,9 +541,8 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
-fn drawFrame(self: *Thread, now: bool) void {
-    // If we're invisible, we do not draw.
-    if (!self.flags.visible) return;
+fn drawFrame(self: *Thread, now: bool, allow_hidden: bool) void {
+    if (!self.flags.visible and !allow_hidden) return;
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
@@ -553,6 +554,20 @@ fn drawFrame(self: *Thread, now: bool) void {
         self.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
     }
+}
+
+/// Rebuild terminal-derived renderer state and publish it through the normal
+/// draw path. Explicit requests may do this while presentation is hidden.
+fn renderFrame(self: *Thread, allow_hidden: bool) void {
+    if (!self.flags.visible and !allow_hidden) return;
+
+    self.renderer.updateFrame(
+        self.state,
+        self.flags.cursor_blink_visible,
+    ) catch |err|
+        log.warn("error rendering err={}", .{err});
+
+    self.drawFrame(allow_hidden, allow_hidden);
 }
 
 fn wakeupCallback(
@@ -570,11 +585,17 @@ fn wakeupCallback(
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
-    t.drainMailbox() catch |err|
+    var frame_requested = false;
+    t.drainMailbox(&frame_requested) catch |err| {
         log.err("error draining mailbox err={}", .{err});
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+        // Async notifications may be coalesced, so ensure messages after the
+        // failed one receive another opportunity to drain.
+        t.wakeup.notify() catch |notify_err|
+            log.err("error rescheduling mailbox drain err={}", .{notify_err});
+    };
+
+    t.renderFrame(frame_requested);
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -613,7 +634,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
-    t.drawFrame(true);
+    t.drawFrame(true, false);
 
     return .rearm;
 }
@@ -632,7 +653,7 @@ fn drawCallback(
     };
 
     // Draw
-    t.drawFrame(false);
+    t.drawFrame(false, false);
 
     // Only continue if we're still active
     if (t.draw_active) {
@@ -655,19 +676,7 @@ fn renderCallback(
         return .disarm;
     };
 
-    // If we're not visible there's no point spending CPU rebuilding cells —
-    // we'll catch up when the .visible mailbox message flips us back on.
-    if (!t.flags.visible) return .disarm;
-
-    // Update our frame data
-    t.renderer.updateFrame(
-        t.state,
-        t.flags.cursor_blink_visible,
-    ) catch |err|
-        log.warn("error rendering err={}", .{err});
-
-    // Draw
-    t.drawFrame(false);
+    t.renderFrame(false);
 
     return .disarm;
 }

@@ -318,6 +318,12 @@ pub fn drawFrame(self: *TerminalSurface) !void {
     try self.runtime.renderer.drawFrame(true);
 }
 
+/// Ask the renderer thread to rebuild and publish a frame without changing
+/// this surface's visibility or focus state.
+pub fn requestFrame(self: *TerminalSurface) !void {
+    try self.queueAndWake(.request_frame);
+}
+
 /// Notify the renderer that canonical terminal state changed. This may be
 /// called by a terminal producer after publishing its changes under
 /// Shared.mutex.

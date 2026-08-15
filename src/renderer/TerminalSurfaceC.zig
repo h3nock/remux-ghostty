@@ -447,6 +447,13 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_request_frame(surface: ?*Surface) Result {
+        const value = surface orelse return .invalid_input;
+        value.core.requestFrame() catch |err|
+            return operationError("request frame", err);
+        return .ok;
+    }
+
     export fn ghostty_terminal_surface_terminal_changed(surface: ?*Surface) Result {
         const value = surface orelse return .invalid_input;
         value.core.terminalChanged() catch |err|
@@ -778,6 +785,7 @@ test "terminal surface C ABI matches ghostty header" {
     const c = @import("ghostty.h");
 
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_input"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_request_frame"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_selection_snapshot"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_cursor_geometry"));
@@ -927,6 +935,14 @@ test "terminal surface C config update rejects a null surface" {
     try std.testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_update_config(null),
+    );
+}
+
+test "terminal surface C frame request rejects a null surface" {
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+    try std.testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_request_frame(null),
     );
 }
 
