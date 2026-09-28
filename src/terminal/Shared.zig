@@ -13,12 +13,13 @@ const Terminal = @import("Terminal.zig");
 alloc: Allocator,
 ref_count: std.atomic.Value(usize),
 renderer_claimed: std.atomic.Value(bool),
-mutex: std.Thread.Mutex = .{},
+mutex: std.Io.Mutex = .init,
 terminal: Terminal,
 
 pub const ClaimRendererError = error{RendererAlreadyClaimed};
 
 pub fn init(
+    io: std.Io,
     alloc: Allocator,
     options: Terminal.Options,
 ) Allocator.Error!*Shared {
@@ -29,7 +30,7 @@ pub fn init(
         .alloc = alloc,
         .ref_count = .init(1),
         .renderer_claimed = .init(false),
-        .terminal = try .init(alloc, options),
+        .terminal = try .init(io, alloc, options),
     };
     return self;
 }
@@ -70,7 +71,7 @@ pub fn releaseRenderer(self: *Shared) void {
 
 test "retained terminal survives its original owner" {
     const testing = std.testing;
-    const shared = try Shared.init(testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -78,8 +79,8 @@ test "retained terminal survives its original owner" {
     shared.release();
     defer retained.release();
 
-    retained.mutex.lock();
-    defer retained.mutex.unlock();
+    retained.mutex.lockUncancelable(retained.terminal.io());
+    defer retained.mutex.unlock(retained.terminal.io());
     try retained.terminal.printString("alive");
     const contents = try retained.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
@@ -88,7 +89,7 @@ test "retained terminal survives its original owner" {
 
 test "renderer claim is exclusive and reusable after release" {
     const testing = std.testing;
-    const shared = try Shared.init(testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });

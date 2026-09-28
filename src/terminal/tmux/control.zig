@@ -130,7 +130,7 @@ pub const Parser = struct {
                 if (parseBlockGuard(line)) |guard| if (guard.kind != .begin and
                     std.meta.eql(guard.meta, self.block_meta))
                 {
-                    const output = std.mem.trimRight(
+                    const output = std.mem.trimEnd(
                         u8,
                         written[0..idx],
                         "\r\n",
@@ -239,7 +239,7 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             return null;
         } else if (std.mem.eql(u8, cmd, "%exit")) {
-            const detail = std.mem.trimLeft(u8, line[cmd.len..], " \t");
+            const detail = std.mem.trimStart(u8, line[cmd.len..], " \t");
 
             // Important: do not clear the buffer because detail points into it.
             self.state = .idle;

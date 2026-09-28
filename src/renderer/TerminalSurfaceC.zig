@@ -2,6 +2,7 @@
 //! terminal without constructing a process-owning Surface.
 
 const std = @import("std");
+const global = @import("../global.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
@@ -121,15 +122,15 @@ fn inputMods(raw: c_int) ?input.Mods {
 }
 
 fn mouseButtonState(raw: c_int) ?input.MouseButtonState {
-    return std.meta.intToEnum(input.MouseButtonState, raw) catch null;
+    return std.enums.fromInt(input.MouseButtonState, raw);
 }
 
 fn mouseButtonValue(raw: c_int) ?input.MouseButton {
-    return std.meta.intToEnum(input.MouseButton, raw) catch null;
+    return std.enums.fromInt(input.MouseButton, raw);
 }
 
 fn pressureStage(raw: u32) ?input.MousePressureStage {
-    return std.meta.intToEnum(input.MousePressureStage, raw) catch null;
+    return std.enums.fromInt(input.MousePressureStage, raw);
 }
 
 fn scrollMods(raw: c_int) ?input.ScrollMods {
@@ -146,7 +147,7 @@ fn scrollRow(value: u64) ?usize {
 }
 
 fn selectionEndpoint(raw: c_int) ?SelectionEndpoint {
-    return std.meta.intToEnum(SelectionEndpoint, raw) catch null;
+    return std.enums.fromInt(SelectionEndpoint, raw);
 }
 
 fn interactionStateC(state: renderer.TerminalSurface.InteractionState) InteractionState {

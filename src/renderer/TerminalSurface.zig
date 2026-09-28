@@ -2,6 +2,7 @@
 pub const TerminalSurface = @This();
 
 const std = @import("std");
+const global = @import("../global.zig");
 const builtin = @import("builtin");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
@@ -204,12 +205,13 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     try shared.claimRenderer();
     errdefer shared.releaseRenderer();
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     terminal_config.applyColorDefaults(
+        opts.alloc,
         &shared.terminal,
         terminal_config.colorDefaults(opts.config),
     );
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
     try rendererpkg.Renderer.surfaceInit(opts.rt_surface);
 
@@ -269,9 +271,9 @@ pub fn updateConfig(
     const prepared = opts.prepared_layout.*;
     const defaults = terminal_config.colorDefaults(opts.config);
 
-    self.shared.mutex.lock();
-    terminal_config.applyColorDefaults(&self.shared.terminal, defaults);
-    self.shared.mutex.unlock();
+    self.shared.mutex.lockUncancelable(global.io());
+    terminal_config.applyColorDefaults(self.alloc, &self.shared.terminal, defaults);
+    self.shared.mutex.unlock(global.io());
 
     var old_interaction_config = self.interaction_config;
     self.interaction_config = interaction_config;
@@ -287,8 +289,8 @@ pub fn updateConfig(
 
     self.runtime.setFontGrid(prepared.font_grid_key, prepared.font_grid);
     opts.prepared_layout.owned = false;
-    _ = self.runtime.thread.mailbox.push(renderer_message, .{ .forever = {} });
-    _ = self.runtime.thread.mailbox.push(.{ .resize = prepared.size }, .{ .forever = {} });
+    _ = self.runtime.thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
+    _ = self.runtime.thread.mailbox.push(global.io(), .{ .resize = prepared.size }, .{ .forever = {} });
     self.runtime.thread.wakeup.notify() catch |err| {
         // The update is fully admitted at this point. Match the main Surface
         // config path: a lost notification is diagnostic, not a false report
@@ -307,10 +309,10 @@ pub fn deinit(self: *TerminalSurface) void {
 }
 
 fn deinitInteraction(self: *TerminalSurface) void {
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     self.interaction.gesture.deinit(&self.shared.terminal);
     self.interaction = .{};
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 }
 
 /// Force a draw from the calling thread without rebuilding terminal state.
@@ -372,23 +374,23 @@ pub fn desiredGridSize(self: *const TerminalSurface) rendererpkg.GridSize {
 
 /// Return the terminal interaction state from one synchronized snapshot.
 pub fn interactionState(self: *TerminalSurface) InteractionState {
-    self.shared.mutex.lock();
-    defer self.shared.mutex.unlock();
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
     return self.normalizeAndSnapshotInteractionLocked();
 }
 
 /// Snapshot the canonical selection in the current presentation viewport.
 pub fn selectionSnapshot(self: *TerminalSurface) SelectionSnapshot {
-    self.shared.mutex.lock();
-    defer self.shared.mutex.unlock();
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
     return self.selectionSnapshotLocked();
 }
 
 /// Snapshot the active screen's logical cursor-cell geometry in the current
 /// presentation viewport.
 pub fn cursorGeometry(self: *TerminalSurface) CellGeometry {
-    self.shared.mutex.lock();
-    defer self.shared.mutex.unlock();
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
     return self.cursorGeometryLocked();
 }
 
@@ -402,8 +404,8 @@ pub fn selectWord(
     out: *SelectionSnapshot,
 ) !void {
     const changed = changed: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
 
         const pin = self.selectionPinLocked(x, y) catch |err| {
             out.* = self.selectionSnapshotLocked();
@@ -442,8 +444,8 @@ pub fn selectLink(
     out_matched.* = false;
     out_target.* = null;
     const changed = changed: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
 
         const pin = self.selectionPinLocked(x, y) catch |err| {
             out.* = self.selectionSnapshotLocked();
@@ -505,8 +507,8 @@ pub fn setSelectionEndpoint(
     out: *SelectionSnapshot,
 ) !void {
     const changed = changed: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
 
         const screen = self.shared.terminal.screens.active;
         var selection = screen.selection orelse {
@@ -546,8 +548,8 @@ pub fn clearSelection(
     out: *SelectionSnapshot,
 ) !void {
     const changed = changed: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
         const did_change = self.clearSelectionLocked();
         out.* = self.selectionSnapshotLocked();
         break :changed did_change;
@@ -568,7 +570,7 @@ pub fn scrollToPosition(
 ) !void {
     std.debug.assert(std.math.isFinite(cell_offset));
 
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const before = self.normalizeAndSnapshotInteractionLocked();
     const max_row = scrollbarMaxRow(before.scrollbar);
     const position = normalizeScrollPosition(row, cell_offset, max_row);
@@ -581,7 +583,7 @@ pub fn scrollToPosition(
     }
     self.runtime.state.scroll_cell_offset = position.cell_offset;
     out.* = self.normalizeAndSnapshotInteractionLocked();
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (row_changed or fraction_changed) try self.terminalChanged();
 }
@@ -692,7 +694,7 @@ pub fn pointerPosition(
 
     var changed = false;
     var snapshot: ?PointerSnapshot = null;
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
     const pos: input.mouse_encode.Event.Pos = .{
         .x = @floatCast(x),
@@ -733,7 +735,7 @@ pub fn pointerPosition(
                 })) |selection| {
                     changed = self.applySelectionLocked(selection) catch {
                         self.cancelLocalGestureLocked();
-                        self.shared.mutex.unlock();
+                        self.shared.mutex.unlock(global.io());
                         if (changed) self.committedStateChanged();
                         return .out_of_memory;
                     } or changed;
@@ -741,15 +743,15 @@ pub fn pointerPosition(
             }
         }
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (changed) self.committedStateChanged();
     var report = snapshot orelse return .consumed_no_output;
     const admission = self.admitMouseReport(&report);
     if (admission.result == .sent) {
-        self.shared.mutex.lock();
+        self.shared.mutex.lockUncancelable(global.io());
         self.interaction.last_reported_cell = admission.last_cell;
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
     }
     return admission.result;
 }
@@ -770,7 +772,7 @@ pub fn mouseButton(
     var snapshot: ?PointerSnapshot = null;
     var reported_pressed = std.StaticBitSet(input.MouseButton.max + 1).initEmpty();
 
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
     self.interaction.mods = mods.binding();
     if (self.remoteMouseLocked()) {
@@ -825,13 +827,7 @@ pub fn mouseButton(
                         .not_accepted,
                     );
                 };
-                const now = std.time.Instant.now() catch |err| now: {
-                    log.warn(
-                        "failed to read click time; multi-click disabled err={}",
-                        .{err},
-                    );
-                    break :now null;
-                };
+                const now = std.Io.Timestamp.now(global.io(), .awake);
                 const selection = self.interaction.gesture.press(term, .{
                     .time = now,
                     .pin = pin,
@@ -871,7 +867,7 @@ pub fn mouseButton(
             },
         }
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     var report = snapshot orelse {
         if (changed) self.committedStateChanged();
@@ -881,13 +877,13 @@ pub fn mouseButton(
     if (admission.result == .sent or
         admission.result == .consumed_no_output)
     {
-        self.shared.mutex.lock();
+        self.shared.mutex.lockUncancelable(global.io());
         if (admission.result == .sent) {
             self.interaction.last_reported_cell = admission.last_cell;
         }
         self.interaction.reported_pressed = reported_pressed;
         changed = self.clearSelectionLocked() or changed;
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
     }
     if (changed) self.committedStateChanged();
     return admission.result;
@@ -898,7 +894,7 @@ fn finishInteractionLocked(
     changed: bool,
     result: InputResult,
 ) InputResult {
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
     if (changed) self.committedStateChanged();
     return result;
 }
@@ -912,7 +908,7 @@ pub fn mousePressure(
     if (!std.math.isFinite(pressure)) return .invalid_input;
 
     var changed = false;
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
     if (stage == .none) {
         self.interaction.pressure_stage = .none;
@@ -927,13 +923,13 @@ pub fn mousePressure(
             })) |selection| {
                 changed = self.applySelectionLocked(selection) catch {
                     self.interaction.local_left_pressed = false;
-                    self.shared.mutex.unlock();
+                    self.shared.mutex.unlock(global.io());
                     return .out_of_memory;
                 };
             }
         }
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (changed) self.committedStateChanged();
     return .consumed_no_output;
@@ -1225,7 +1221,7 @@ pub fn scroll(
 
     var changed = false;
     var snapshot: ScrollSnapshot = undefined;
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
     const x = normalizeScrollAxis(
         xoff,
@@ -1234,7 +1230,7 @@ pub fn scroll(
         if (scroll_mods.precision) 1 else 0,
         scroll_mods.precision,
     ) catch {
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
         return .invalid_input;
     };
     const y_multiplier = if (scroll_mods.precision)
@@ -1255,7 +1251,7 @@ pub fn scroll(
         y_multiplier,
         scroll_mods.precision,
     ) catch {
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
         return .invalid_input;
     };
     const interaction_state = self.normalizeAndSnapshotInteractionLocked();
@@ -1309,10 +1305,10 @@ pub fn scroll(
     {
         self.interaction.pending_scroll_x = snapshot.x.pending;
         self.interaction.pending_scroll_y = snapshot.y.pending;
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
         return .consumed_no_output;
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (snapshot.route == .viewport) {
         if (changed) self.committedStateChanged();
@@ -1330,7 +1326,7 @@ pub fn scroll(
         admission.result == .consumed_no_output)
     {
         var selection_changed = false;
-        self.shared.mutex.lock();
+        self.shared.mutex.lockUncancelable(global.io());
         self.interaction.pending_scroll_x = snapshot.x.pending;
         self.interaction.pending_scroll_y = snapshot.y.pending;
         if (snapshot.route == .remote_mouse and admission.result == .sent) {
@@ -1339,7 +1335,7 @@ pub fn scroll(
         if (snapshot.route == .remote_mouse or snapshot.y.delta != 0) {
             selection_changed = self.clearSelectionLocked();
         }
-        self.shared.mutex.unlock();
+        self.shared.mutex.unlock(global.io());
         if (selection_changed) self.committedStateChanged();
     }
     return admission.result;
@@ -1516,8 +1512,8 @@ pub const SelectedTextError = error{ NoSelection, OutOfMemory };
 /// Copy selected text while holding Shared.mutex. The caller owns the returned
 /// sentinel slice and must release it through freeSelectedText.
 pub fn selectedText(self: *TerminalSurface) SelectedTextError![:0]const u8 {
-    self.shared.mutex.lock();
-    defer self.shared.mutex.unlock();
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
     const screen = self.shared.terminal.screens.active;
     const selection = screen.selection orelse return error.NoSelection;
     return screen.selectionString(self.alloc, .{
@@ -1551,8 +1547,8 @@ pub fn key(
     event: input.KeyEvent,
 ) InputResult {
     const encoding_opts: input.key_encode.Options = opts: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
 
         if (self.vt_kam_allowed and
             self.shared.terminal.modes.get(.disable_keyboard))
@@ -1624,10 +1620,10 @@ pub fn committedText(
 ) InputResult {
     if (data.len == 0) return .consumed_no_output;
 
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const keyboard_disabled = self.vt_kam_allowed and
         self.shared.terminal.modes.get(.disable_keyboard);
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
     if (keyboard_disabled) return .consumed_no_output;
 
     const sink = self.write_sink orelse return .unavailable;
@@ -1648,8 +1644,8 @@ pub fn paste(
     const sink = self.write_sink orelse return .unavailable;
 
     const encoding_opts: input.paste.Options = opts: {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
         break :opts .fromTerminal(&self.shared.terminal);
     };
 
@@ -1712,7 +1708,7 @@ fn acceptedTyping(
     force_selection_clear: bool,
 ) void {
     var changed = false;
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     const screen = self.shared.terminal.screens.active;
     if ((self.selection_clear_on_typing or force_selection_clear) and
         screen.selection != null)
@@ -1730,14 +1726,14 @@ fn acceptedTyping(
             changed = true;
         }
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (changed) self.committedStateChanged();
 }
 
 fn acceptedPaste(self: *TerminalSurface) void {
     var changed = false;
-    self.shared.mutex.lock();
+    self.shared.mutex.lockUncancelable(global.io());
     if (!self.shared.terminal.screens.active.viewportIsBottom()) {
         self.shared.terminal.scrollViewport(.bottom);
         changed = true;
@@ -1746,13 +1742,13 @@ fn acceptedPaste(self: *TerminalSurface) void {
         self.runtime.state.scroll_cell_offset = 0;
         changed = true;
     }
-    self.shared.mutex.unlock();
+    self.shared.mutex.unlock(global.io());
 
     if (changed) self.committedStateChanged();
 }
 
 fn queueAndWake(self: *TerminalSurface, message: rendererpkg.Message) !void {
-    _ = self.runtime.thread.mailbox.push(message, .{ .forever = {} });
+    _ = self.runtime.thread.mailbox.push(global.io(), message, .{ .forever = {} });
     try self.runtime.thread.wakeup.notify();
 }
 
@@ -1776,7 +1772,7 @@ const TestSink = struct {
         self.len = data.len;
         @memcpy(self.data[0..data.len], data);
         self.lock_was_free = self.shared.mutex.tryLock();
-        if (self.lock_was_free) self.shared.mutex.unlock();
+        if (self.lock_was_free) self.shared.mutex.unlock(global.io());
         return self.accept;
     }
 };
@@ -1825,8 +1821,8 @@ fn testSurface(
 }
 
 fn testFeed(shared: *terminal.Shared, bytes: []const u8) void {
-    shared.mutex.lock();
-    defer shared.mutex.unlock();
+    shared.mutex.lockUncancelable(global.io());
+    defer shared.mutex.unlock(global.io());
     var stream = shared.terminal.vtStream();
     defer stream.deinit();
     stream.nextSlice(bytes);
@@ -1834,7 +1830,7 @@ fn testFeed(shared: *terminal.Shared, bytes: []const u8) void {
 
 test "terminal surface config derivation failure does not partially commit" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1867,8 +1863,8 @@ test "terminal surface config derivation failure does not partially commit" {
 }
 
 fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
-    shared.mutex.lock();
-    defer shared.mutex.unlock();
+    shared.mutex.lockUncancelable(global.io());
+    defer shared.mutex.unlock(global.io());
     const screen = shared.terminal.screens.active;
     const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
     try screen.select(terminal.Selection.init(pin, pin, false));
@@ -1876,14 +1872,14 @@ fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
 }
 
 fn testCompressionActivity(shared: *terminal.Shared) u64 {
-    shared.mutex.lock();
-    defer shared.mutex.unlock();
+    shared.mutex.lockUncancelable(global.io());
+    defer shared.mutex.unlock(global.io());
     return shared.terminal.compressionActivity();
 }
 
 test "terminal surface key admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1904,18 +1900,18 @@ test "terminal surface key admission contract" {
     try testing.expect(sink.lock_was_free);
     try testing.expectEqual(@as(usize, 0), tracking.allocations);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.cursor_keys, true);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.calls = 0;
     try testing.expectEqual(InputResult.sent, surface.key(.{
         .key = .arrow_up,
     }));
     try testing.expectEqualStrings("\x1bOA", sink.data[0..sink.len]);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.disable_keyboard, true);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     surface.vt_kam_allowed = true;
     sink.calls = 0;
     try testing.expectEqual(InputResult.consumed_no_output, surface.key(.{
@@ -1926,22 +1922,22 @@ test "terminal surface key admission contract" {
     try testing.expectEqual(InputResult.consumed_no_output, surface.key(.{}));
     surface.write_sink = sink.writeSink();
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.disable_keyboard, false);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.calls = 0;
     try testing.expectEqual(InputResult.not_accepted, surface.key(.{}));
     try testing.expectEqual(@as(usize, 0), sink.calls);
 
     try setTestSelectionAndViewport(shared);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     surface.runtime.state.scroll_cell_offset = 0.5;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.accept = false;
     try testing.expectEqual(InputResult.not_accepted, surface.key(letter));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -1953,8 +1949,8 @@ test "terminal surface key admission contract" {
     sink.accept = true;
     try testing.expectEqual(InputResult.sent, surface.key(letter));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection == null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
         try testing.expectEqual(
@@ -1981,8 +1977,8 @@ test "terminal surface key admission contract" {
         .key = .escape,
     }));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection == null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
     }
@@ -2012,7 +2008,7 @@ test "terminal surface key admission contract" {
 
 test "terminal surface committed text admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2032,16 +2028,16 @@ test "terminal surface committed text admission contract" {
         unavailable.committedText("text"),
     );
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
     }
 
     const arbitrary = [_]u8{ 'a', 0, 0x03, 0xf0, 0x9f, 0x98, 0x80 };
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.bracketed_paste, true);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try testing.expectEqual(
         InputResult.sent,
         surface.committedText(&arbitrary),
@@ -2053,10 +2049,10 @@ test "terminal surface committed text admission contract" {
     try testing.expectEqual(@as(usize, 0), tracking.allocations);
 
     try setTestSelectionAndViewport(shared);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.disable_keyboard, true);
     surface.runtime.state.scroll_cell_offset = 0.5;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     surface.vt_kam_allowed = true;
     surface.write_sink = null;
     sink.calls = 0;
@@ -2066,8 +2062,8 @@ test "terminal surface committed text admission contract" {
     );
     try testing.expectEqual(@as(usize, 0), sink.calls);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -2082,9 +2078,9 @@ test "terminal surface committed text admission contract" {
         surface.committedText("not gated"),
     );
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.disable_keyboard, false);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     surface.write_sink = sink.writeSink();
     sink.accept = false;
     try testing.expectEqual(
@@ -2093,8 +2089,8 @@ test "terminal surface committed text admission contract" {
     );
     try testing.expectEqual(@as(usize, 1), sink.calls);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -2110,8 +2106,8 @@ test "terminal surface committed text admission contract" {
     surface.scroll_to_bottom_on_keystroke = false;
     try testing.expectEqual(InputResult.sent, surface.committedText("\x1b"));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -2123,8 +2119,8 @@ test "terminal surface committed text admission contract" {
     surface.selection_clear_on_typing = true;
     try testing.expectEqual(InputResult.sent, surface.committedText("clear"));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection == null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -2134,15 +2130,15 @@ test "terminal surface committed text admission contract" {
     }
 
     try setTestSelectionAndViewport(shared);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     surface.runtime.state.scroll_cell_offset = 0.5;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     surface.selection_clear_on_typing = false;
     surface.scroll_to_bottom_on_keystroke = true;
     try testing.expectEqual(InputResult.sent, surface.committedText("scroll"));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
         try testing.expectEqual(
@@ -2159,7 +2155,7 @@ test "terminal surface committed text admission contract" {
 
 test "terminal surface paste admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2172,8 +2168,8 @@ test "terminal surface paste admission contract" {
     try testing.expectEqual(InputResult.consumed_no_output, surface.paste(""));
     try testing.expectEqual(@as(usize, 0), sink.calls);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
     }
     var unavailable = testSurface(testing.allocator, shared, null);
@@ -2188,8 +2184,8 @@ test "terminal surface paste admission contract" {
     try testing.expect(sink.lock_was_free);
     try testing.expectEqual(@as(usize, 0), tracking.allocations);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .active);
     }
@@ -2201,14 +2197,14 @@ test "terminal surface paste admission contract" {
     );
 
     try setTestSelectionAndViewport(shared);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     surface.runtime.state.scroll_cell_offset = 0.5;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.accept = false;
     try testing.expectEqual(InputResult.not_accepted, surface.paste(unchanged));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
         try testing.expect(shared.terminal.screens.active.pages.viewport == .top);
         try testing.expectEqual(
@@ -2218,9 +2214,9 @@ test "terminal surface paste admission contract" {
     }
     sink.accept = true;
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.bracketed_paste, true);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.calls = 0;
     try testing.expectEqual(InputResult.sent, surface.paste("a\nb\x00c"));
     try testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2228,17 +2224,17 @@ test "terminal surface paste admission contract" {
     try testing.expectEqual(@as(usize, 1), tracking.allocations);
     try testing.expectEqual(@as(usize, 1), tracking.deallocations);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expectEqual(
             @as(f64, 0),
             surface.runtime.state.scroll_cell_offset,
         );
     }
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.modes.set(.bracketed_paste, false);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     sink.calls = 0;
     try testing.expectEqual(InputResult.sent, surface.paste("a\nb\x03c"));
     try testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2312,17 +2308,17 @@ test "terminal surface interaction state and position scrolling" {
         normalizeScrollPosition(0, usize_boundary, 10),
     );
 
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer shared.release();
     var surface = testSurface(testing.allocator, shared, null);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         var stream = shared.terminal.vtStream();
         defer stream.deinit();
         stream.nextSlice("0\r\n1\r\n2\r\n3\r\n4\r\n5");
@@ -2352,9 +2348,9 @@ test "terminal surface interaction state and position scrolling" {
     try testing.expectEqual(state.scrollbar.total - state.scrollbar.len, state.scrollbar.offset);
     try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         var stream = shared.terminal.vtStream();
         defer stream.deinit();
         stream.nextSlice("\x1b[?1049h");
@@ -2367,17 +2363,17 @@ test "terminal surface interaction state and position scrolling" {
     try testing.expect(!state.mouse_captured);
     try testing.expect(state.has_selection);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.flags.mouse_event = .normal;
     surface.runtime.state.scroll_cell_offset = 0.5;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     state = surface.interactionState();
     try testing.expectEqual(ScrollRoute.remote_mouse, state.route);
     try testing.expect(state.mouse_captured);
     try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expectEqual(
             @as(f64, 0),
             surface.runtime.state.scroll_cell_offset,
@@ -2392,10 +2388,10 @@ test "terminal surface interaction state and position scrolling" {
 
 test "terminal surface selection snapshot follows viewport and active screen" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer shared.release();
     var surface = testSurface(testing.allocator, shared, null);
@@ -2407,9 +2403,9 @@ test "terminal surface selection snapshot follows viewport and active screen" {
 
     try testing.expect(!surface.selectionSnapshot().active);
     testFeed(shared, "zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         const screen = shared.terminal.screens.active;
         shared.terminal.scrollViewport(.top);
         try screen.select(terminal.Selection.init(
@@ -2439,9 +2435,9 @@ test "terminal surface selection snapshot follows viewport and active screen" {
     testFeed(shared, "\x1b[?1049hALT");
     try testing.expect(!surface.selectionSnapshot().active);
     surface.runtime.state.scroll_cell_offset = 0;
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         const screen = shared.terminal.screens.active;
         try screen.select(terminal.Selection.init(
             screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
@@ -2462,10 +2458,10 @@ test "terminal surface selection snapshot follows viewport and active screen" {
 
 test "terminal surface cursor geometry follows viewport and active screen" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer shared.release();
     var surface = testSurface(testing.allocator, shared, null);
@@ -2495,18 +2491,18 @@ test "terminal surface cursor geometry follows viewport and active screen" {
 
     surface.runtime.state.scroll_cell_offset = 0;
     testFeed(shared, "\r\nzero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.scrollViewport(.top);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     geometry = surface.cursorGeometry();
     try testing.expect(!geometry.visible);
     try testing.expectEqualDeep(CellGeometry{}, geometry);
 
     testFeed(shared, "\x1b[2;3H");
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     const scrollbar = shared.terminal.screens.active.pages.scrollbar();
     shared.terminal.scrollViewport(.{ .row = scrollbar.total - scrollbar.len - 1 });
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     geometry = surface.cursorGeometry();
     try testing.expect(geometry.visible);
     try testing.expectEqual(@as(f64, 22), geometry.x_px);
@@ -2529,7 +2525,7 @@ test "terminal surface cursor geometry follows viewport and active screen" {
 
 test "terminal surface word selection is local and refreshes after reflow" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 20,
         .rows = 3,
     });
@@ -2538,9 +2534,9 @@ test "terminal surface word selection is local and refreshes after reflow" {
     var surface = testSurface(testing.allocator, shared, sink.writeSink());
     surface.size.screen.width = 200;
     testFeed(shared, "hello\x1b[41m \x1b[0mworld.foo");
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.flags.mouse_event = .normal;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
     surface.interaction_config.word_chars = &[_]u21{ ' ', '\t', '.' };
     var snapshot: SelectionSnapshot = undefined;
@@ -2575,9 +2571,9 @@ test "terminal surface word selection is local and refreshes after reflow" {
     );
     try testing.expect(snapshot.active);
 
-    shared.mutex.lock();
-    try shared.terminal.resize(testing.allocator, 10, 3);
-    shared.mutex.unlock();
+    shared.mutex.lockUncancelable(global.io());
+    try shared.terminal.resize(testing.allocator, .{ .cols = 10, .rows = 3 });
+    shared.mutex.unlock(global.io());
     snapshot = surface.selectionSnapshot();
     try testing.expect(snapshot.active);
     try testing.expectEqual(@as(f64, 40), snapshot.end.x_px);
@@ -2587,7 +2583,7 @@ test "terminal surface word selection is local and refreshes after reflow" {
 
 test "terminal surface link selection preserves no-match and target ownership" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 8,
         .rows = 3,
     });
@@ -2638,7 +2634,7 @@ test "terminal surface link selection preserves no-match and target ownership" {
 
 test "terminal surface selects scheme-less loopback host:port spans" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 26,
         .rows = 3,
     });
@@ -2673,7 +2669,7 @@ test "terminal surface selects scheme-less loopback host:port spans" {
 
 test "terminal surface OSC 8 link selection takes precedence over configured links" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 3,
     });
@@ -2689,14 +2685,14 @@ test "terminal surface OSC 8 link selection takes precedence over configured lin
     defer links.deinit(testing.allocator);
     surface.interaction_config.links = links;
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     try shared.terminal.screens.active.startHyperlink(
         "https://example.com/target",
         null,
     );
     try shared.terminal.screens.active.testWriteString("https://a");
     shared.terminal.screens.active.endHyperlink();
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
     var snapshot: SelectionSnapshot = undefined;
     var matched: bool = undefined;
@@ -2737,7 +2733,7 @@ test "terminal surface OSC 8 link selection takes precedence over configured lin
 
 test "terminal surface selection endpoints preserve roles and allocation" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2764,15 +2760,15 @@ test "terminal surface selection endpoints preserve roles and allocation" {
     try testing.expectEqual(@as(f64, 50), snapshot.start.x_px);
     try testing.expectEqual(@as(f64, 70), snapshot.end.x_px);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.screens.active.selection.?.rectangle = true;
     shared.terminal.screens.active.dirty.selection = false;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try surface.setSelectionEndpoint(.end, 75, 5, &snapshot);
     try testing.expect(snapshot.rectangle);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     try testing.expect(!shared.terminal.screens.active.dirty.selection);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
     try testing.expectError(
         error.InvalidInput,
@@ -2787,13 +2783,13 @@ test "terminal surface selection endpoints preserve roles and allocation" {
         initial_pins,
         shared.terminal.screens.active.pages.countTrackedPins(),
     );
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.screens.active.dirty.selection = false;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try surface.clearSelection(&snapshot);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     try testing.expect(!shared.terminal.screens.active.dirty.selection);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try testing.expectError(
         error.InvalidInput,
         surface.setSelectionEndpoint(.start, 5, 5, &snapshot),
@@ -2816,7 +2812,7 @@ test "terminal surface selection endpoints preserve roles and allocation" {
 
 test "terminal surface local pointer selection pressure and text ownership" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2824,9 +2820,9 @@ test "terminal surface local pointer selection pressure and text ownership" {
     var tracking = testing.FailingAllocator.init(testing.allocator, .{});
     var surface = testSurface(tracking.allocator(), shared, null);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         var stream = shared.terminal.vtStream();
         defer stream.deinit();
         stream.nextSlice("hello world");
@@ -2848,8 +2844,8 @@ test "terminal surface local pointer selection pressure and text ownership" {
             .{ .ctrl = true, .alt = true }),
     );
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         const selection = shared.terminal.screens.active.selection.?;
         try testing.expect(selection.rectangle);
     }
@@ -2872,9 +2868,9 @@ test "terminal surface local pointer selection pressure and text ownership" {
     try testing.expect(tracking.allocations != 0);
     try testing.expectEqual(tracking.allocations, tracking.deallocations);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     surface.interaction.gesture.reset(&shared.terminal);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try testing.expectEqual(
         InputResult.consumed_no_output,
         surface.pointerPosition(15, 5, .{}),
@@ -2896,7 +2892,7 @@ test "terminal surface local pointer selection pressure and text ownership" {
     );
     try testing.expectEqual(input.MousePressureStage.none, surface.interaction.pressure_stage);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     surface.runtime.state.scroll_cell_offset = 0.5;
     try testing.expectEqual(
         @as(u32, 1),
@@ -2911,7 +2907,7 @@ test "terminal surface local pointer selection pressure and text ownership" {
         @as(u32, 3),
         surface.rendererPointLocked(5, 70).?.y,
     );
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try testing.expectEqual(@as(u32, 1), fractional_point.coord().y);
 
     // A live press owns a tracked pin. TerminalSurface teardown must release it
@@ -2926,7 +2922,7 @@ test "terminal surface local pointer selection pressure and text ownership" {
 
 test "terminal surface remote mouse admission and rejection state" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2935,10 +2931,10 @@ test "terminal surface remote mouse admission and rejection state" {
     var tracking = testing.FailingAllocator.init(testing.allocator, .{});
     var surface = testSurface(tracking.allocator(), shared, sink.writeSink());
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.flags.mouse_event = .any;
     shared.terminal.flags.mouse_format = .sgr;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
     try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
     try testing.expectEqualStrings("\x1b[<35;1;1M", sink.data[0..sink.len]);
@@ -2988,8 +2984,8 @@ test "terminal surface remote mouse admission and rejection state" {
         @intFromEnum(input.MouseButton.left),
     ));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection != null);
     }
 
@@ -3004,8 +3000,8 @@ test "terminal surface remote mouse admission and rejection state" {
         @intFromEnum(input.MouseButton.left),
     ));
     {
-        shared.mutex.lock();
-        defer shared.mutex.unlock();
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
         try testing.expect(shared.terminal.screens.active.selection == null);
     }
 
@@ -3029,19 +3025,19 @@ test "terminal surface remote mouse admission and rejection state" {
 
 test "terminal surface scroll routing concatenation and remainders" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer shared.release();
     var sink: TestSink = .{ .shared = shared };
     var surface = testSurface(testing.allocator, shared, sink.writeSink());
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     shared.terminal.flags.mouse_event = .normal;
     shared.terminal.flags.mouse_format = .sgr;
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
     try testing.expectEqual(InputResult.consumed_no_output, surface.pointerPosition(5, 5, .{}));
 
     sink.calls = 0;
@@ -3094,9 +3090,9 @@ test "terminal surface scroll routing concatenation and remainders" {
     try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
     try testing.expectEqual(@as(usize, 1), sink.calls);
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         shared.terminal.flags.mouse_event = .none;
         var stream = shared.terminal.vtStream();
         defer stream.deinit();
@@ -3109,13 +3105,13 @@ test "terminal surface scroll routing concatenation and remainders" {
     try testing.expectEqual(InputResult.sent, surface.scroll(0, 2, .{}));
     try testing.expectEqual(@as(usize, 1), sink.calls);
     try testing.expectEqualStrings("\x1b[A" ** 6, sink.data[0..sink.len]);
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     try testing.expect(shared.terminal.screens.active.selection == null);
-    shared.mutex.unlock();
+    shared.mutex.unlock(global.io());
 
-    shared.mutex.lock();
+    shared.mutex.lockUncancelable(global.io());
     {
-        defer shared.mutex.unlock();
+        defer shared.mutex.unlock(global.io());
         var stream = shared.terminal.vtStream();
         defer stream.deinit();
         stream.nextSlice("\x1b[?1049l0\r\n1\r\n2\r\n3\r\n4");
@@ -3147,7 +3143,7 @@ test "terminal surface scroll routing concatenation and remainders" {
 
 test "terminal surface pointer and pressure validation" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });

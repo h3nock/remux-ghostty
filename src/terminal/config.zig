@@ -1,5 +1,6 @@
 //! Projection of application configuration into canonical terminal state.
 
+const std = @import("std");
 const Config = @import("../config/Config.zig");
 const Terminal = @import("Terminal.zig");
 const color = @import("color.zig");
@@ -37,10 +38,14 @@ pub fn colorDefaults(config: *const Config) ColorDefaults {
 /// Update only config-owned defaults. Program-owned OSC overrides survive.
 /// The caller must hold the terminal's synchronization lock when required.
 pub fn applyColorDefaults(
+    alloc: std.mem.Allocator,
     terminal: *Terminal,
     defaults: ColorDefaults,
 ) void {
-    terminal.colors.palette.changeDefault(defaults.palette);
+    terminal.colors.palette.changeDefault(alloc, defaults.palette) catch |err| {
+        std.log.scoped(.terminal_config).warn("error changing default palette, using built-in default err={}", .{err});
+        terminal.colors.palette.resetDefault(alloc);
+    };
     terminal.colors.background.default = defaults.background;
     terminal.colors.foreground.default = defaults.foreground;
     terminal.colors.cursor.default = defaults.cursor;
@@ -57,7 +62,7 @@ test "config color defaults preserve terminal overrides" {
     config.@"cursor-color" = .{ .color = .{ .r = 16, .g = 17, .b = 18 } };
     config.palette.value[2] = .{ .r = 7, .g = 8, .b = 9 };
 
-    var terminal = try Terminal.init(testing.allocator, .{
+    var terminal = try Terminal.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -67,7 +72,7 @@ test "config color defaults preserve terminal overrides" {
     terminal.colors.cursor.set(.{ .r = 22, .g = 23, .b = 24 });
     terminal.colors.palette.set(2, .{ .r = 13, .g = 14, .b = 15 });
 
-    applyColorDefaults(&terminal, colorDefaults(&config));
+    applyColorDefaults(testing.allocator, &terminal, colorDefaults(&config));
 
     try testing.expectEqual(config.background.toTerminalRGB(), terminal.colors.background.default.?);
     try testing.expectEqual(color.RGB{ .r = 10, .g = 11, .b = 12 }, terminal.colors.background.get().?);

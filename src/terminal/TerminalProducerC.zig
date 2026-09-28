@@ -4,7 +4,7 @@
 //! writer/lifetime boundary only: rendering and transport remain host concerns.
 
 const std = @import("std");
-const state = &@import("../global.zig").state;
+const global = @import("../global.zig");
 const SharedTerminal = @import("Shared.zig");
 const TerminalStream = @import("stream_terminal.zig").Stream;
 
@@ -32,10 +32,10 @@ pub const Producer = struct {
         const self = try alloc.create(Producer);
         errdefer alloc.destroy(self);
 
-        const terminal = try SharedTerminal.init(alloc, .{
+        const terminal = try SharedTerminal.init(global.io(), alloc, .{
             .cols = config.columns,
             .rows = config.rows,
-            .max_scrollback = config.max_scrollback,
+            .max_scrollback_bytes = config.max_scrollback,
         });
         errdefer terminal.release();
 
@@ -55,8 +55,8 @@ pub const Producer = struct {
     }
 
     fn feed(self: *Producer, bytes: []const u8) void {
-        self.terminal.mutex.lock();
-        defer self.terminal.mutex.unlock();
+        self.terminal.mutex.lockUncancelable(self.terminal.terminal.io());
+        defer self.terminal.mutex.unlock(self.terminal.terminal.io());
         self.stream.nextSlice(bytes);
     }
 };
@@ -74,7 +74,7 @@ pub export fn ghostty_terminal_producer_new(
     const config = config_ptr orelse return .invalid_input;
     if (config.columns == 0 or config.rows == 0) return .invalid_input;
 
-    out.* = Producer.init(state.alloc, config.*) catch return .out_of_memory;
+    out.* = Producer.init(global.alloc(), config.*) catch return .out_of_memory;
     return .ok;
 }
 
@@ -153,7 +153,6 @@ test "terminal producer C ABI matches ghostty header" {
 
 test "terminal producer C defaults and validation" {
     const testing = std.testing;
-    state.alloc = testing.allocator;
 
     const defaults = ghostty_terminal_producer_config_new();
     try testing.expectEqual(@as(u16, 80), defaults.columns);
@@ -238,7 +237,6 @@ test "terminal producer preserves parser state across feeds" {
 
 test "terminal producer feed preserves embedded NUL and explicit length" {
     const testing = std.testing;
-    state.alloc = testing.allocator;
     const config: Config = .{
         .columns = 8,
         .rows = 2,
@@ -304,8 +302,8 @@ test "terminal producer and retained terminal have independent lifetimes" {
     ghostty_terminal_producer_free(producer_first);
     {
         defer ghostty_terminal_release(retained_after);
-        retained_after.?.mutex.lock();
-        defer retained_after.?.mutex.unlock();
+        retained_after.?.mutex.lockUncancelable(testing.io);
+        defer retained_after.?.mutex.unlock(testing.io);
         const contents = try retained_after.?.terminal.plainString(testing.allocator);
         defer testing.allocator.free(contents);
         try testing.expectEqualStrings("producer first", contents);

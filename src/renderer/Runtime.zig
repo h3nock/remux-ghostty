@@ -2,6 +2,7 @@
 pub const Runtime = @This();
 
 const std = @import("std");
+const global = @import("../global.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const crash = @import("../crash/main.zig");
@@ -25,7 +26,7 @@ pub const Options = struct {
     config: *const configpkg.Config,
     rt_surface: *apprt.RendererSurface,
     terminal: *terminal.Terminal,
-    mutex: *std.Thread.Mutex,
+    mutex: *std.Io.Mutex,
     prepared_layout: *PreparedLayout,
     size: *rendererpkg.Size,
     event_sink: rendererpkg.EventSink,
@@ -149,7 +150,7 @@ pub fn start(self: *Runtime) !void {
         rendererpkg.Thread.threadMain,
         .{&self.thread},
     );
-    self.os_thread.setName("renderer") catch {};
+    self.os_thread.setName(global.io(), "renderer") catch {};
 }
 
 /// Stop and join the renderer OS thread, then restore graphics ownership to
@@ -179,7 +180,7 @@ pub fn setFontGrid(
     key: font.SharedGridSet.Key,
     grid: *font.SharedGrid,
 ) void {
-    _ = self.thread.mailbox.push(.{
+    _ = self.thread.mailbox.push(global.io(), .{
         .font_grid = .{
             .grid = grid,
             .set = self.font_grid_set,
