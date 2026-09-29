@@ -74,6 +74,9 @@ pub fn build(b: *std.Build) !void {
         ) } },
         .target = target,
         .optimize = optimize,
+        // Blocks need to be enabled to use Apple SDK headers (the iOS SDK
+        // headers use them unconditionally).
+        .extra_args = &.{"-fblocks"},
     });
 
     const lib = b.addLibrary(.{
