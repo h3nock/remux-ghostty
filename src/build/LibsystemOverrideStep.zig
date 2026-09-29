@@ -1,8 +1,9 @@
 //! Wraps a Darwin static archive with the libsystem_override.sh
 //! post-processing step so that consumers linking the archive bind
 //! well-known libc/libm symbols (memcpy, memmove, memset, cos, sin,
-//! ...) to Apple's libSystem instead of the bundled Zig compiler-rt.
-//! See src/build/libsystem_override.sh for the full rationale.
+//! ...) to Apple's libSystem instead of definitions bundled in the
+//! archive (Zig's compiler-rt and the root module's quirks_memset.zig
+//! export). See src/build/libsystem_override.sh for the full rationale.
 //!
 //! This applies to every static archive we produce, public
 //! (e.g. libghostty-vt) and app-internal alike: the compiler-rt

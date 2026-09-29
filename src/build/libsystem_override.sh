@@ -15,11 +15,22 @@
 # compiler-rt memmove costing several percent of PTY throughput on
 # scroll-region workloads versus libSystem's.
 #
+# The root module's object can define one of these symbols too:
+# quirks_memset.zig exports a vectorized memset. It requests weak
+# linkage for static libraries, but Zig 0.16 lowers that export to a
+# weak_odr alias, which LLVM emits on Mach-O as a plain (non-weak)
+# private extern definition. Left global, any consumer reference to
+# memset (e.g. from a unit-test bundle that links this archive) would
+# load the entire root object, and with it a second, uninitialized copy
+# of the library's globals.
+#
 # The mechanism is to localize (make non-external) the libSystem-provided
-# symbols defined by the compiler_rt.o archive member. This keeps
-# compiler_rt.o functional for the intrinsics that libSystem does NOT
-# provide (e.g. the f128 conversions ___extenddftf2/___extendxftf2, *q
-# math, sincos*) while letting every other archive member bind the
+# symbols in every archive member that defines them. A localized
+# definition still satisfies references from within its own member. This
+# keeps compiler_rt.o functional for the intrinsics that libSystem does
+# NOT provide (e.g. the f128 conversions ___extenddftf2/___extendxftf2,
+# *q math, sincos*), and it keeps the root module's own calls on its own
+# memset. Every other archive member and every consumer binds the
 # well-known libc/libm symbols to libSystem at final link.
 #
 # usage: libsystem_override.sh <input.a> <output.a>
@@ -109,15 +120,38 @@ EOF
 
 cd "$tmp"
 
-xcrun ar x "$out" compiler_rt.o
-chmod 644 compiler_rt.o
-
-# nmedit takes a keep-list (-s): all current global definitions except
-# the ones we want to localize.
-xcrun nm -g compiler_rt.o | awk '$2 ~ /^[A-TV-Z]$/ {print $3}' | sort -u >all.txt
 sort -u localize.txt >loc.txt
-comm -23 all.txt loc.txt >keep.txt
-xcrun nmedit -s keep.txt compiler_rt.o
 
-xcrun ar r "$out" compiler_rt.o
+# The members to rewrite: those with a global definition of any listed
+# symbol. `nm -A` prefixes each line with "<archive>:<member>: ".
+xcrun nm -gU -A "$out" >defs.txt
+awk -v prefix="$out:" '
+  NR == FNR { loc[$1] = 1; next }
+  index($0, prefix) == 1 && ($NF in loc) {
+    rest = substr($0, length(prefix) + 1)
+    print substr(rest, 1, index(rest, ": ") - 1)
+  }' loc.txt defs.txt | sort -u >members.txt
+
+# Members are extracted and replaced by name, which is only unambiguous
+# for names that occur once in the archive.
+xcrun ar t "$out" >names.txt
+
+for member in $(cat members.txt); do
+  if [ "$(grep -cxF "$member" names.txt)" -ne 1 ]; then
+    echo "libsystem_override.sh: member $member is not unique in $out" >&2
+    exit 1
+  fi
+
+  xcrun ar x "$out" "$member"
+  chmod 644 "$member"
+
+  # nmedit takes a keep-list (-s): all current global definitions
+  # except the ones we want to localize.
+  xcrun nm -g "$member" | awk '$2 ~ /^[A-TV-Z]$/ {print $3}' | sort -u >all.txt
+  comm -23 all.txt loc.txt >keep.txt
+  xcrun nmedit -s keep.txt "$member"
+
+  xcrun ar r "$out" "$member"
+done
+
 xcrun ranlib "$out" 2>/dev/null || true
