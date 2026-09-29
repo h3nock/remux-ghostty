@@ -259,10 +259,10 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         }
 
         fn eventRedraw(_: *anyopaque) void {
-            // Embedded renderers draw off the renderer thread and never ask
-            // this sink for an app-thread redraw. Do not fabricate a process
-            // Surface target for a path this runtime does not use.
-            log.warn("unexpected app-thread redraw request for terminal surface", .{});
+            // Embedded renderers present directly and never export frames for
+            // the host to composite. Do not fabricate a process Surface target
+            // for a path this runtime does not use.
+            log.warn("unexpected exported-frame redraw for terminal surface", .{});
         }
 
         fn writeSink(self: *Surface) ?renderer.TerminalSurface.WriteSink {

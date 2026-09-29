@@ -126,7 +126,6 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
         opts.rt_surface,
         &self.renderer,
         &self.state,
-        opts.event_sink,
         opts.crash_context,
         .{
             .visible = opts.visible,
@@ -141,10 +140,8 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
     return prepared.font_grid.metrics;
 }
 
-/// Finalize platform renderer setup and start the renderer OS thread. The
-/// runtime must be stopped before deinit.
+/// Start the renderer OS thread. The runtime must be stopped before deinit.
 pub fn start(self: *Runtime) !void {
-    try self.renderer.finalizeSurfaceInit(self.thread.surface);
     self.os_thread = try std.Thread.spawn(
         .{},
         rendererpkg.Thread.threadMain,
@@ -153,8 +150,8 @@ pub fn start(self: *Runtime) !void {
     self.os_thread.setName(global.io(), "renderer") catch {};
 }
 
-/// Stop and join the renderer OS thread, then restore graphics ownership to
-/// the calling thread as required by the renderer implementation.
+/// Stop and join the renderer OS thread. The renderer releases its GPU
+/// resources on the render thread before the thread exits.
 pub fn stop(self: *Runtime) void {
     self.thread.stop.notify() catch |err|
         log.err(
@@ -162,7 +159,6 @@ pub fn stop(self: *Runtime) void {
             .{err},
         );
     self.os_thread.join();
-    self.renderer.threadEnter(self.thread.surface) catch unreachable;
 }
 
 /// Deinitialize an unstarted or already-stopped runtime.

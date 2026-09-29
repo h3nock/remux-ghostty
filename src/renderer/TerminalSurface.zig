@@ -213,8 +213,6 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
     );
     shared.mutex.unlock(global.io());
 
-    try rendererpkg.Renderer.surfaceInit(opts.rt_surface);
-
     self.* = .{
         .alloc = opts.alloc,
         .runtime = undefined,

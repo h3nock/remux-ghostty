@@ -79,9 +79,6 @@ state: *rendererpkg.State,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: *Mailbox,
 
-/// Renderer-originated events delivered to the owning surface.
-event_sink: rendererpkg.EventSink,
-
 /// Renderer-thread crash metadata, when available.
 crash_context: ?crash.sentry.ThreadState,
 
@@ -130,7 +127,6 @@ pub fn init(
     surface: *apprt.RendererSurface,
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
-    event_sink: rendererpkg.EventSink,
     crash_context: ?crash.sentry.ThreadState,
     initial_state: InitialState,
 ) !Thread {
@@ -175,7 +171,6 @@ pub fn init(
         .renderer = renderer_impl,
         .state = state,
         .mailbox = mailbox,
-        .event_sink = event_sink,
         .crash_context = crash_context,
         .flags = .{
             .visible = initial_state.visible,
@@ -423,6 +418,8 @@ fn drainMailbox(self: *Thread, frame_requested: *bool) !void {
                 grid.set.deref(grid.old_key);
             },
 
+            .presentation_health => |v| self.renderer.setPresentationHealth(v),
+
             .resize => |v| self.renderer.setScreenSize(v),
 
             .change_config => |config| {
@@ -488,12 +485,8 @@ fn drawFrame(self: *Thread, now: bool, allow_hidden: bool) void {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return;
 
-    if (apprt.must_draw_from_app_thread) {
-        self.event_sink.redraw();
-    } else {
-        self.renderer.drawFrame(false) catch |err|
-            log.warn("error drawing err={}", .{err});
-    }
+    self.renderer.drawFrame(false) catch |err|
+        log.warn("error drawing err={}", .{err});
 }
 
 /// Rebuild terminal-derived renderer state and publish it through the normal
@@ -598,6 +591,17 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+
+    // If the display is now unrealized, release GPU resources now
+    // we're on the render thread, and do not try to update and draw
+    // this frame.
+    if (!t.renderer.display_realized) {
+        t.renderer.draw_mutex.lockUncancelable(global.io());
+        defer t.renderer.draw_mutex.unlock(global.io());
+
+        t.renderer.releaseGpuResources();
+        return .disarm;
+    }
 
     if (!t.flags.visible) return .disarm;
     t.renderFrame(false);

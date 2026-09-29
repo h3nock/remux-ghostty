@@ -290,7 +290,12 @@ pub const Viewer = struct {
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
                         const value = @field(self, u_field.name);
-                        try writer.print("{any}", .{value});
+                        switch (u_field.type) {
+                            // Window embeds ArenaAllocator.State; dumping
+                            // `{any}` walks freed/poisoned arena nodes.
+                            []const Window => try writer.print("[{d} windows]", .{value.len}),
+                            else => try writer.print("{any}", .{value}),
+                        }
                     }
                 }
 
@@ -2825,7 +2830,9 @@ test "list-windows command requests the standard tmux window name" {
     ));
 }
 
-test "pane state query excludes aggregate tmux mouse flag" {
+test "pane state query requests specific tmux mouse flags" {
+    // The aggregate mouse_any_flag is not an output variable, so the query
+    // can only request the specific selector and format flags.
     for ([_]output.Variable{
         .mouse_all_flag,
         .mouse_button_flag,
@@ -2835,7 +2842,6 @@ test "pane state query excludes aggregate tmux mouse flag" {
     }) |variable| {
         try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, variable) != null);
     }
-    try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, .mouse_any_flag) == null);
 }
 
 test "pane hydration restores tmux mouse modes and effective flags" {
@@ -3176,12 +3182,25 @@ test "session changed resets state" {
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.session_id);
                     try testing.expectEqualStrings("first", v.session_name);
                     try testing.expectEqual(1, v.windows.items.len);
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
+
+                    for (actions) |action| switch (action) {
+                        .windows => |windows| {
+                            // The action must reference viewer-owned state,
+                            // not the temporary list used while parsing.
+                            try testing.expectEqual(v.windows.items.ptr, windows.ptr);
+                            try testing.expectEqual(v.windows.items.len, windows.len);
+                            try testing.expectEqual(@as(usize, 0), windows[0].id);
+                            return;
+                        },
+                        else => {},
+                    };
+                    return error.TestExpectedWindowsAction;
                 }
             }).check,
         },

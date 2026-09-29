@@ -16,6 +16,7 @@ pub const VTable = struct {
     /// keep the value dirty and retry delivery on its next draw.
     scrollbar: *const fn (ptr: *anyopaque, value: terminal.Scrollbar) bool,
     renderer_health: *const fn (ptr: *anyopaque, value: renderer.Health) void,
+    /// The renderer exported a new frame for the owning surface to present.
     redraw: *const fn (ptr: *anyopaque) void,
 };
 
