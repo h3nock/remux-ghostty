@@ -2622,7 +2622,7 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
 
     // Allocate the codepoints slice
     const Codepoint = rendererpkg.State.Preedit.Codepoint;
-    var codepoints: std.ArrayListUnmanaged(Codepoint) = .{};
+    var codepoints: std.ArrayList(Codepoint) = .empty;
     defer codepoints.deinit(self.alloc);
     while (it.nextCodepoint()) |cp| {
         const width: usize = @intCast(unicode.table.get(cp).width);
