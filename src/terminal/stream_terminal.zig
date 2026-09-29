@@ -4881,10 +4881,10 @@ test "window_title effect is called" {
 }
 
 test "screen title is consumed without changing the grid" {
-    var t: Terminal = try .init(testing.allocator, .{ .cols = 4, .rows = 2 });
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 4, .rows = 2 });
     defer t.deinit(testing.allocator);
 
-    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
     defer s.deinit();
 
     // GNU screen and programs running under tmux use ESC k title ST. Split

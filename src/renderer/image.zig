@@ -1229,14 +1229,14 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
         .rows = 1,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 1), storage.placements.count());
     try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
     try testing.expect(state.images.get(.{ .kitty = 1 }) == null);
 
     const pixels = try alloc.dupe(u8, "rgba");
     try testing.expect(pending.complete(storage, io, pixels));
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
     try testing.expectEqual(
         pending.generation,
@@ -1252,7 +1252,7 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
         .format = .rgba,
         .data = .{ .pending = 4 },
     });
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 0), storage.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
     try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
@@ -1291,7 +1291,7 @@ test "kitty renderer uses the intersected source rectangle" {
         .source_y = 1,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
 
     const placement = state.kitty_placements.items[0];
@@ -1352,7 +1352,7 @@ test "kitty renderer positions relative placements from the parent pin" {
         .z = 1,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 2), state.kitty_placements.items.len);
 
     // Sorted by z: parent (z=0) first, child (z=1) second.
@@ -1430,7 +1430,7 @@ test "kitty renderer relative placement with negative offsets" {
         .z = 2,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expectEqual(@as(usize, 2), state.kitty_placements.items.len);
     const child = state.kitty_placements.items[1];
     try testing.expectEqual(@as(i32, -1), child.x);
@@ -1490,7 +1490,7 @@ test "kitty renderer positions relative placements from virtual parent placehold
         .z = 5,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     try testing.expect(state.kitty_virtual);
 
     // Two placeholder runs (z=-1) plus the child (z=5), sorted by z.
@@ -1531,7 +1531,7 @@ test "kitty renderer uploads the current animation frame" {
         .rows = 1,
     });
 
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     const gen1 = state.images.get(.{ .kitty = 1 }).?.generation;
     try testing.expectEqualSlices(
         u8,
@@ -1554,7 +1554,7 @@ test "kitty renderer uploads the current animation frame" {
 
     // The renderer must pick up the frame's pixels under a fresh
     // generation.
-    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 }, t.rows);
     const entry = state.images.get(.{ .kitty = 1 }).?;
     try testing.expect(entry.generation > gen1);
     try testing.expectEqualSlices(
