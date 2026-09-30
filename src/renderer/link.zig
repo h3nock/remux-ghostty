@@ -94,12 +94,10 @@ pub const Set = struct {
             .semantic_prompt_boundary = true,
         }) orelse return null;
 
-        var map: terminal.StringMap = undefined;
-        alloc.free(try screen.selectionString(alloc, .{
+        const map = try screen.selectionStringMap(alloc, .{
             .sel = line,
             .trim = false,
-            .map = &map,
-        }));
+        });
         defer map.deinit(alloc);
 
         for (self.links) |link| {
@@ -211,7 +209,7 @@ test "renderCellMap" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -264,7 +262,7 @@ test "renderCellMap hover links" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -341,8 +339,9 @@ test "renderCellMap hover links" {
 test "renderCellMap inactive links don't allocate" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -401,7 +400,7 @@ test "renderCellMap mods no match" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -456,10 +455,10 @@ test "matchAtPin follows soft wraps, config priority, and optional modifiers" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var screen = try Screen.init(alloc, .{
+    var screen = try Screen.init(testing.io, alloc, .{
         .cols = 8,
         .rows = 4,
-        .max_scrollback = 0,
+        .max_scrollback_bytes = 0,
     });
     defer screen.deinit();
     try screen.testWriteString("xxhttps://example.com rest");
@@ -515,10 +514,10 @@ test "matchAtPin respects semantic prompt boundaries" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var screen = try Screen.init(alloc, .{
+    var screen = try Screen.init(testing.io, alloc, .{
         .cols = 16,
         .rows = 2,
-        .max_scrollback = 0,
+        .max_scrollback_bytes = 0,
     });
     defer screen.deinit();
     screen.cursorSetSemanticContent(.{ .prompt = .initial });

@@ -64,6 +64,7 @@ pub const ControlClient = struct {
         error{ ClientFailed, InvalidInput, PaneUnknown, WindowUnknown };
 
     pub fn init(
+        io: std.Io,
         alloc: Allocator,
         options: Options,
     ) Allocator.Error!ControlClient {
@@ -72,7 +73,7 @@ pub const ControlClient = struct {
 
         return .{
             .channel = channel,
-            .viewer = try .init(alloc, options),
+            .viewer = try .init(io, alloc, options),
         };
     }
 
@@ -678,7 +679,7 @@ fn openPaneTestClient(
 test "control client sends startup commands before either response" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -698,7 +699,7 @@ test "control client sends startup commands before either response" {
 test "control client reports initial size between version and topology" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
         .initial_client_size = .{ .columns = 117, .rows = 41 },
     });
     defer client.deinit();
@@ -744,7 +745,7 @@ test "control client reports initial size between version and topology" {
 test "control client size error stays in Viewer FIFO" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
         .initial_client_size = .{ .columns = 117, .rows = 41 },
     });
     defer client.deinit();
@@ -783,7 +784,7 @@ test "control client owns and replaces session name" {
     const testing = std.testing;
     var tracking = testing.FailingAllocator.init(testing.allocator, .{});
 
-    var client = try ControlClient.init(tracking.allocator(), .{});
+    var client = try ControlClient.init(testing.io, tracking.allocator(), .{});
     var client_live = true;
     defer if (client_live) client.deinit();
     var actions: TestActions = .{};
@@ -806,7 +807,7 @@ test "control client owns and replaces session name" {
 test "control client hydrates as one group and keeps later command independent" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -839,7 +840,7 @@ test "control client hydrates as one group and keeps later command independent" 
 test "control client close notifications produce no outbound work" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -865,7 +866,7 @@ test "control client close notifications produce no outbound work" {
 test "control client hydration error skips only its group" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -915,7 +916,7 @@ test "control client hydration error skips only its group" {
 test "control client server block cannot consume a Viewer command" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -939,7 +940,7 @@ test "control client server block cannot consume a Viewer command" {
 test "control client forwards partial outbound consumption" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -962,7 +963,7 @@ test "control client forwards partial outbound consumption" {
 test "control client emits borrowed server exit detail once" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -986,7 +987,7 @@ test "control client emits borrowed server exit detail once" {
 test "control client closes without rejecting pending viewer commands" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1013,7 +1014,7 @@ test "control client enqueue failure is terminal" {
             testing.allocator,
             .{ .fail_index = fail_index },
         );
-        var client = ControlClient.init(failing.allocator(), .{}) catch |err| {
+        var client = ControlClient.init(testing.io, failing.allocator(), .{}) catch |err| {
             try testing.expectEqual(error.OutOfMemory, err);
             continue;
         };
@@ -1044,7 +1045,7 @@ test "control client enqueue failure is terminal" {
 test "control client malformed stream exits" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1063,7 +1064,7 @@ test "control client malformed stream exits" {
 test "control client reports unsupported tmux version detail" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1089,7 +1090,7 @@ test "control client reports unsupported tmux version detail" {
 test "control client exposes pane phase and retained terminal lifetime" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     var client_live = true;
     defer if (client_live) client.deinit();
     var actions: TestActions = .{};
@@ -1135,8 +1136,8 @@ test "control client exposes pane phase and retained terminal lifetime" {
     client_live = false;
     defer retained.release();
 
-    retained.mutex.lock();
-    defer retained.mutex.unlock();
+    retained.mutex.lockUncancelable(retained.terminal.io());
+    defer retained.mutex.unlock(retained.terminal.io());
     try testing.expectEqual(83, retained.terminal.cols);
     try testing.expectEqual(44, retained.terminal.rows);
     try retained.terminal.printString("alive");
@@ -1148,7 +1149,7 @@ test "control client exposes pane phase and retained terminal lifetime" {
 test "control client pane refresh admission and command order" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1198,7 +1199,7 @@ test "control client pane refresh admission and command order" {
 test "control client refreshes window pane metadata without hydration" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1238,7 +1239,7 @@ test "control client refreshes window pane metadata without hydration" {
 test "control client window pane metadata failure is nonfatal" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1265,7 +1266,7 @@ test "control client window pane metadata failure is nonfatal" {
 test "control client pane refresh preserves identity and output cut" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1274,8 +1275,8 @@ test "control client pane refresh preserves identity and output cut" {
     const retained = client.retainPaneTerminal(0).?;
     defer retained.release();
     {
-        retained.mutex.lock();
-        defer retained.mutex.unlock();
+        retained.mutex.lockUncancelable(retained.terminal.io());
+        defer retained.mutex.unlock(retained.terminal.io());
         try retained.terminal.setTitle("pane title");
         try retained.terminal.setPwd("file:///work");
         retained.terminal.colors.background.set(.{ .r = 10, .g = 11, .b = 12 });
@@ -1309,8 +1310,8 @@ test "control client pane refresh preserves identity and output cut" {
     defer same.release();
     try testing.expectEqual(retained, same);
     {
-        retained.mutex.lock();
-        defer retained.mutex.unlock();
+        retained.mutex.lockUncancelable(retained.terminal.io());
+        defer retained.mutex.unlock(retained.terminal.io());
         try testing.expectEqual(100, retained.terminal.cols);
         try testing.expectEqual(40, retained.terminal.rows);
         const blank = try retained.terminal.plainString(testing.allocator);
@@ -1336,8 +1337,8 @@ test "control client pane refresh preserves identity and output cut" {
 
     try client.feed("%output %0 after\n", &actions);
     try testing.expectEqual(1, actions.records.items.len);
-    retained.mutex.lock();
-    defer retained.mutex.unlock();
+    retained.mutex.lockUncancelable(retained.terminal.io());
+    defer retained.mutex.unlock(retained.terminal.io());
     const contents = try retained.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("beforeduringafter", contents);
@@ -1346,7 +1347,7 @@ test "control client pane refresh preserves identity and output cut" {
 test "control client refresh failure is pane local" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1379,7 +1380,7 @@ test "control client refresh failure is pane local" {
 test "control client serializes exact binary pane input" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1395,7 +1396,7 @@ test "control client serializes exact binary pane input" {
 test "control client correlates tracked pane input completion" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1416,7 +1417,7 @@ test "control client correlates tracked pane input completion" {
 test "control client serializes tracked literal pane input as one argument" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1439,7 +1440,7 @@ test "control client serializes tracked literal pane input as one argument" {
 test "control client tracked literal input terminates flags before payload" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1455,7 +1456,7 @@ test "control client tracked literal input terminates flags before payload" {
 test "control client tracked literal input rejects non-text bytes atomically" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1477,7 +1478,7 @@ test "control client tracked literal input rejects non-text bytes atomically" {
 test "control client tracked literal input keeps large payload in one argument" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1495,7 +1496,7 @@ test "control client tracked literal input formatting failure is allocation atom
     const testing = std.testing;
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
 
-    var client = try ControlClient.init(failing.allocator(), .{});
+    var client = try ControlClient.init(testing.io, failing.allocator(), .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1515,7 +1516,7 @@ test "control client tracked literal input formatting failure is allocation atom
 test "control client pane input validates without no-op mutation" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1543,7 +1544,7 @@ test "control client pane input validates without no-op mutation" {
 test "control client pane input completion stays independently correlated" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1581,7 +1582,7 @@ test "control client pane input formatting failure is allocation atomic" {
     const testing = std.testing;
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
 
-    var client = try ControlClient.init(failing.allocator(), .{});
+    var client = try ControlClient.init(testing.io, failing.allocator(), .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1601,7 +1602,7 @@ test "control client pane input formatting failure is allocation atomic" {
 test "control client submits independent host commands in one outbound buffer" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1627,7 +1628,7 @@ test "control client submits independent host commands in one outbound buffer" {
 test "control client host group failure preserves later independent command" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
@@ -1661,7 +1662,7 @@ test "control client host group failure preserves later independent command" {
 test "control client callback submission bypasses viewer correlation" {
     const testing = std.testing;
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     const Handler = struct {
         client: *ControlClient,
@@ -1727,7 +1728,7 @@ test "control client command admission rejects without mutation" {
     const testing = std.testing;
     const sentinel: channel_pkg.CommandToken = @enumFromInt(999);
 
-    var client = try ControlClient.init(testing.allocator, .{});
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
     defer client.deinit();
     var token = [1]channel_pkg.CommandToken{sentinel};
     try testing.expectError(
@@ -1762,7 +1763,7 @@ test "control client allocation failure leaves submission atomic" {
     const testing = std.testing;
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
 
-    var client = try ControlClient.init(failing.allocator(), .{});
+    var client = try ControlClient.init(testing.io, failing.allocator(), .{});
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();

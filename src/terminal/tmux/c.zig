@@ -7,7 +7,7 @@ const SharedTerminal = @import("../Shared.zig");
 const Viewer = @import("viewer.zig").Viewer;
 const Layout = @import("layout.zig").Layout;
 const CommandToken = @import("channel.zig").CommandToken;
-const state = &@import("../../global.zig").state;
+const global = @import("../../global.zig");
 
 pub const Result = enum(c_int) {
     ok,
@@ -187,7 +187,7 @@ pub const Client = struct {
     ) (Allocator.Error || error{InvalidInput})!Client {
         return .{
             .alloc = alloc,
-            .control = try .init(alloc, .{
+            .control = try .init(global.io(), alloc, .{
                 .max_scrollback = config.max_scrollback,
                 .history_line_limit = if (config.history_line_limit_is_set)
                     config.history_line_limit
@@ -315,9 +315,9 @@ export fn ghostty_tmux_client_new(
     if (config.action_cb == null) return .invalid_input;
     _ = config.initialClientSize() catch return .invalid_input;
 
-    const client = state.alloc.create(Client) catch return .out_of_memory;
-    client.* = Client.init(state.alloc, config.*) catch |err| {
-        state.alloc.destroy(client);
+    const client = global.alloc().create(Client) catch return .out_of_memory;
+    client.* = Client.init(global.alloc(), config.*) catch |err| {
+        global.alloc().destroy(client);
         return switch (err) {
             error.OutOfMemory => .out_of_memory,
             error.InvalidInput => .invalid_input,
@@ -849,7 +849,6 @@ test "tmux C client config and invalid boundaries" {
 
     var context: TestContext = .{};
     var config = testConfig(&context);
-    state.alloc = testing.allocator;
     try testing.expectEqual(Result.ok, ghostty_tmux_client_new(&config, &out));
     const client = out.?;
     defer testing.expectEqual(Result.ok, ghostty_tmux_client_free(client)) catch
@@ -1358,8 +1357,8 @@ test "tmux C client topology and retained terminal lifetime" {
     context.client = null;
     defer retained.release();
 
-    retained.mutex.lock();
-    defer retained.mutex.unlock();
+    retained.mutex.lockUncancelable(retained.terminal.io());
+    defer retained.mutex.unlock(retained.terminal.io());
     try testing.expectEqual(83, retained.terminal.cols);
     try testing.expectEqual(20, retained.terminal.rows);
 }

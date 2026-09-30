@@ -175,6 +175,9 @@ pub const Viewer = struct {
     /// Oldest tmux release with every command required by pane hydration.
     pub const minimum_tmux_version = "3.1";
 
+    /// I/O implementation used for all internal state.
+    io: std.Io,
+
     /// Allocator used for all internal state.
     alloc: Allocator,
 
@@ -287,7 +290,12 @@ pub const Viewer = struct {
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
                         const value = @field(self, u_field.name);
-                        try writer.print("{any}", .{value});
+                        switch (u_field.type) {
+                            // Window embeds ArenaAllocator.State; dumping
+                            // `{any}` walks freed/poisoned arena nodes.
+                            []const Window => try writer.print("[{d} windows]", .{value.len}),
+                            else => try writer.print("{any}", .{value}),
+                        }
                     }
                 }
 
@@ -381,13 +389,14 @@ pub const Viewer = struct {
         }
 
         fn init(
+            io: std.Io,
             alloc: Allocator,
             terminal_opts: Terminal.Options,
         ) Allocator.Error!*Pane {
             const self = try alloc.create(Pane);
             errdefer alloc.destroy(self);
 
-            const terminal_owner = try SharedTerminal.init(alloc, terminal_opts);
+            const terminal_owner = try SharedTerminal.init(io, alloc, terminal_opts);
             errdefer terminal_owner.release();
 
             self.* = .{
@@ -417,6 +426,7 @@ pub const Viewer = struct {
     /// The given allocator is used for all internal state. You must
     /// call deinit when you're done with the viewer to free it.
     pub fn init(
+        io: std.Io,
         alloc: Allocator,
         options: Options,
     ) Allocator.Error!Viewer {
@@ -425,6 +435,7 @@ pub const Viewer = struct {
         errdefer command_queue.deinit(alloc);
 
         return .{
+            .io = io,
             .alloc = alloc,
             .options = options,
             .state = .startup_block,
@@ -1106,6 +1117,7 @@ pub const Viewer = struct {
             } else null;
 
             try initLayout(
+                self.io,
                 self.alloc,
                 &self.panes,
                 &panes,
@@ -1230,7 +1242,7 @@ pub const Viewer = struct {
         session_name: []const u8,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
-        var replacement: Viewer = try .init(self.alloc, self.options);
+        var replacement: Viewer = try .init(self.io, self.alloc, self.options);
         errdefer replacement.deinit();
 
         replacement.session_name = try replacement.alloc.dupe(
@@ -1513,7 +1525,7 @@ pub const Viewer = struct {
         // is not a complete record therefore continues the preceding name.
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
-            const line = std.mem.trimRight(u8, line_raw, "\r");
+            const line = std.mem.trimEnd(u8, line_raw, "\r");
             const data = parseWindowListLine(line) catch {
                 if (pending == null) {
                     log.info("list-windows response does not begin with a record", .{});
@@ -1618,7 +1630,7 @@ pub const Viewer = struct {
         var metadata_changed = false;
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
-            const line = std.mem.trimRight(u8, line_raw, "\r");
+            const line = std.mem.trimEnd(u8, line_raw, "\r");
             if (line.len == 0) continue;
 
             const data = output.parseFormatStructFinalRemainder(
@@ -1649,8 +1661,8 @@ pub const Viewer = struct {
             if (!hydrate_terminal) continue;
 
             const terminal_owner = pane.terminal_owner;
-            terminal_owner.mutex.lock();
-            defer terminal_owner.mutex.unlock();
+            terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+            defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
             const t: *Terminal = &terminal_owner.terminal;
 
             const cols = std.math.cast(
@@ -1679,7 +1691,7 @@ pub const Viewer = struct {
                     screen.clearSelection();
                 }
                 t.screens.switchTo(active_key);
-                try t.resize(self.alloc, cols, rows);
+                try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
 
                 // Snapshot replay starts at a fresh protocol boundary. The
                 // canonical Terminal and SharedTerminal identities remain
@@ -1687,7 +1699,7 @@ pub const Viewer = struct {
                 pane.stream.deinit();
                 pane.stream = t.vtStream();
             } else if (t.cols != cols or t.rows != rows) {
-                try t.resize(self.alloc, cols, rows);
+                try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
             }
 
             pane.active_screen = if (data.alternate_on) .alternate else .primary;
@@ -1800,7 +1812,7 @@ pub const Viewer = struct {
         var changed = false;
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
-            const line = std.mem.trimRight(u8, line_raw, "\r");
+            const line = std.mem.trimEnd(u8, line_raw, "\r");
             if (line.len == 0) continue;
 
             const data = output.parseFormatStructFinalRemainder(
@@ -1903,8 +1915,8 @@ pub const Viewer = struct {
         const pane: *Pane = entry.value_ptr.*;
         if (!pane.has_history) return;
         const terminal_owner = pane.terminal_owner;
-        terminal_owner.mutex.lock();
-        defer terminal_owner.mutex.unlock();
+        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
         const t: *Terminal = &terminal_owner.terminal;
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
@@ -1975,8 +1987,8 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
         const terminal_owner = pane.terminal_owner;
-        terminal_owner.mutex.lock();
-        defer terminal_owner.mutex.unlock();
+        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
         const t: *Terminal = &terminal_owner.terminal;
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
@@ -2005,8 +2017,8 @@ pub const Viewer = struct {
         };
 
         const terminal_owner = pane.terminal_owner;
-        terminal_owner.mutex.lock();
-        defer terminal_owner.mutex.unlock();
+        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
         const t = &terminal_owner.terminal;
         Pane.restoreCursor(t.screens.get(.primary).?, pane.saved_primary_cursor);
         _ = try t.switchScreen(pane.active_screen);
@@ -2047,8 +2059,8 @@ pub const Viewer = struct {
                 break :hydrating null;
             },
             .live => live: {
-                pane.terminal_owner.mutex.lock();
-                defer pane.terminal_owner.mutex.unlock();
+                pane.terminal_owner.mutex.lockUncancelable(pane.terminal_owner.terminal.io());
+                defer pane.terminal_owner.mutex.unlock(pane.terminal_owner.terminal.io());
                 pane.stream.nextSlice(data);
                 break :live out.pane_id;
             },
@@ -2062,6 +2074,7 @@ pub const Viewer = struct {
     };
 
     fn initLayout(
+        io: std.Io,
         gpa_alloc: Allocator,
         panes_old: *const PanesMap,
         panes_new: *PanesMap,
@@ -2075,6 +2088,7 @@ pub const Viewer = struct {
             .horizontal, .vertical => |layouts| {
                 for (layouts) |l| {
                     try initLayout(
+                        io,
                         gpa_alloc,
                         panes_old,
                         panes_new,
@@ -2121,17 +2135,17 @@ pub const Viewer = struct {
                 // so just copy it over.
                 if (panes_old.getEntry(id)) |entry| {
                     const terminal_owner = entry.value_ptr.*.terminal_owner;
-                    terminal_owner.mutex.lock();
-                    defer terminal_owner.mutex.unlock();
-                    try terminal_owner.terminal.resize(gpa_alloc, cols, rows);
+                    terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+                    defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
+                    try terminal_owner.terminal.resize(gpa_alloc, .{ .cols = cols, .rows = rows });
                     gop.value_ptr.* = entry.value_ptr.*;
                     break :pane;
                 }
 
-                gop.value_ptr.* = try Pane.init(gpa_alloc, .{
+                gop.value_ptr.* = try Pane.init(io, gpa_alloc, .{
                     .cols = cols,
                     .rows = rows,
-                    .max_scrollback = max_scrollback,
+                    .max_scrollback_bytes = max_scrollback,
                 });
             },
         }
@@ -2607,7 +2621,7 @@ fn testPaneState(
 }
 
 fn addTestPane(viewer: *Viewer) Allocator.Error!*Viewer.Pane {
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2711,10 +2725,10 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
 }
 
 test "retained terminal outlives concurrent pane removal" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -2725,19 +2739,19 @@ test "retained terminal outlives concurrent pane removal" {
 
     const Context = struct {
         terminal: *SharedTerminal,
-        locked: std.Thread.ResetEvent = .{},
-        proceed: std.Thread.ResetEvent = .{},
-        done: std.Thread.ResetEvent = .{},
+        locked: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
         observed_cols: size.CellCountInt = 0,
 
         fn run(self: *@This()) void {
-            self.terminal.mutex.lock();
-            self.locked.set();
-            self.proceed.wait();
+            self.terminal.mutex.lockUncancelable(self.terminal.terminal.io());
+            self.locked.set(testing.io);
+            self.proceed.waitUncancelable(testing.io);
             self.observed_cols = self.terminal.terminal.cols;
-            self.terminal.mutex.unlock();
+            self.terminal.mutex.unlock(self.terminal.terminal.io());
             self.terminal.release();
-            self.done.set();
+            self.done.set(testing.io);
         }
     };
     var context: Context = .{ .terminal = pane.retainTerminal() };
@@ -2746,15 +2760,15 @@ test "retained terminal outlives concurrent pane removal" {
         return err;
     };
     defer {
-        context.proceed.set();
+        context.proceed.set(testing.io);
         thread.join();
     }
 
-    try context.locked.timedWait(std.time.ns_per_s);
+    try context.locked.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
     try viewer.syncLayouts(&.{});
     try testing.expectEqual(0, viewer.panes.count());
-    context.proceed.set();
-    try context.done.timedWait(std.time.ns_per_s);
+    context.proceed.set(testing.io);
+    try context.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
     try testing.expectEqual(10, context.observed_cols);
 }
 
@@ -2816,7 +2830,9 @@ test "list-windows command requests the standard tmux window name" {
     ));
 }
 
-test "pane state query excludes aggregate tmux mouse flag" {
+test "pane state query requests specific tmux mouse flags" {
+    // The aggregate mouse_any_flag is not an output variable, so the query
+    // can only request the specific selector and format flags.
     for ([_]output.Variable{
         .mouse_all_flag,
         .mouse_button_flag,
@@ -2826,11 +2842,10 @@ test "pane state query excludes aggregate tmux mouse flag" {
     }) |variable| {
         try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, variable) != null);
     }
-    try testing.expect(std.mem.indexOfScalar(output.Variable, Format.list_panes.vars, .mouse_any_flag) == null);
 }
 
 test "pane hydration restores tmux mouse modes and effective flags" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     const pane = try addTestPane(&viewer);
     const terminal = &pane.terminal_owner.terminal;
@@ -2892,7 +2907,7 @@ test "pane hydration restores tmux mouse modes and effective flags" {
 }
 
 test "pane refresh preserves parser-only mouse modes" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     const pane = try addTestPane(&viewer);
     const terminal = &pane.terminal_owner.terminal;
@@ -2918,7 +2933,7 @@ test "pane refresh preserves parser-only mouse modes" {
 
 test "active topology creates configured pane terminals" {
     const max_scrollback: usize = 123_456;
-    var viewer = try Viewer.init(testing.allocator, .{
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .max_scrollback = max_scrollback,
     });
     defer viewer.deinit();
@@ -2949,11 +2964,11 @@ test "active topology creates configured pane terminals" {
     try testing.expectEqual(1, viewer.windows.items[1].active_pane_id);
     {
         const terminal_owner = viewer.panes.get(0).?.terminal_owner;
-        terminal_owner.mutex.lock();
-        defer terminal_owner.mutex.unlock();
+        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
         try testing.expectEqual(
             max_scrollback,
-            terminal_owner.terminal.screens.get(.primary).?.pages.explicit_max_size,
+            terminal_owner.terminal.screens.get(.primary).?.pages.limits.bytes.explicit,
         );
     }
 
@@ -3035,7 +3050,7 @@ test "active topology creates configured pane terminals" {
 }
 
 test "unsupported tmux exits before topology hydration" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3062,7 +3077,7 @@ test "unsupported tmux exits before topology hydration" {
 }
 
 test "zero history limit omits initial history capture" {
-    var viewer = try Viewer.init(testing.allocator, .{
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .history_line_limit = 0,
     });
     defer viewer.deinit();
@@ -3097,7 +3112,7 @@ test "zero history limit omits initial history capture" {
 }
 
 test "immediate exit" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3117,7 +3132,7 @@ test "immediate exit" {
 }
 
 test "direct viewer accepts only the server attach block" {
-    var server_viewer = try Viewer.init(testing.allocator, .{});
+    var server_viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer server_viewer.deinit();
     var server_block = testClientBlock("");
     server_block.meta.flags = 0;
@@ -3127,7 +3142,7 @@ test "direct viewer accepts only the server attach block" {
     );
     try testing.expectEqual(State.startup_session, server_viewer.state);
 
-    var client_viewer = try Viewer.init(testing.allocator, .{});
+    var client_viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer client_viewer.deinit();
     const actions = client_viewer.next(.{ .tmux = .{
         .block_end = testClientBlock(""),
@@ -3138,7 +3153,7 @@ test "direct viewer accepts only the server attach block" {
 }
 
 test "session changed resets state" {
-    var viewer = try Viewer.init(testing.allocator, .{
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .history_line_limit = 2_000,
     });
     defer viewer.deinit();
@@ -3167,12 +3182,25 @@ test "session changed resets state" {
             } },
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.session_id);
                     try testing.expectEqualStrings("first", v.session_name);
                     try testing.expectEqual(1, v.windows.items.len);
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
+
+                    for (actions) |action| switch (action) {
+                        .windows => |windows| {
+                            // The action must reference viewer-owned state,
+                            // not the temporary list used while parsing.
+                            try testing.expectEqual(v.windows.items.ptr, windows.ptr);
+                            try testing.expectEqual(v.windows.items.len, windows.len);
+                            try testing.expectEqual(@as(usize, 0), windows[0].id);
+                            return;
+                        },
+                        else => {},
+                    };
+                    return error.TestExpectedWindowsAction;
                 }
             }).check,
         },
@@ -3253,7 +3281,7 @@ test "session changed resets state" {
 }
 
 test "session changed with pending commands fails closed" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     _ = viewer.next(.handshake_ok);
@@ -3277,7 +3305,7 @@ test "session changed with pending commands fails closed" {
 
 test "initial session name allocation failure is atomic" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var viewer = try Viewer.init(failing.allocator(), .{});
+    var viewer = try Viewer.init(testing.io, failing.allocator(), .{});
     var viewer_live = true;
     defer if (viewer_live) viewer.deinit();
 
@@ -3300,7 +3328,7 @@ test "initial session name allocation failure is atomic" {
 }
 
 test "initial flow" {
-    var viewer = try Viewer.init(testing.allocator, .{
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .history_line_limit = 2_000,
     });
     defer viewer.deinit();
@@ -3490,7 +3518,7 @@ test "initial flow" {
 }
 
 test "untracked UTF-8 allocation failure exits the viewer" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -3511,11 +3539,11 @@ test "untracked UTF-8 allocation failure exits the viewer" {
 }
 
 test "live output preserves UTF-8 split across notifications" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -3538,11 +3566,11 @@ test "live output preserves UTF-8 split across notifications" {
 }
 
 test "live output action does not allocate" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -3571,11 +3599,11 @@ test "live output action does not allocate" {
 }
 
 test "live output preserves CSI split across notifications" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -3595,17 +3623,17 @@ test "live output preserves CSI split across notifications" {
     const cell = pane.terminal_owner.terminal.screens.active.pages.getCell(.{
         .screen = .{ .x = 0, .y = 0 },
     }).?.cell;
-    try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
+    try testing.expectEqual(@as(u21, 'X'), cell.codepoint());
     try testing.expect(cell.style_id != 0);
     try testing.expect(pane.terminal_owner.terminal.screens.active.cursor.style.flags.bold);
 }
 
 test "hydration seeds pending VT state before live output" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -3625,16 +3653,16 @@ test "hydration seeds pending VT state before live output" {
         .screen = .{ .x = 0, .y = 0 },
     }).?.cell;
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
-    try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
+    try testing.expectEqual(@as(u21, 'X'), cell.codepoint());
     try testing.expect(cell.style_id != 0);
 }
 
 test "hydration carries split UTF-8 past an empty pending capture" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -3662,11 +3690,11 @@ test "hydration carries split UTF-8 past an empty pending capture" {
 }
 
 test "hydration command errors do not become terminal content" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -3697,7 +3725,7 @@ test "hydration command errors do not become terminal content" {
 }
 
 test "direct viewer server block does not consume a command" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     _ = viewer.next(.handshake_ok);
@@ -3717,7 +3745,7 @@ test "direct viewer server block does not consume a command" {
 }
 
 test "direct viewer group error preserves later group" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
@@ -3755,7 +3783,7 @@ test "direct viewer group error preserves later group" {
 }
 
 test "zoomed geometry follows visible layout" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     const full_layout = "607b,83x44,0,0[83x22,0,0,0,83x21,0,23,1]";
@@ -3854,7 +3882,7 @@ test "zoomed geometry follows visible layout" {
 }
 
 test "layout change" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     var undiscovered_prefix = [_]u8{0xE2};
 
@@ -3935,7 +3963,7 @@ test "layout change" {
 }
 
 test "layout_change emits a new group while another group is pending" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3993,7 +4021,7 @@ test "layout_change emits a new group while another group is pending" {
 }
 
 test "layout_change returns command when queue was empty" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4081,7 +4109,7 @@ fn seedWindowCloseTestViewer(viewer: *Viewer) !void {
 }
 
 test "window rename replaces the owned name and publishes topology" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4114,7 +4142,7 @@ test "window rename replaces the owned name and publishes topology" {
 }
 
 test "list-windows reconstructs multiline names without another command" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4146,7 +4174,7 @@ test "list-windows reconstructs multiline names without another command" {
 }
 
 test "invalid list-windows response fails without publishing topology" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4173,7 +4201,7 @@ test "invalid list-windows response fails without publishing topology" {
 }
 
 test "window_close from another session does not change current topology" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4186,7 +4214,7 @@ test "window_close from another session does not change current topology" {
 }
 
 test "unlinked_window_close removes once without commands" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4209,7 +4237,7 @@ test "unlinked_window_close removes once without commands" {
 }
 
 test "session active-window change precedes unlinked_window_close" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4234,7 +4262,7 @@ test "session active-window change precedes unlinked_window_close" {
 }
 
 test "unlinked_window_close preserves an in-flight command group" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     try seedWindowCloseTestViewer(&viewer);
 
@@ -4255,7 +4283,7 @@ test "unlinked_window_close preserves an in-flight command group" {
 }
 
 test "window_add queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4316,7 +4344,7 @@ test "window_add queues list_windows when queue empty" {
 }
 
 test "window_add emits list_windows while another group is pending" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4384,11 +4412,11 @@ test "window_add emits list_windows while another group is pending" {
 }
 
 test "alternate pane hydration restores canonical screens" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 20,
         .rows = 4,
     });
@@ -4435,11 +4463,11 @@ test "alternate pane hydration restores canonical screens" {
 }
 
 test "visible snapshot preserves styled trailing cells" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 1,
     });
@@ -4459,11 +4487,11 @@ test "visible snapshot preserves styled trailing cells" {
 }
 
 test "history capture style does not seed visible snapshot blanks" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 2,
     });
@@ -4480,17 +4508,17 @@ test "history capture style does not seed visible snapshot blanks" {
     const written = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?.cell;
     const trailing = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?.cell;
     const blank = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?.cell;
-    try testing.expectEqual(@as(u21, 'A'), written.content.codepoint);
+    try testing.expectEqual(@as(u21, 'A'), written.codepoint());
     try testing.expect(trailing.isZero());
     try testing.expect(blank.isZero());
 }
 
 test "pane refresh is atomic when transport submission fails" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane = try Viewer.Pane.init(testing.allocator, .{
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -4523,11 +4551,11 @@ test "pane refresh is atomic when transport submission fails" {
 }
 
 test "targeted pane refresh preserves protocol state and isolates concurrent groups" {
-    var viewer = try Viewer.init(testing.allocator, .{});
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
     viewer.state = .command_queue;
 
-    const pane_1 = try Viewer.Pane.init(testing.allocator, .{
+    const pane_1 = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 2,
     });
@@ -4536,7 +4564,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
         pane_1.deinit(testing.allocator);
         return err;
     };
-    const pane_2 = try Viewer.Pane.init(testing.allocator, .{
+    const pane_2 = try Viewer.Pane.init(testing.io, testing.allocator, .{
         .cols = 11,
         .rows = 2,
     });

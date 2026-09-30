@@ -14,8 +14,10 @@ pub const calling_conv: std.builtin.CallingConvention = .c;
 
 /// Forwarded decls from lib that are used.
 pub const alloc = lib.allocator;
+pub const TinyIo = lib.TinyIo;
 pub const Buffer = lib.Buffer;
 pub const Enum = lib.Enum;
+pub const parseInt = lib.parseInt;
 pub const TaggedUnion = lib.TaggedUnion;
 pub const Struct = lib.Struct;
 pub const String = lib.String;
