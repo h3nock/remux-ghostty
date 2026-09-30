@@ -970,6 +970,7 @@ typedef enum {
   GHOSTTY_TERMINAL_PRODUCER_RESULT_OK,
   GHOSTTY_TERMINAL_PRODUCER_RESULT_INVALID_INPUT,
   GHOSTTY_TERMINAL_PRODUCER_RESULT_OUT_OF_MEMORY,
+  GHOSTTY_TERMINAL_PRODUCER_RESULT_SEMANTIC_FAILURE,
 } ghostty_terminal_producer_result_e;
 
 typedef struct {
@@ -1436,10 +1437,30 @@ ghostty_terminal_producer_retain_terminal(
 // Data is borrowed only for this call. A NULL data pointer is valid only when
 // len is zero. Embedded NUL bytes are passed unchanged to the VT parser. The
 // producer does not attach to or mutate other terminals.
+//
+// Returns SEMANTIC_FAILURE when the parser could not apply part of the input
+// (for example an allocation failure). The producer is then poisoned: every
+// later feed or resize returns SEMANTIC_FAILURE without changing the terminal.
+// The retained terminal stays valid for display; the host replaces the
+// producer and feeds a fresh baseline.
 GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_feed(
     ghostty_terminal_producer_t,
     const uint8_t*,
     size_t);
+// Resizes the producer's terminal in place to columns x rows with the given
+// cell pixel size, keeping the parser state, the retained terminal and any
+// renderer attached to it. All four values must be nonzero; invalid input is
+// rejected without changing the terminal. A same-size call still applies the
+// cell pixel size. The terminal's usual resize effects apply (the scroll
+// region and synchronized output are reset). The host keeps any live surface
+// in step with the new size. An allocation failure poisons the producer
+// (SEMANTIC_FAILURE).
+GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_resize(
+    ghostty_terminal_producer_t,
+    uint16_t columns,
+    uint16_t rows,
+    uint32_t cell_width_px,
+    uint32_t cell_height_px);
 GHOSTTY_API void ghostty_terminal_producer_free(ghostty_terminal_producer_t);
 GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 
