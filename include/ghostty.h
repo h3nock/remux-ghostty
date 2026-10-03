@@ -1461,6 +1461,21 @@ GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_resize(
     uint16_t rows,
     uint32_t cell_width_px,
     uint32_t cell_height_px);
+// Resizes as ghostty_terminal_producer_resize does, then feeds data as
+// ghostty_terminal_producer_feed does, under one hold of the terminal lock: a
+// renderer never observes the resized terminal before the content written for
+// its new size. Input is validated before anything changes; a resize that is
+// rejected or fails feeds nothing. A SEMANTIC_FAILURE from the feed leaves the
+// terminal at the new size, poisoned, as for a plain feed.
+GHOSTTY_API ghostty_terminal_producer_result_e
+ghostty_terminal_producer_resize_and_feed(
+    ghostty_terminal_producer_t,
+    uint16_t columns,
+    uint16_t rows,
+    uint32_t cell_width_px,
+    uint32_t cell_height_px,
+    const uint8_t*,
+    size_t);
 GHOSTTY_API void ghostty_terminal_producer_free(ghostty_terminal_producer_t);
 GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 

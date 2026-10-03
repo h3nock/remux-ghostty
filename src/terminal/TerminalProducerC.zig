@@ -64,13 +64,7 @@ pub const Producer = struct {
     fn feed(self: *Producer, bytes: []const u8) Result {
         self.terminal.mutex.lockUncancelable(self.terminal.terminal.io());
         defer self.terminal.mutex.unlock(self.terminal.terminal.io());
-        if (self.poisoned) return .semantic_failure;
-        self.stream.nextSlice(bytes);
-        if (self.stream.handler.semantic_failure) {
-            self.poisoned = true;
-            return .semantic_failure;
-        }
-        return .ok;
+        return self.feedLocked(bytes);
     }
 
     fn resize(
@@ -80,10 +74,48 @@ pub const Producer = struct {
         cell_width_px: u32,
         cell_height_px: u32,
     ) Result {
-        const terminal = &self.terminal.terminal;
-        self.terminal.mutex.lockUncancelable(terminal.io());
-        defer self.terminal.mutex.unlock(terminal.io());
+        self.terminal.mutex.lockUncancelable(self.terminal.terminal.io());
+        defer self.terminal.mutex.unlock(self.terminal.terminal.io());
+        return self.resizeLocked(columns, rows, cell_width_px, cell_height_px);
+    }
+
+    /// Resizes and feeds under one hold of the terminal lock, so a renderer
+    /// never observes the resized terminal before the bytes written for the
+    /// new size.
+    fn resizeAndFeed(
+        self: *Producer,
+        columns: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        bytes: []const u8,
+    ) Result {
+        self.terminal.mutex.lockUncancelable(self.terminal.terminal.io());
+        defer self.terminal.mutex.unlock(self.terminal.terminal.io());
+        const resized = self.resizeLocked(columns, rows, cell_width_px, cell_height_px);
+        if (resized != .ok) return resized;
+        return self.feedLocked(bytes);
+    }
+
+    fn feedLocked(self: *Producer, bytes: []const u8) Result {
         if (self.poisoned) return .semantic_failure;
+        self.stream.nextSlice(bytes);
+        if (self.stream.handler.semantic_failure) {
+            self.poisoned = true;
+            return .semantic_failure;
+        }
+        return .ok;
+    }
+
+    fn resizeLocked(
+        self: *Producer,
+        columns: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) Result {
+        if (self.poisoned) return .semantic_failure;
+        const terminal = &self.terminal.terminal;
         terminal.resize(terminal.gpa(), .{
             .cols = columns,
             .rows = rows,
@@ -157,6 +189,26 @@ pub export fn ghostty_terminal_producer_resize(
     return value.resize(columns, rows, cell_width_px, cell_height_px);
 }
 
+pub export fn ghostty_terminal_producer_resize_and_feed(
+    producer: ?*Producer,
+    columns: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    data_ptr: ?[*]const u8,
+    len: usize,
+) Result {
+    const value = producer orelse return .invalid_input;
+    if (columns == 0 or rows == 0 or cell_width_px == 0 or cell_height_px == 0) {
+        return .invalid_input;
+    }
+    const bytes: []const u8 = if (len == 0)
+        &.{}
+    else
+        (data_ptr orelse return .invalid_input)[0..len];
+    return value.resizeAndFeed(columns, rows, cell_width_px, cell_height_px, bytes);
+}
+
 pub export fn ghostty_terminal_producer_free(producer: ?*Producer) void {
     if (producer) |value| value.deinit();
 }
@@ -185,6 +237,7 @@ test "terminal producer C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_retain_terminal"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_feed"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_resize"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_producer_resize_and_feed"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_free"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_release"));
     try testing.expectEqual(
@@ -521,4 +574,183 @@ test "terminal producer reports a stream semantic failure and stays poisoned" {
     const contents = try producer.terminal.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("", contents);
+}
+
+test "terminal producer resize and feed applies content written for the new size" {
+    const testing = std.testing;
+    const producer = try Producer.init(testing.allocator, .{ .columns = 8, .rows = 3 });
+    defer producer.deinit();
+    var retained: ?*SharedTerminal = null;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_retain_terminal(producer, &retained),
+    );
+    defer ghostty_terminal_release(retained);
+
+    // A sequence split before the call completes on the same parser.
+    try testing.expectEqual(Result.ok, producer.feed("\x1b[3;"));
+    const repaint = "5Hnew";
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_resize_and_feed(producer, 12, 4, 9, 18, repaint.ptr, repaint.len),
+    );
+
+    const terminal = &retained.?.terminal;
+    try testing.expectEqual(@as(u16, 12), terminal.cols);
+    try testing.expectEqual(@as(u16, 4), terminal.rows);
+    try testing.expectEqual(@as(u32, 108), terminal.width_px);
+    try testing.expectEqual(@as(u32, 72), terminal.height_px);
+    const contents = try terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("\n\n    new", contents);
+
+    // Empty data resizes only.
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_resize_and_feed(producer, 12, 4, 10, 20, null, 0),
+    );
+    try testing.expectEqual(@as(u32, 120), terminal.width_px);
+}
+
+test "terminal producer resize and feed validates input without changing the terminal" {
+    const testing = std.testing;
+    const producer = try Producer.init(testing.allocator, .{ .columns = 8, .rows = 3 });
+    defer producer.deinit();
+    try testing.expectEqual(Result.ok, producer.feed("before"));
+
+    const data = "after";
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_resize_and_feed(null, 8, 3, 9, 18, data.ptr, data.len),
+    );
+    for ([_][4]u32{
+        .{ 0, 3, 9, 18 },
+        .{ 8, 0, 9, 18 },
+        .{ 8, 3, 0, 18 },
+        .{ 8, 3, 9, 0 },
+    }) |args| {
+        try testing.expectEqual(
+            Result.invalid_input,
+            ghostty_terminal_producer_resize_and_feed(
+                producer,
+                @intCast(args[0]),
+                @intCast(args[1]),
+                args[2],
+                args[3],
+                data.ptr,
+                data.len,
+            ),
+        );
+    }
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_resize_and_feed(producer, 12, 4, 9, 18, null, 1),
+    );
+
+    try testing.expectEqual(@as(u16, 8), producer.terminal.terminal.cols);
+    try testing.expectEqual(@as(u16, 3), producer.terminal.terminal.rows);
+    const contents = try producer.terminal.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("before", contents);
+    try testing.expectEqual(Result.ok, producer.feed(" still live"));
+}
+
+test "terminal producer resize and feed feeds nothing when the resize fails" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const producer = try Producer.init(failing.allocator(), .{ .columns = 8, .rows = 3 });
+    defer producer.deinit();
+    try testing.expectEqual(Result.ok, producer.feed("before"));
+
+    const data = "\x1b[H\x1b[2Jafter";
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(
+        Result.semantic_failure,
+        ghostty_terminal_producer_resize_and_feed(producer, 1000, 1000, 9, 18, data.ptr, data.len),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+
+    try testing.expectEqual(Result.semantic_failure, producer.feed("ignored"));
+    try testing.expectEqual(
+        Result.semantic_failure,
+        ghostty_terminal_producer_resize_and_feed(producer, 8, 3, 9, 18, data.ptr, data.len),
+    );
+    const contents = try producer.terminal.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("before", contents);
+}
+
+test "terminal producer resize and feed poisons on a feed failure after the resize" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const producer = try Producer.init(failing.allocator(), .{ .columns = 10, .rows = 2 });
+    defer producer.deinit();
+
+    // A same-size resize allocates nothing, so the forced failure lands on the
+    // title update in the feed, as in the plain feed test above.
+    const data = "\x1B]2;unavailable\x1B\\";
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(
+        Result.semantic_failure,
+        ghostty_terminal_producer_resize_and_feed(producer, 10, 2, 11, 22, data.ptr, data.len),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+
+    // The resize applied before the feed failed.
+    try testing.expectEqual(@as(u32, 110), producer.terminal.terminal.width_px);
+    try testing.expectEqual(Result.semantic_failure, producer.feed("ignored"));
+}
+
+test "terminal producer resize and feed is never observed between its steps" {
+    const testing = std.testing;
+    const producer = try Producer.init(testing.allocator, .{
+        .columns = 10,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer producer.deinit();
+    try testing.expectEqual(Result.ok, producer.feed("ten"));
+
+    // Plays the renderer: takes the terminal lock and checks that the content
+    // on screen is the content written for the size on screen.
+    const Observer = struct {
+        shared: *SharedTerminal,
+        stop: std.atomic.Value(bool) = .init(false),
+        observed: std.atomic.Value(usize) = .init(0),
+        mismatches: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *@This()) void {
+            const io = self.shared.terminal.io();
+            while (!self.stop.load(.acquire)) {
+                self.shared.mutex.lockUncancelable(io);
+                defer self.shared.mutex.unlock(io);
+                const contents = self.shared.terminal.plainString(std.testing.allocator) catch continue;
+                defer std.testing.allocator.free(contents);
+                const expected: []const u8 = if (self.shared.terminal.cols == 10) "ten" else "twelve";
+                if (!std.mem.eql(u8, contents, expected)) _ = self.mismatches.fetchAdd(1, .monotonic);
+                _ = self.observed.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var observer: Observer = .{ .shared = producer.terminal };
+    const thread = try std.Thread.spawn(.{}, Observer.run, .{&observer});
+    while (observer.observed.load(.monotonic) == 0) {}
+
+    const twelve = "\x1b[H\x1b[2Jtwelve";
+    const ten = "\x1b[H\x1b[2Jten";
+    for (0..2_000) |_| {
+        try testing.expectEqual(
+            Result.ok,
+            ghostty_terminal_producer_resize_and_feed(producer, 12, 3, 9, 18, twelve.ptr, twelve.len),
+        );
+        try testing.expectEqual(
+            Result.ok,
+            ghostty_terminal_producer_resize_and_feed(producer, 10, 3, 9, 18, ten.ptr, ten.len),
+        );
+    }
+    observer.stop.store(true, .release);
+    thread.join();
+
+    try testing.expect(observer.observed.load(.monotonic) > 0);
+    try testing.expectEqual(@as(usize, 0), observer.mismatches.load(.monotonic));
 }
