@@ -734,6 +734,11 @@ test "terminal producer resize and feed is never observed between its steps" {
     };
     var observer: Observer = .{ .shared = producer.terminal };
     const thread = try std.Thread.spawn(.{}, Observer.run, .{&observer});
+    // A failed assertion must not free the producer under the running observer.
+    errdefer {
+        observer.stop.store(true, .release);
+        thread.join();
+    }
     while (observer.observed.load(.monotonic) == 0) {}
 
     const twelve = "\x1b[H\x1b[2Jtwelve";
