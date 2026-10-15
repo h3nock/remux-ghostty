@@ -8,7 +8,9 @@ const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const input_mouse = @import("../input/mouse.zig");
 const renderer = @import("../renderer.zig");
-const SharedTerminal = @import("../terminal/Shared.zig");
+const RendererRuntime = @import("Runtime.zig");
+const TerminalSurface = @import("TerminalSurface.zig");
+const SharedTerminal = @import("Shared.zig");
 const terminal = @import("../terminal/main.zig");
 
 const log = std.log.scoped(.terminal_surface_c);
@@ -32,7 +34,7 @@ pub const WriteCallback = *const fn (
     len: usize,
 ) callconv(.c) bool;
 
-pub const InputResult = renderer.TerminalSurface.InputResult;
+pub const InputResult = TerminalSurface.InputResult;
 
 pub const Platform = apprt.embedded.Platform.C;
 
@@ -66,7 +68,7 @@ pub const Scrollbar = extern struct {
     cell_offset: f64,
 };
 
-pub const ScrollRoute = renderer.TerminalSurface.ScrollRoute;
+pub const ScrollRoute = TerminalSurface.ScrollRoute;
 
 pub const InteractionState = extern struct {
     scrollbar: Scrollbar,
@@ -75,9 +77,9 @@ pub const InteractionState = extern struct {
     has_selection: bool,
 };
 
-pub const SelectionEndpoint = renderer.TerminalSurface.SelectionEndpoint;
-pub const CellGeometry = renderer.TerminalSurface.CellGeometry;
-pub const SelectionSnapshot = renderer.TerminalSurface.SelectionSnapshot;
+pub const SelectionEndpoint = TerminalSurface.SelectionEndpoint;
+pub const CellGeometry = TerminalSurface.CellGeometry;
+pub const SelectionSnapshot = TerminalSurface.SelectionSnapshot;
 
 pub const Text = extern struct {
     tl_px_x: f64,
@@ -150,7 +152,7 @@ fn selectionEndpoint(raw: c_int) ?SelectionEndpoint {
     return std.enums.fromInt(SelectionEndpoint, raw);
 }
 
-fn interactionStateC(state: renderer.TerminalSurface.InteractionState) InteractionState {
+fn interactionStateC(state: TerminalSurface.InteractionState) InteractionState {
     return .{
         .scrollbar = .{
             .total = @intCast(state.scrollbar.total),
@@ -224,7 +226,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         app: *Runtime.App,
         font_size: f32,
         renderer_surface: apprt.RendererSurface,
-        core: renderer.TerminalSurface,
+        core: TerminalSurface,
         userdata: ?*anyopaque,
         renderer_health_cb: ?RendererHealthCallback,
         write_cb: ?WriteCallback,
@@ -265,7 +267,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             log.warn("unexpected exported-frame redraw for terminal surface", .{});
         }
 
-        fn writeSink(self: *Surface) ?renderer.TerminalSurface.WriteSink {
+        fn writeSink(self: *Surface) ?TerminalSurface.WriteSink {
             if (self.write_cb == null) return null;
             return .{
                 .ptr = self,
@@ -326,7 +328,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
     fn prepareLayout(
         app: *Runtime.App,
         config: Config,
-    ) !renderer.Runtime.PreparedLayout {
+    ) !RendererRuntime.PreparedLayout {
         const alloc = app.core_app.alloc;
 
         var font_config = try font.SharedGridSet.DerivedConfig.init(
@@ -524,7 +526,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         const out = out_ptr orelse return .invalid_input;
         if (!validCellOffset(cell_offset)) return .invalid_input;
         const row_value = scrollRow(row) orelse return .invalid_input;
-        var state: renderer.TerminalSurface.InteractionState = undefined;
+        var state: TerminalSurface.InteractionState = undefined;
         value.core.scrollToPosition(
             row_value,
             cell_offset,

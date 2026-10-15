@@ -8,7 +8,7 @@ const Shared = @This();
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Terminal = @import("Terminal.zig");
+const Terminal = @import("../terminal/Terminal.zig");
 
 alloc: Allocator,
 ref_count: std.atomic.Value(usize),

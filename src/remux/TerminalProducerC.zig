@@ -6,7 +6,7 @@
 const std = @import("std");
 const global = @import("../global.zig");
 const SharedTerminal = @import("Shared.zig");
-const TerminalStream = @import("stream_terminal.zig").Stream;
+const TerminalStream = @import("../terminal/stream_terminal.zig").Stream;
 
 pub const Result = enum(c_int) {
     ok,
