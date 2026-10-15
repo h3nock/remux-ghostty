@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const SharedTerminal = @import("../Shared.zig");
+const SharedTerminal = @import("../../terminal/Shared.zig");
 const channel_pkg = @import("channel.zig");
 const Viewer = @import("viewer.zig").Viewer;
 

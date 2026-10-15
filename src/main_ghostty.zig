@@ -263,4 +263,7 @@ test {
     _ = @import("extra/sublime.zig");
     _ = @import("extra/vim.zig");
     _ = @import("extra/zsh.zig");
+
+    // Remux
+    _ = @import("remux/main.zig");
 }

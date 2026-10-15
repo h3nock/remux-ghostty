@@ -411,7 +411,7 @@ pub const StreamHandler = struct {
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
-                        viewer.* = try .init(global.io(), self.alloc, .{});
+                        viewer.* = try .init(global.io(), self.alloc);
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
                         break :tmux;
@@ -458,20 +458,17 @@ pub const StreamHandler = struct {
                         },
 
                         .command => |command| {
-                            var serialized: std.Io.Writer.Allocating = .init(self.alloc);
-                            errdefer serialized.deinit();
-                            try command.write(&serialized.writer);
-                            self.messageWriter(.{ .write_alloc = .{
-                                .alloc = self.alloc,
-                                .data = try serialized.toOwnedSlice(),
-                            } });
+                            assert(command.len > 0);
+                            assert(command[command.len - 1] == '\n');
+                            self.messageWriter(try termio.Message.writeReq(
+                                self.alloc,
+                                command,
+                            ));
                         },
 
                         .windows => {
                             // TODO
                         },
-
-                        .pane_changed => {},
                     }
                 }
             },

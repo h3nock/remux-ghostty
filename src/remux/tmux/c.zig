@@ -3,9 +3,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ControlClient = @import("client.zig").ControlClient;
-const SharedTerminal = @import("../Shared.zig");
+const SharedTerminal = @import("../../terminal/Shared.zig");
 const Viewer = @import("viewer.zig").Viewer;
-const Layout = @import("layout.zig").Layout;
+const Layout = @import("../../terminal/tmux/layout.zig").Layout;
 const CommandToken = @import("channel.zig").CommandToken;
 const global = @import("../../global.zig");
 

@@ -36,35 +36,6 @@ pub fn parseFormatStruct(
     return result;
 }
 
-/// Parse a formatted record whose final field may contain the delimiter.
-/// All preceding fields remain strict; the final field receives the complete
-/// unconsumed remainder.
-pub fn parseFormatStructFinalRemainder(
-    comptime T: type,
-    str: []const u8,
-    delimiter: u8,
-) ParseError!T {
-    const fields = @typeInfo(T).@"struct".fields;
-    var remaining = str;
-    var result: T = undefined;
-    inline for (fields, 0..) |field, index| {
-        const part = if (index + 1 == fields.len)
-            remaining
-        else part: {
-            const end = std.mem.indexOfScalar(u8, remaining, delimiter) orelse
-                return error.MissingEntry;
-            const value = remaining[0..end];
-            remaining = remaining[end + 1 ..];
-            break :part value;
-        };
-        @field(result, field.name) = Variable.parse(
-            @field(Variable, field.name),
-            part,
-        ) catch return error.FormatError;
-    }
-    return result;
-}
-
 pub fn comptimeFormat(
     comptime vars: []const Variable,
     comptime delimiter: u8,
@@ -146,8 +117,6 @@ pub const Variable = enum {
     cursor_y,
     /// 1 if focus reporting is enabled.
     focus_flag,
-    /// Number of lines currently retained in pane history.
-    history_size,
     /// Pane insert flag.
     insert_flag,
     /// Pane keypad cursor flag.
@@ -168,14 +137,6 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
-    /// Current command reported by tmux for the pane process.
-    pane_current_command,
-    /// Current working directory reported by tmux for the pane process.
-    pane_current_path,
-    /// Current pane width in cells.
-    pane_width,
-    /// Current pane height in cells.
-    pane_height,
     /// Pane tab positions as a comma-separated list of 0-indexed column
     /// numbers (e.g., `8,16,24,32`). Empty string if no tabs are set.
     pane_tabs,
@@ -189,8 +150,6 @@ pub const Variable = enum {
     version,
     /// Unique window ID prefixed with `@` (e.g., `@0`, `@42`).
     window_id,
-    /// 1 if the window is the current session window.
-    window_active,
     /// Width of window.
     window_width,
     /// Height of window.
@@ -200,11 +159,6 @@ pub const Variable = enum {
     /// encodes pane dimensions as `WxH,X,Y[,ID]` with `{...}` for horizontal
     /// splits and `[...]` for vertical splits.
     window_layout,
-    /// Layout currently visible to the client. This equals window_layout when
-    /// unzoomed and contains the zoomed pane at full size when zoomed.
-    window_visible_layout,
-    /// The tmux-managed window name, whether automatic or explicitly set.
-    window_name,
     /// Pane wrap flag.
     wrap_flag,
 
@@ -226,14 +180,12 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
-            .window_active,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
             .alternate_saved_y,
             .cursor_x,
             .cursor_y,
-            .history_size,
             .scroll_region_lower,
             .scroll_region_upper,
             => try std.fmt.parseInt(usize, value, 10),
@@ -249,19 +201,13 @@ pub const Variable = enum {
                 try std.fmt.parseInt(usize, value[1..], 10)
             else
                 return error.FormatError,
-            .pane_width => try std.fmt.parseInt(usize, value, 10),
-            .pane_height => try std.fmt.parseInt(usize, value, 10),
             .window_width => try std.fmt.parseInt(usize, value, 10),
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
-            .pane_current_command,
-            .pane_current_path,
             .version,
             .window_layout,
-            .window_visible_layout,
-            .window_name,
             => value,
         };
     }
@@ -283,33 +229,25 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
-            .window_active,
             .wrap_flag,
             => bool,
             .alternate_saved_x,
             .alternate_saved_y,
             .cursor_x,
             .cursor_y,
-            .history_size,
             .scroll_region_lower,
             .scroll_region_upper,
             .session_id,
             .window_id,
             .pane_id,
-            .pane_width,
-            .pane_height,
             .window_width,
             .window_height,
             => usize,
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
-            .pane_current_command,
-            .pane_current_path,
             .version,
             .window_layout,
-            .window_visible_layout,
-            .window_name,
             => []const u8,
         };
     }
@@ -347,12 +285,6 @@ test "parse cursor_y" {
     try testing.expectError(error.InvalidCharacter, Variable.parse(.cursor_y, "abc"));
 }
 
-test "parse history_size" {
-    try testing.expectEqual(0, try Variable.parse(.history_size, "0"));
-    try testing.expectEqual(10_000, try Variable.parse(.history_size, "10000"));
-    try testing.expectError(error.InvalidCharacter, Variable.parse(.history_size, "abc"));
-}
-
 test "parse scroll_region_upper" {
     try testing.expectEqual(0, try Variable.parse(.scroll_region_upper, "0"));
     try testing.expectEqual(5, try Variable.parse(.scroll_region_upper, "5"));
@@ -386,14 +318,6 @@ test "parse window id" {
     try testing.expectError(error.InvalidCharacter, Variable.parse(.window_id, "@abc"));
 }
 
-test "parse window_active" {
-    try testing.expectEqual(true, try Variable.parse(.window_active, "1"));
-    try testing.expectEqual(false, try Variable.parse(.window_active, "0"));
-    try testing.expectEqual(false, try Variable.parse(.window_active, ""));
-    try testing.expectEqual(false, try Variable.parse(.window_active, "true"));
-    try testing.expectEqual(false, try Variable.parse(.window_active, "yes"));
-}
-
 test "parse window width" {
     try testing.expectEqual(80, try Variable.parse(.window_width, "80"));
     try testing.expectEqual(0, try Variable.parse(.window_width, "0"));
@@ -416,13 +340,6 @@ test "parse window layout" {
     try testing.expectEqualStrings("abc123", try Variable.parse(.window_layout, "abc123"));
     try testing.expectEqualStrings("", try Variable.parse(.window_layout, ""));
     try testing.expectEqualStrings("a]b,c{d}e(f)", try Variable.parse(.window_layout, "a]b,c{d}e(f)"));
-}
-
-test "parse visible window layout" {
-    try testing.expectEqualStrings(
-        "b7dd,83x44,0,0,0",
-        try Variable.parse(.window_visible_layout, "b7dd,83x44,0,0,0"),
-    );
 }
 
 test "parse cursor_flag" {
@@ -531,13 +448,6 @@ test "parse pane_id" {
     try testing.expectError(error.FormatError, Variable.parse(.pane_id, "%"));
     try testing.expectError(error.FormatError, Variable.parse(.pane_id, ""));
     try testing.expectError(error.InvalidCharacter, Variable.parse(.pane_id, "%abc"));
-}
-
-test "parse pane dimensions" {
-    try testing.expectEqual(80, try Variable.parse(.pane_width, "80"));
-    try testing.expectEqual(24, try Variable.parse(.pane_height, "24"));
-    try testing.expectError(error.InvalidCharacter, Variable.parse(.pane_width, "80px"));
-    try testing.expectError(error.Overflow, Variable.parse(.pane_height, "-1"));
 }
 
 test "parse cursor_colour" {
@@ -659,5 +569,5 @@ test "format empty variables" {
 }
 
 test "format all variables" {
-    try testFormat(&.{ .session_id, .window_id, .window_width, .window_height, .window_layout, .window_visible_layout }, ' ', "#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout} #{window_visible_layout}");
+    try testFormat(&.{ .session_id, .window_id, .window_width, .window_height, .window_layout }, ' ', "#{session_id} #{window_id} #{window_width} #{window_height} #{window_layout}");
 }
