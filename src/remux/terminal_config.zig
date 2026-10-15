@@ -88,16 +88,24 @@ test "color defaults match the derivation in upstream's Termio" {
     const testing = std.testing;
     const Termio = @import("../termio/Termio.zig");
 
+    // Generation only runs when the palette has user-set entries, keeps
+    // entries 0-15, and is affected by harmonious only on light themes, so
+    // the cases cover each of those inputs separately.
     const cases = [_]struct {
         generate: bool = false,
         harmonious: bool = false,
-        set_entry: bool = false,
+        light: bool = false,
+        entry: ?u8 = null,
         cursor: ?Config.TerminalColor = null,
     }{
         .{},
+        .{ .entry = 100 },
         .{ .generate = true },
-        .{ .generate = true, .set_entry = true },
-        .{ .generate = true, .harmonious = true, .set_entry = true },
+        .{ .generate = true, .entry = 3 },
+        .{ .generate = true, .entry = 100 },
+        .{ .generate = true, .harmonious = true, .entry = 100 },
+        .{ .generate = true, .harmonious = true, .light = true, .entry = 100 },
+        .{ .generate = true, .light = true, .entry = 100 },
         .{ .cursor = .{ .color = .{ .r = 16, .g = 17, .b = 18 } } },
         .{ .cursor = .@"cell-foreground" },
     };
@@ -105,13 +113,18 @@ test "color defaults match the derivation in upstream's Termio" {
     for (cases) |case| {
         var config = try Config.default(testing.allocator);
         defer config.deinit();
-        config.background = .{ .r = 1, .g = 2, .b = 3 };
-        config.foreground = .{ .r = 250, .g = 251, .b = 252 };
+        if (case.light) {
+            config.background = .{ .r = 250, .g = 248, .b = 240 };
+            config.foreground = .{ .r = 20, .g = 20, .b = 30 };
+        } else {
+            config.background = .{ .r = 1, .g = 2, .b = 3 };
+            config.foreground = .{ .r = 250, .g = 251, .b = 252 };
+        }
         config.@"palette-generate" = case.generate;
         config.@"palette-harmonious" = case.harmonious;
-        if (case.set_entry) {
-            config.palette.value[3] = .{ .r = 7, .g = 8, .b = 9 };
-            config.palette.mask.set(3);
+        if (case.entry) |index| {
+            config.palette.value[index] = .{ .r = 7, .g = 8, .b = 9 };
+            config.palette.mask.set(index);
         }
         config.@"cursor-color" = case.cursor;
 
