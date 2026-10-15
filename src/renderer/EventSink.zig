@@ -1,38 +1,60 @@
-//! Renderer-originated events delivered to the owning surface.
-//!
-//! The context pointer and vtable must remain valid for the full lifetime of
-//! every renderer and renderer thread that uses the sink. Callbacks may run
-//! off the main thread.
-pub const EventSink = @This();
-
+const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 
-ptr: *anyopaque,
-vtable: *const VTable,
+/// Renderer-originated events delivered to the renderer's owner. A core
+/// surface receives them through its mailbox. Owners without a core surface
+/// receive them through callbacks, which may run off the main thread.
+pub const EventSink = union(enum) {
+    surface_mailbox: apprt.surface.Mailbox,
+    callbacks: Callbacks,
 
-pub const VTable = struct {
-    /// Returns true when the value was accepted. False asks the renderer to
-    /// keep the value dirty and retry delivery on its next draw.
-    scrollbar: *const fn (ptr: *anyopaque, value: terminal.Scrollbar) bool,
-    renderer_health: *const fn (ptr: *anyopaque, value: renderer.Health) void,
-    /// The renderer exported a new frame for the owning surface to present.
-    redraw: *const fn (ptr: *anyopaque) void,
+    /// The context pointer and vtable must remain valid for the full lifetime
+    /// of every renderer and renderer thread that uses the sink.
+    pub const Callbacks = struct {
+        ptr: *anyopaque,
+        vtable: *const VTable,
+    };
+
+    pub const VTable = struct {
+        /// Returns true when the value was accepted. False asks the renderer
+        /// to keep the value dirty and retry delivery on its next draw.
+        scrollbar: *const fn (ptr: *anyopaque, value: terminal.Scrollbar) bool,
+        renderer_health: *const fn (ptr: *anyopaque, value: renderer.Health) void,
+        /// The renderer exported a new frame for the owner to present.
+        redraw: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn scrollbar(self: EventSink, value: terminal.Scrollbar) bool {
+        return switch (self) {
+            .surface_mailbox => |mailbox| mailbox.push(.{
+                .scrollbar = value,
+            }, .instant) > 0,
+            .callbacks => |c| c.vtable.scrollbar(c.ptr, value),
+        };
+    }
+
+    pub fn rendererHealth(self: EventSink, value: renderer.Health) void {
+        switch (self) {
+            .surface_mailbox => |mailbox| _ = mailbox.push(.{
+                .renderer_health = value,
+            }, .{ .forever = {} }),
+            .callbacks => |c| c.vtable.renderer_health(c.ptr, value),
+        }
+    }
+
+    pub fn redraw(self: EventSink) void {
+        switch (self) {
+            .surface_mailbox => |mailbox| _ = mailbox.push(
+                .redraw,
+                .{ .forever = {} },
+            ),
+            .callbacks => |c| c.vtable.redraw(c.ptr),
+        }
+    }
 };
 
-pub inline fn scrollbar(self: EventSink, value: terminal.Scrollbar) bool {
-    return self.vtable.scrollbar(self.ptr, value);
-}
-
-pub inline fn rendererHealth(self: EventSink, value: renderer.Health) void {
-    self.vtable.renderer_health(self.ptr, value);
-}
-
-pub inline fn redraw(self: EventSink) void {
-    self.vtable.redraw(self.ptr);
-}
-
-test "dispatches renderer events" {
+test "callbacks receive renderer events" {
     const testing = @import("std").testing;
 
     const Context = struct {
@@ -58,16 +80,16 @@ test "dispatches renderer events" {
         }
     };
 
-    const vtable: VTable = .{
+    const vtable: EventSink.VTable = .{
         .scrollbar = Context.scrollbar,
         .renderer_health = Context.rendererHealth,
         .redraw = Context.redraw,
     };
     var context: Context = .{};
-    const sink: EventSink = .{
+    const sink: EventSink = .{ .callbacks = .{
         .ptr = &context,
         .vtable = &vtable,
-    };
+    } };
 
     const value: terminal.Scrollbar = .{
         .total = 10,

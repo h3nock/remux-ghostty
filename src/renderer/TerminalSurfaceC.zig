@@ -236,10 +236,10 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         };
 
         fn eventSink(self: *Surface) renderer.EventSink {
-            return .{
+            return .{ .callbacks = .{
                 .ptr = self,
                 .vtable = &event_vtable,
-            };
+            } };
         }
 
         fn eventScrollbar(_: *anyopaque, _: terminal.Scrollbar) bool {
@@ -404,7 +404,6 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
             .write_sink = surface.writeSink(),
             .macos_option_as_alt = app.config.@"macos-option-as-alt" orelse
                 app.keyboardLayout().detectOptionAsAlt(),
-            .crash_context = null,
             .visible = config.visible,
             .focused = config.focused,
         });

@@ -125,5 +125,5 @@ pub fn render(
     // state. This is KIND OF expensive (wasted CPU if nothing was done)
     // but the inspector is a development tool and it expressly costs
     // more resources while open so its okay.
-    surface.render.thread.wakeup.notify() catch {};
+    surface.renderer_thread.wakeup.notify() catch {};
 }

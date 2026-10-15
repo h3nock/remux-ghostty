@@ -15,5 +15,8 @@ pub const App = struct {
     ) !bool {
         return false;
     }
+
+    /// There is no app event loop to wake up.
+    pub fn wakeup(_: *const App) void {}
 };
 pub const Surface = struct {};

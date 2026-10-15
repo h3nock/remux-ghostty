@@ -79,9 +79,6 @@ state: *rendererpkg.State,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: *Mailbox,
 
-/// Renderer-thread crash metadata, when available.
-crash_context: ?crash.sentry.ThreadState,
-
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -113,11 +110,6 @@ pub const DerivedConfig = struct {
     }
 };
 
-pub const InitialState = struct {
-    visible: bool = true,
-    focused: bool = true,
-};
-
 /// Initialize the thread. This does not START the thread. This only sets
 /// up all the internal state necessary prior to starting the thread. It
 /// is up to the caller to start the thread with the threadMain entrypoint.
@@ -127,8 +119,6 @@ pub fn init(
     surface: *apprt.RendererSurface,
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
-    crash_context: ?crash.sentry.ThreadState,
-    initial_state: InitialState,
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
@@ -171,11 +161,6 @@ pub fn init(
         .renderer = renderer_impl,
         .state = state,
         .mailbox = mailbox,
-        .crash_context = crash_context,
-        .flags = .{
-            .visible = initial_state.visible,
-            .focused = initial_state.focused,
-        },
     };
 
     // Only enable compression if we have it enabled... save some
@@ -223,7 +208,13 @@ fn threadMain_(self: *Thread) !void {
     }
 
     // Setup our crash metadata
-    crash.sentry.thread_state = self.crash_context;
+    crash.sentry.thread_state = switch (self.renderer.event_sink) {
+        .surface_mailbox => |mailbox| .{
+            .type = .renderer,
+            .surface = mailbox.surface,
+        },
+        .callbacks => null,
+    };
     defer crash.sentry.thread_state = null;
 
     // Setup our thread QoS

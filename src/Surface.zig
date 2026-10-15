@@ -21,11 +21,11 @@ const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global = @import("global.zig");
+const oni = @import("oniguruma");
 const simd = @import("simd/main.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
-const renderer_link = @import("renderer/link.zig");
 const termio = @import("termio.zig");
 const font = @import("font/main.zig");
 const Command = @import("Command.zig");
@@ -43,44 +43,6 @@ const log = std.log.scoped(.surface);
 
 // The renderer implementation to use.
 const Renderer = rendererpkg.Renderer;
-
-/// Adapts renderer events to the Core Surface mailbox.
-const RendererEventSink = struct {
-    const vtable: rendererpkg.EventSink.VTable = .{
-        .scrollbar = scrollbar,
-        .renderer_health = rendererHealth,
-        .redraw = redrawSurface,
-    };
-
-    fn init(surface: *Surface) rendererpkg.EventSink {
-        return .{
-            .ptr = surface,
-            .vtable = &vtable,
-        };
-    }
-
-    fn coreSurface(ptr: *anyopaque) *Surface {
-        return @ptrCast(@alignCast(ptr));
-    }
-
-    fn scrollbar(ptr: *anyopaque, value: terminal.Scrollbar) bool {
-        return coreSurface(ptr).surfaceMailbox().push(
-            .{ .scrollbar = value },
-            .{ .instant = {} },
-        ) > 0;
-    }
-
-    fn rendererHealth(ptr: *anyopaque, value: rendererpkg.Health) void {
-        _ = coreSurface(ptr).surfaceMailbox().push(
-            .{ .renderer_health = value },
-            .{ .forever = {} },
-        );
-    }
-
-    fn redrawSurface(ptr: *anyopaque) void {
-        _ = coreSurface(ptr).surfaceMailbox().push(.redraw, .{ .forever = {} });
-    }
-};
 
 /// Minimum window size in cells. This is used to prevent the window from
 /// being resized to a size that is too small to be useful. These defaults
@@ -117,6 +79,7 @@ rt_app: *apprt.runtime.App,
 rt_surface: *apprt.runtime.Surface,
 
 /// The font structures
+font_grid_key: font.SharedGridSet.Key,
 font_size: font.face.DesiredSize,
 font_metrics: font.Metrics,
 
@@ -126,8 +89,17 @@ font_metrics: font.Metrics,
 /// a specific size.
 font_size_adjusted: bool,
 
-/// Renderer, render state, and renderer thread lifecycle.
-render: rendererpkg.Runtime,
+/// The renderer for this surface.
+renderer: Renderer,
+
+/// The render state
+renderer_state: rendererpkg.State,
+
+/// The renderer thread manager
+renderer_thread: rendererpkg.Thread,
+
+/// The actual thread
+renderer_thr: std.Thread,
 
 /// Mouse state.
 mouse: Mouse,
@@ -369,7 +341,7 @@ const DerivedConfig = struct {
     title: ?[:0]const u8,
     title_report: bool,
     vt_window_resize_allowed: bool,
-    links: renderer_link.Set,
+    links: []DerivedConfig.Link,
     link_osc8: bool,
     link_previews: configpkg.LinkPreviews,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
@@ -378,16 +350,37 @@ const DerivedConfig = struct {
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
 
+    const Link = struct {
+        regex: oni.Regex,
+        action: input.Link.Action,
+        highlight: input.Link.Highlight,
+    };
+
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
         var arena = ArenaAllocator.init(alloc_gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var links = try renderer_link.Set.fromConfig(
-            alloc,
-            config.link.links.items,
-        );
-        errdefer links.deinit(alloc);
+        // Build all of our links
+        const links = links: {
+            var links: std.ArrayList(DerivedConfig.Link) = .empty;
+            defer links.deinit(alloc);
+            for (config.link.links.items) |link| {
+                var regex = try link.oniRegex();
+                errdefer regex.deinit();
+                try links.append(alloc, .{
+                    .regex = regex,
+                    .action = link.action,
+                    .highlight = link.highlight,
+                });
+            }
+
+            break :links try links.toOwnedSlice(alloc);
+        };
+        errdefer {
+            for (links) |*link| link.regex.deinit();
+            alloc.free(links);
+        }
 
         return .{
             .original_font_size = config.@"font-size",
@@ -445,17 +438,34 @@ const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
-        self.links.deinit(self.arena.allocator());
+        for (self.links) |*link| link.regex.deinit();
         self.arena.deinit();
     }
 
     fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
-        return (rendererpkg.Padding{
-            .top = self.window_padding_top,
-            .bottom = self.window_padding_bottom,
-            .left = self.window_padding_left,
-            .right = self.window_padding_right,
-        }).scaledDpi(x_dpi, y_dpi);
+        const padding_top: u32 = padding_top: {
+            const padding_top: f32 = @floatFromInt(self.window_padding_top);
+            break :padding_top @intFromFloat(@floor(padding_top * y_dpi / 72));
+        };
+        const padding_bottom: u32 = padding_bottom: {
+            const padding_bottom: f32 = @floatFromInt(self.window_padding_bottom);
+            break :padding_bottom @intFromFloat(@floor(padding_bottom * y_dpi / 72));
+        };
+        const padding_left: u32 = padding_left: {
+            const padding_left: f32 = @floatFromInt(self.window_padding_left);
+            break :padding_left @intFromFloat(@floor(padding_left * x_dpi / 72));
+        };
+        const padding_right: u32 = padding_right: {
+            const padding_right: f32 = @floatFromInt(self.window_padding_right);
+            break :padding_right @intFromFloat(@floor(padding_right * x_dpi / 72));
+        };
+
+        return .{
+            .top = padding_top,
+            .bottom = padding_bottom,
+            .left = padding_left,
+            .right = padding_right,
+        };
     }
 };
 
@@ -494,11 +504,6 @@ pub fn init(
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
-    // The renderer borrows this projection until its thread stops and joins
-    // during deinit. The application-runtime surface storage remains stable
-    // for that full lifetime.
-    const renderer_surface = apprt.rendererSurface(rt_surface);
-
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
     const content_scale = try rt_surface.getContentScale();
@@ -518,10 +523,71 @@ pub fn init(
         .ydpi = @intFromFloat(@round(y_dpi)),
     };
 
+    // Setup our font group. This will reuse an existing font group if
+    // it was already loaded.
+    const font_grid_key, const font_grid = try app.font_grid_set.ref(
+        &derived_config.font,
+        font_size,
+    );
+
+    // Build our size struct which has all the sizes we need.
+    const size: rendererpkg.Size = size: {
+        var size: rendererpkg.Size = .{
+            .screen = screen: {
+                const surface_size = try rt_surface.getSize();
+                break :screen .{
+                    .width = surface_size.width,
+                    .height = surface_size.height,
+                };
+            },
+
+            .cell = font_grid.cellSize(),
+            .padding = .{},
+        };
+
+        const explicit: rendererpkg.Padding = derived_config.scaledPadding(
+            x_dpi,
+            y_dpi,
+        );
+        if (derived_config.window_padding_balance != .false) {
+            size.balancePadding(explicit, derived_config.window_padding_balance);
+        } else {
+            size.padding = explicit;
+        }
+
+        break :size size;
+    };
+
+    // Create our terminal grid with the initial size
+    const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
+    var renderer_impl = try Renderer.init(alloc, .{
+        .config = try .init(alloc, config),
+        .font_grid = font_grid,
+        .size = size,
+        .event_sink = .{ .surface_mailbox = .{ .surface = self, .app = app_mailbox } },
+        .rt_surface = apprt.rendererSurface(rt_surface),
+        .thread = &self.renderer_thread,
+    });
+    errdefer renderer_impl.deinit();
+
     // The mutex used to protect our renderer state.
     const mutex = try alloc.create(std.Io.Mutex);
     mutex.* = .init;
     errdefer alloc.destroy(mutex);
+
+    // Create the renderer thread
+    var render_thread = try rendererpkg.Thread.init(
+        alloc,
+        config,
+        apprt.rendererSurface(rt_surface),
+        &self.renderer,
+        &self.renderer_state,
+    );
+    errdefer render_thread.deinit();
+
+    // Create the IO thread
+    var io_thread = try termio.Thread.init(alloc);
+    errdefer io_thread.deinit();
 
     self.* = .{
         .id = id: {
@@ -539,16 +605,23 @@ pub fn init(
         .app = app,
         .rt_app = rt_app,
         .rt_surface = rt_surface,
+        .font_grid_key = font_grid_key,
         .font_size = font_size,
         .font_size_adjusted = false,
-        .font_metrics = undefined,
-        .render = undefined,
+        .font_metrics = font_grid.metrics,
+        .renderer = renderer_impl,
+        .renderer_thread = render_thread,
+        .renderer_state = .{
+            .mutex = mutex,
+            .terminal = &self.io.terminal,
+        },
+        .renderer_thr = undefined,
         .mouse = .{},
         .keyboard = .{},
         .io = undefined,
-        .io_thread = undefined,
+        .io_thread = io_thread,
         .io_thr = undefined,
-        .size = undefined,
+        .size = size,
         .config = derived_config,
 
         // Our conditional state is initialized to the app state. This
@@ -566,148 +639,103 @@ pub fn init(
         break :command config.command;
     };
 
+    // Start our IO implementation
+    // This separate block ({}) is important because our errdefers must
+    // be scoped here to be valid.
     {
-        const app_mailbox: App.Mailbox = .{
-            .rt_app = rt_app,
-            .mailbox = &app.mailbox,
+        var env = rt_surface.defaultTermioEnv() catch |err| env: {
+            // If an error occurs, we don't want to block surface startup.
+            log.warn("error getting env map for surface err={}", .{err});
+            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
         };
-        const renderer_event_sink = RendererEventSink.init(self);
-        const surface_size = try renderer_surface.getSize();
-        var prepared_layout = try rendererpkg.Runtime.PreparedLayout.init(.{
-            .font_grid_set = &app.font_grid_set,
-            .font_config = &derived_config.font,
-            .font_size = font_size,
-            .screen = .{
-                .width = surface_size.width,
-                .height = surface_size.height,
-            },
-            .explicit_padding = derived_config.scaledPadding(x_dpi, y_dpi),
-            .padding_balance = derived_config.window_padding_balance,
-        });
-        defer prepared_layout.deinit();
-        self.font_metrics = try self.render.init(.{
-            .alloc = alloc,
-            .config = config,
-            .rt_surface = renderer_surface,
-            .terminal = &self.io.terminal,
-            .mutex = mutex,
-            .prepared_layout = &prepared_layout,
-            .size = &self.size,
-            .event_sink = renderer_event_sink,
-            .crash_context = .{
-                .type = .renderer,
-                .surface = self,
-            },
-        });
-        errdefer self.render.deinit();
+        errdefer env.deinit();
 
-        self.io_thread = try termio.Thread.init(alloc);
-        errdefer self.io_thread.deinit();
+        // don't leak GHOSTTY_LOG to any subprocesses
+        _ = env.orderedRemove("GHOSTTY_LOG");
 
-        // Start our IO implementation. This separate block is important
-        // because IO takes ownership of each temporary on success.
-        {
-            var env = rt_surface.defaultTermioEnv() catch |err| env: {
-                // If an error occurs, we don't want to block surface startup.
-                log.warn("error getting env map for surface err={}", .{err});
-                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
-            };
-            errdefer env.deinit();
-
-            // don't leak GHOSTTY_LOG to any subprocesses
-            _ = env.orderedRemove("GHOSTTY_LOG");
-
-            var buf: [18]u8 = undefined;
-            try env.put(
-                "GHOSTTY_SURFACE_ID",
-                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-            );
-
-            // Initialize our IO backend
-            var io_exec = try termio.Exec.init(alloc, .{
-                .command = command,
-                .env = env,
-                .env_override = config.env,
-                .shell_integration = config.@"shell-integration",
-                .shell_integration_features = config.@"shell-integration-features",
-                .cursor_blink = config.@"cursor-style-blink",
-                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-                .resources_dir = global.resourcesDir().host(),
-                .term = config.term,
-                .rt_pre_exec_info = .init(config),
-                .rt_post_fork_info = .init(config),
-            });
-            errdefer io_exec.deinit();
-
-            // Initialize our IO mailbox
-            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-            errdefer io_mailbox.deinit(alloc);
-
-            try termio.Termio.init(&self.io, alloc, .{
-                .size = self.size,
-                .full_config = config,
-                .config = try termio.Termio.DerivedConfig.init(alloc, config),
-                .backend = .{ .exec = io_exec },
-                .mailbox = io_mailbox,
-                .renderer_state = &self.render.state,
-                .renderer_wakeup = self.render.thread.wakeup,
-                .renderer_mailbox = self.render.thread.mailbox,
-                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-            });
-        }
-        errdefer self.io.deinit();
-
-        // Report initial cell size on surface creation
-        _ = try rt_app.performAction(
-            .{ .surface = self },
-            .cell_size,
-            .{ .width = self.size.cell.width, .height = self.size.cell.height },
+        var buf: [18]u8 = undefined;
+        try env.put(
+            "GHOSTTY_SURFACE_ID",
+            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
-        _ = try rt_app.performAction(
-            .{ .surface = self },
-            .size_limit,
-            .{
-                .min_width = self.size.cell.width * min_window_width_cells,
-                .min_height = self.size.cell.height * min_window_height_cells,
-                // No max:
-                .max_width = 0,
-                .max_height = 0,
-            },
-        );
+        // Initialize our IO backend
+        var io_exec = try termio.Exec.init(alloc, .{
+            .command = command,
+            .env = env,
+            .env_override = config.env,
+            .shell_integration = config.@"shell-integration",
+            .shell_integration_features = config.@"shell-integration-features",
+            .cursor_blink = config.@"cursor-style-blink",
+            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+            .resources_dir = global.resourcesDir().host(),
+            .term = config.term,
+            .rt_pre_exec_info = .init(config),
+            .rt_post_fork_info = .init(config),
+        });
+        errdefer io_exec.deinit();
 
-        // Call our size callback which handles all our retina setup
-        // Note: this shouldn't be necessary and when we clean up the surface
-        // init stuff we should get rid of this. But this is required because
-        // sizeCallback does retina-aware stuff we don't do here and don't want
-        // to duplicate.
-        try self.resize(self.size.screen);
+        // Initialize our IO mailbox
+        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+        errdefer io_mailbox.deinit(alloc);
 
-        try self.render.start();
+        try termio.Termio.init(&self.io, alloc, .{
+            .size = size,
+            .full_config = config,
+            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .backend = .{ .exec = io_exec },
+            .mailbox = io_mailbox,
+            .renderer_state = &self.renderer_state,
+            .renderer_wakeup = render_thread.wakeup,
+            .renderer_mailbox = render_thread.mailbox,
+            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+        });
     }
+    // Outside the block, IO has now taken ownership of our temporary state
+    // so we can just defer this and not the subcomponents.
+    errdefer self.io.deinit();
+
+    // Report initial cell size on surface creation
+    _ = try rt_app.performAction(
+        .{ .surface = self },
+        .cell_size,
+        .{ .width = size.cell.width, .height = size.cell.height },
+    );
+
+    _ = try rt_app.performAction(
+        .{ .surface = self },
+        .size_limit,
+        .{
+            .min_width = size.cell.width * min_window_width_cells,
+            .min_height = size.cell.height * min_window_height_cells,
+            // No max:
+            .max_width = 0,
+            .max_height = 0,
+        },
+    );
+
+    // Call our size callback which handles all our retina setup
+    // Note: this shouldn't be necessary and when we clean up the surface
+    // init stuff we should get rid of this. But this is required because
+    // sizeCallback does retina-aware stuff we don't do here and don't want
+    // to duplicate.
+    try self.resize(self.size.screen);
+
+    // Start our renderer thread
+    self.renderer_thr = try std.Thread.spawn(
+        .{},
+        rendererpkg.Thread.threadMain,
+        .{&self.renderer_thread},
+    );
+    self.renderer_thr.setName(global.io(), "renderer") catch {};
 
     // Start our IO thread
-    self.io_thr = std.Thread.spawn(
+    self.io_thr = try std.Thread.spawn(
         .{},
         termio.Thread.threadMain,
         .{ &self.io_thread, &self.io },
-    ) catch |err| {
-        self.render.stop();
-        self.render.deinit();
-        self.io_thread.deinit();
-        self.io.deinit();
-        return err;
-    };
+    );
     self.io_thr.setName(global.io(), "io") catch {};
-    errdefer {
-        self.render.stop();
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
-        self.render.deinit();
-        self.io_thread.deinit();
-        self.io.deinit();
-    }
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -774,7 +802,11 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
-    self.render.stop();
+    {
+        self.renderer_thread.stop.notify() catch |err|
+            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        self.renderer_thr.join();
+    }
 
     // Stop our IO thread
     {
@@ -785,7 +817,8 @@ pub fn deinit(self: *Surface) void {
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
-    self.render.deinit();
+    self.renderer_thread.deinit();
+    self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     self.io.deinit();
@@ -800,8 +833,12 @@ pub fn deinit(self: *Surface) void {
     self.keyboard.sequence_queued.deinit(self.alloc);
     self.keyboard.table_stack.deinit(self.alloc);
 
+    // Clean up our font grid
+    self.app.font_grid_set.deref(self.font_grid_key);
+
     // Clean up our render state
-    self.alloc.destroy(self.render.state.mutex);
+    if (self.renderer_state.preedit) |p| self.alloc.free(p.codepoints);
+    self.alloc.destroy(self.renderer_state.mutex);
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
@@ -854,7 +891,7 @@ fn queueIo(
 pub fn draw(self: *Surface) !void {
     // Renderers are required to support `drawFrame` being called from
     // the main thread, so that they can update contents during resize.
-    try self.render.renderer.drawFrame(true);
+    try self.renderer.drawFrame(true);
 }
 
 /// Activate the inspector. This will begin collecting inspection data.
@@ -873,14 +910,14 @@ pub fn activateInspector(self: *Surface) !void {
 
     // Put the inspector onto the render state
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
-        assert(self.render.state.inspector == null);
-        self.render.state.inspector = self.inspector;
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        assert(self.renderer_state.inspector == null);
+        self.renderer_state.inspector = self.inspector;
     }
 
     // Notify our components we have an inspector active
-    _ = self.render.thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -888,12 +925,12 @@ pub fn activateInspector(self: *Surface) !void {
 /// the renderer exports. See `renderer.Health` and the renderer's
 /// `presentation_health` state for the semantics.
 pub fn reportPresentationHealth(self: *Surface, health: rendererpkg.Health) void {
-    _ = self.render.thread.mailbox.push(
+    _ = self.renderer_thread.mailbox.push(
         global.io(),
         .{ .presentation_health = health },
         .forever,
     );
-    self.render.thread.wakeup.notify() catch |err|
+    self.renderer_thread.wakeup.notify() catch |err|
         log.warn("failed to wake up renderer err={}", .{err});
 }
 
@@ -903,14 +940,14 @@ pub fn deactivateInspector(self: *Surface) void {
 
     // Remove the inspector from the render state
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
-        assert(self.render.state.inspector != null);
-        self.render.state.inspector = null;
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        assert(self.renderer_state.inspector != null);
+        self.renderer_state.inspector = null;
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.render.thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -934,8 +971,8 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
@@ -1187,9 +1224,9 @@ fn selectionScrollTick(self: *Surface) !void {
     const pos_vp = self.posToViewport(pos.x, pos.y);
 
     // We need our locked state for the remainder
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
-    const t: *terminal.Terminal = self.render.state.terminal;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const t: *terminal.Terminal = self.renderer_state.terminal;
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
         .viewport = pos_vp,
@@ -1278,9 +1315,9 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
 
         // If the native GUI can't be shown, display a text message in the
         // terminal.
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
-        const t: *terminal.Terminal = self.render.state.terminal;
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t: *terminal.Terminal = self.renderer_state.terminal;
         t.carriageReturn();
         t.linefeed() catch break :terminal;
         t.printString("Process exited. Press any key to close the terminal.") catch
@@ -1318,9 +1355,9 @@ fn childExitedAbnormally(
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
-    const t: *terminal.Terminal = self.render.state.terminal;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const t: *terminal.Terminal = self.renderer_state.terminal;
 
     // No matter what move the cursor back to the column 0.
     t.carriageReturn();
@@ -1385,8 +1422,8 @@ fn childExitedAbnormally(
 /// Called when the terminal detects there is a password input prompt.
 fn passwordInput(self: *Surface, v: bool) !void {
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // If our password input state is unchanged then we don't
         // waste time doing anything more.
@@ -1437,7 +1474,7 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.render.thread.mailbox.push(
+            _ = self.renderer_thread.mailbox.push(
                 global.io(),
                 .{ .search_viewport_matches = .{
                     .arena = arena,
@@ -1445,7 +1482,7 @@ fn searchCallback_(
                 } },
                 .forever,
             );
-            try self.render.thread.wakeup.notify();
+            try self.renderer_thread.wakeup.notify();
         },
 
         .selected_match => |selected_| {
@@ -1456,7 +1493,7 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.render.thread.mailbox.push(
+                _ = self.renderer_thread.mailbox.push(
                     global.io(),
                     .{ .search_selected_match = .{
                         .arena = arena,
@@ -1472,7 +1509,7 @@ fn searchCallback_(
                 );
             } else {
                 // Reset our selected match
-                _ = self.render.thread.mailbox.push(
+                _ = self.renderer_thread.mailbox.push(
                     global.io(),
                     .{ .search_selected_match = null },
                     .forever,
@@ -1485,7 +1522,7 @@ fn searchCallback_(
                 );
             }
 
-            try self.render.thread.wakeup.notify();
+            try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
@@ -1497,12 +1534,12 @@ fn searchCallback_(
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.render.thread.mailbox.push(
+            _ = self.renderer_thread.mailbox.push(
                 global.io(),
                 .{ .search_selected_match = null },
                 .forever,
             );
-            _ = self.render.thread.mailbox.push(
+            _ = self.renderer_thread.mailbox.push(
                 global.io(),
                 .{ .search_viewport_matches = .{
                     .arena = .init(self.alloc),
@@ -1510,7 +1547,7 @@ fn searchCallback_(
                 } },
                 .forever,
             );
-            try self.render.thread.wakeup.notify();
+            try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
             _ = self.surfaceMailbox().push(
@@ -1546,15 +1583,15 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
         // highlight links. Additionally, mark the screen as dirty so
         // that the highlight state of all links is properly updated.
         {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
-            self.render.state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
             // We use the clear screen dirty flag to force a rebuild of all
             // rows because changing mouse mods can affect the highlight state
             // of a link. If there is no link this seems very wasteful but
             // its really only one frame so it's not so bad.
-            self.render.state.terminal.flags.dirty.clear = true;
+            self.renderer_state.terminal.flags.dirty.clear = true;
         }
 
         self.queueRender() catch |err| {
@@ -1626,7 +1663,7 @@ fn mouseRefreshLinks(
             ._open_osc8 => {
                 // Show the URL in the status bar
                 const pin = link.selection.start();
-                const uri = self.io.terminal.screens.active.hyperlinkURI(pin) orelse {
+                const uri = self.osc8URI(pin) orelse {
                     log.warn("failed to get URI for OSC8 hyperlink", .{});
                     break :link .{ null, false };
                 };
@@ -1641,9 +1678,9 @@ fn mouseRefreshLinks(
     // If we found a link, setup our internal state and notify the
     // apprt so it can highlight it.
     if (link_) |link| {
-        self.render.state.mouse.point = pos_vp;
+        self.renderer_state.mouse.point = pos_vp;
         self.mouse.over_link = true;
-        self.render.state.terminal.screens.active.dirty.hyperlink_hover = true;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
@@ -1805,7 +1842,7 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.render.thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -1961,8 +1998,8 @@ pub fn dumpText(
     alloc: Allocator,
     sel: terminal.Selection,
 ) !Text {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return try self.dumpTextLocked(alloc, sel);
 }
 
@@ -2087,15 +2124,15 @@ pub fn dumpTextLocked(
 
 /// Returns true if the terminal has a selection.
 pub fn hasSelection(self: *const Surface) bool {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.screens.active.selection != null;
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const sel = self.io.terminal.screens.active.selection orelse return null;
     return try self.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
@@ -2110,8 +2147,8 @@ pub fn pwd(
     self: *const Surface,
     alloc: Allocator,
 ) Allocator.Error!?[]const u8 {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const terminal_pwd = self.io.terminal.getPwd() orelse return null;
     return try alloc.dupe(u8, terminal_pwd);
 }
@@ -2142,10 +2179,10 @@ fn resolvePathForOpening(
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
 /// keyboard should be rendered.
 pub fn imePoint(self: *const Surface) apprt.IMEPos {
-    self.render.state.mutex.lockUncancelable(global.io());
-    const cursor = self.render.state.terminal.screens.active.cursor;
-    const preedit_width: usize = if (self.render.state.preedit) |preedit| preedit.width() else 0;
-    self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    const cursor = self.renderer_state.terminal.screens.active.cursor;
+    const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
+    self.renderer_state.mutex.unlock(global.io());
 
     // TODO: need to handle when scrolling and the cursor is not
     // in the visible portion of the screen.
@@ -2463,11 +2500,11 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     self.font_size = size;
 
     // We need to build up a new font stack for this font size.
-    const font_grid_key, const font_grid = try self.render.font_grid_set.ref(
+    const font_grid_key, const font_grid = try self.app.font_grid_set.ref(
         &self.config.font,
         self.font_size,
     );
-    errdefer self.render.font_grid_set.deref(font_grid_key);
+    errdefer self.app.font_grid_set.deref(font_grid_key);
 
     // Set our cell size
     try self.setCellSize(.{
@@ -2475,9 +2512,19 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
         .height = font_grid.metrics.cell_height,
     });
 
-    // Notify our render thread of the new font stack and transfer our new
-    // grid reference to the renderer runtime.
-    self.render.setFontGrid(font_grid_key, font_grid);
+    // Notify our render thread of the new font stack. The renderer
+    // MUST accept the new font grid and deref the old.
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .font_grid = .{
+            .grid = font_grid,
+            .set = &self.app.font_grid_set,
+            .old_key = self.font_grid_key,
+            .new_key = font_grid_key,
+        },
+    }, .{ .forever = {} });
+
+    // Once we've sent the key we can replace our key
+    self.font_grid_key = font_grid_key;
     self.font_metrics = font_grid.metrics;
 
     // Schedule render which also drains our mailbox
@@ -2488,24 +2535,24 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
 fn queueRender(self: *Surface) !void {
-    try self.render.thread.wakeup.notify();
+    try self.renderer_thread.wakeup.notify();
 }
 
 /// Called by the apprt when the surface's display is realized.
 /// Notifies the renderer so it can begin rendering.
 /// Safe to call from the main thread.
 pub fn displayRealized(self: *Surface) !void {
-    try self.render.renderer.displayRealized();
+    try self.renderer.displayRealized();
 }
 
 /// Called by the apprt when the surface's display is unrealized (the surface
 /// is being destroyed or reparented). Safe to call from the main thread.
 pub fn displayUnrealized(self: *Surface) void {
-    self.render.renderer.displayUnrealized();
+    self.renderer.displayUnrealized();
 
     // Wake the render thread so it notices `display_realized` is now false
     // and releases GPU resources (swap chain and shaders).
-    self.render.thread.wakeup.notify() catch |err| {
+    self.renderer_thread.wakeup.notify() catch |err| {
         log.warn("failed to notify renderer thread of unrealize err={}", .{err});
     };
 }
@@ -2551,7 +2598,7 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     self.queueIo(.{ .resize = self.size }, .unlocked);
 
     // Mail the render thread so it updates its padding and screen size.
-    _ = self.render.thread.mailbox.push(
+    _ = self.renderer_thread.mailbox.push(
         global.io(),
         .{ .resize = self.size },
         .forever,
@@ -2586,13 +2633,13 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     // We clear our selection when ANY OF:
     // 1. We have an existing preedit
     // 2. We have preedit text
-    if (self.render.state.preedit != null or
+    if (self.renderer_state.preedit != null or
         preedit_ != null)
     {
         if (self.config.selection_clear_on_typing) {
@@ -2601,9 +2648,9 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     }
 
     // We always clear our prior preedit
-    if (self.render.state.preedit) |p| {
+    if (self.renderer_state.preedit) |p| {
         self.alloc.free(p.codepoints);
-        self.render.state.preedit = null;
+        self.renderer_state.preedit = null;
     }
 
     // Mark preedit dirty flag
@@ -2644,7 +2691,7 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
         return;
     }
 
-    self.render.state.preedit = .{
+    self.renderer_state.preedit = .{
         .codepoints = try codepoints.toOwnedSlice(self.alloc),
     };
     try self.queueRender();
@@ -2753,8 +2800,8 @@ pub fn keyCallback(
     )) |v| return v;
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
@@ -2784,8 +2831,8 @@ pub fn keyCallback(
         {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             self.mouseRefreshLinks(
                 pos,
                 self.posToViewport(pos.x, pos.y),
@@ -2877,8 +2924,8 @@ pub fn keyCallback(
     // some data to send to the pty, then we move the viewport down to the
     // bottom. We also clear the selection for any key other then modifiers.
     if (!event.key.modifier()) {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         if (self.config.selection_clear_on_typing or
             event.key == .escape)
@@ -3310,8 +3357,8 @@ fn encodeKey(
 }
 
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
@@ -3358,10 +3405,10 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
 
     // Update the terminal state for synchronous queries, then notify the IO
     // thread so it can emit a mode 2033 report when enabled.
-    self.render.state.mutex.lockUncancelable(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
     self.io.terminal.flags.visible = visible;
     const report_visibility = self.io.terminal.modes.get(.report_visibility);
-    self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.unlock(global.io());
     if (report_visibility) {
         self.queueIo(.{ .visibility_report = .{
             .visible = visible,
@@ -3369,7 +3416,7 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         } }, .unlocked);
     }
 
-    _ = self.render.thread.mailbox.push(global.io(), .{
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
     }, .{ .forever = {} });
 
@@ -3390,7 +3437,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.render.thread.mailbox.push(global.io(), .{
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
         .focus = focused,
     }, .{ .forever = {} });
 
@@ -3457,9 +3504,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
 
     // Update the focus state and notify the terminal
     {
-        self.render.state.mutex.lockUncancelable(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
         self.io.terminal.flags.focused = focused;
-        self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.unlock(global.io());
         self.queueIo(.{ .focused = focused }, .unlocked);
     }
 }
@@ -3591,8 +3638,8 @@ pub fn scrollCallback(
     // log.info("SCROLL: delta_y={} delta_x={}", .{ y.delta, x.delta });
 
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
@@ -3718,8 +3765,8 @@ fn isMouseReporting(self: *const Surface) bool {
 }
 
 pub fn mouseReportingActive(self: *Surface) bool {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return self.isMouseReporting();
 }
 
@@ -3798,8 +3845,8 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
         .false, .true => {},
     }
 
-    if (lock) self.render.state.mutex.lockUncancelable(global.io());
-    defer if (lock) self.render.state.mutex.unlock(global.io());
+    if (lock) self.renderer_state.mutex.lockUncancelable(global.io());
+    defer if (lock) self.renderer_state.mutex.unlock(global.io());
 
     // If the terminal explicitly requests it then we always allow it
     // since we processed never/always at this point.
@@ -3820,8 +3867,8 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.flags.mouse_event != .none;
 }
 
@@ -3893,8 +3940,8 @@ pub fn mouseButtonCallback(
     }
 
     if (button == .left and action == .release) {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // The selection gesture tracks whether a press became a drag by
         // comparing the release cell to the original press cell. Resolve the
@@ -3916,7 +3963,7 @@ pub fn mouseButtonCallback(
             } });
         } else null;
         self.mouse.selection_gesture.release(
-            self.render.state.terminal,
+            self.renderer_state.terminal,
             .{ .pin = release_pin },
         );
 
@@ -3969,8 +4016,8 @@ pub fn mouseButtonCallback(
 
     // Report mouse events if enabled
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         if (self.isMouseReporting()) report: {
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
@@ -3984,7 +4031,7 @@ pub fn mouseButtonCallback(
             // We also set the left click count to 0 so that if mouse reporting
             // is disabled in the middle of press (before release) we don't
             // suddenly start selecting text.
-            self.mouse.selection_gesture.reset(self.render.state.terminal);
+            self.mouse.selection_gesture.reset(self.renderer_state.terminal);
 
             const pos = try self.rt_surface.getCursorPos();
 
@@ -4009,10 +4056,10 @@ pub fn mouseButtonCallback(
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
     if (button == .left and action == .press) click: {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
-        const t: *terminal.Terminal = self.render.state.terminal;
-        const screen: *terminal.Screen = self.render.state.terminal.screens.active;
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
@@ -4109,11 +4156,11 @@ pub fn mouseButtonCallback(
     // want to be careful in the future we can add a function to apprts
     // that let's us know.
     if (button == .right and action == .press) sel: {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // Get our viewport pin
-        const screen: *terminal.Screen = self.render.state.terminal.screens.active;
+        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
             const pt_viewport = self.posToViewport(pos.x, pos.y);
@@ -4181,8 +4228,8 @@ pub fn mouseButtonCallback(
             } else {
                 // Pasting can trigger a lock grab in complete clipboard
                 // request so we need to unlock.
-                self.render.state.mutex.unlock(global.io());
-                defer self.render.state.mutex.lockUncancelable(global.io());
+                self.renderer_state.mutex.unlock(global.io());
+                defer self.renderer_state.mutex.lockUncancelable(global.io());
                 _ = try self.startClipboardRequest(.standard, .{ .paste = .standard });
 
                 // We don't need to clear selection because we didn't have
@@ -4196,8 +4243,8 @@ pub fn mouseButtonCallback(
 
                 // Pasting can trigger a lock grab in complete clipboard
                 // request so we need to unlock.
-                self.render.state.mutex.unlock(global.io());
-                defer self.render.state.mutex.lockUncancelable(global.io());
+                self.renderer_state.mutex.unlock(global.io());
+                defer self.renderer_state.mutex.lockUncancelable(global.io());
                 _ = try self.startClipboardRequest(.standard, .{ .paste = .standard });
             },
         }
@@ -4211,7 +4258,7 @@ pub fn mouseButtonCallback(
 
 /// Requires the renderer state mutex is held.
 fn maybePromptClick(self: *Surface) !bool {
-    const t: *terminal.Terminal = self.render.state.terminal;
+    const t: *terminal.Terminal = self.renderer_state.terminal;
     const screen: *terminal.Screen = t.screens.active;
 
     // If our screen doesn't handle any prompt clicks, then we never
@@ -4330,15 +4377,20 @@ fn maybePromptClick(self: *Surface) !bool {
     return true;
 }
 
+const Link = struct {
+    action: input.Link.Action,
+    selection: terminal.Selection,
+};
+
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
-) !?renderer_link.Match {
+) !?Link {
     // Convert our cursor position to a screen point.
-    const screen: *terminal.Screen = self.render.state.terminal.screens.active;
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
         const point = self.posToViewport(pos.x, pos.y);
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
@@ -4358,10 +4410,8 @@ fn linkAtPos(
         const rac = mouse_pin.rowAndCell();
         const cell = rac.cell;
         if (!cell.hyperlink) break :hyperlink;
-        return .{
-            .action = .{ ._open_osc8 = {} },
-            .selection = .init(mouse_pin, mouse_pin, false),
-        };
+        const sel = terminal.Selection.init(mouse_pin, mouse_pin, false);
+        return .{ .action = ._open_osc8, .selection = sel };
     }
 
     // Fall back to configured links
@@ -4378,14 +4428,45 @@ fn linkAtPin(
     self: *Surface,
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
-) !?renderer_link.Match {
-    const screen: *terminal.Screen = self.render.state.terminal.screens.active;
-    return try self.config.links.matchAtPin(
-        self.alloc,
-        screen,
-        mouse_pin,
-        mouse_mods,
-    );
+) !?Link {
+    if (self.config.links.len == 0) return null;
+
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+    const line = screen.selectLine(.{
+        .pin = mouse_pin,
+        .whitespace = null,
+        // Respect semantic prompt boundaries so link/path matching doesn't
+        // merge shell prompt content with the text beside it.
+        .semantic_prompt_boundary = true,
+    }) orelse return null;
+
+    const strmap = try screen.selectionStringMap(self.alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer strmap.deinit(self.alloc);
+
+    for (self.config.links) |link| {
+        // Skip highlight/mods check when mouse_mods is null (double-click mode)
+        if (mouse_mods) |mods| switch (link.highlight) {
+            .always, .hover => {},
+            .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
+        };
+
+        var it = strmap.searchIterator(link.regex);
+        while (true) {
+            var match = (try it.next()) orelse break;
+            defer match.deinit();
+            const sel = match.selection();
+            if (!sel.contains(screen, mouse_pin)) continue;
+            return .{
+                .action = link.action,
+                .selection = sel,
+            };
+        }
+    }
+
+    return null;
 }
 
 /// This returns the mouse mods to consider for link highlighting or
@@ -4429,9 +4510,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
         },
 
         ._open_osc8 => {
-            const uri = self.io.terminal.screens.active.hyperlinkURI(
-                link.selection.start(),
-            ) orelse {
+            const uri = self.osc8URI(link.selection.start()) orelse {
                 log.warn("failed to get URI for OSC8 hyperlink", .{});
                 return false;
             };
@@ -4463,6 +4542,17 @@ fn openUrl(
     );
 }
 
+/// Return the URI for an OSC8 hyperlink at the given position or null
+/// if there is no hyperlink.
+fn osc8URI(self: *Surface, pin: terminal.Pin) ?[]const u8 {
+    _ = self;
+    const page = pin.node.page();
+    const cell = pin.rowAndCell().cell;
+    const link_id = page.lookupHyperlink(cell) orelse return null;
+    const entry = page.hyperlink_set.get(page.memory, link_id);
+    return entry.uri.slice(page.memory);
+}
+
 pub fn mousePressureCallback(
     self: *Surface,
     stage: input.MousePressureStage,
@@ -4492,11 +4582,11 @@ pub fn mousePressureCallback(
     if (self.mouse.click_state[left_idx] == .press and
         stage == .deep)
     select: {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         const sel = self.mouse.selection_gesture.deepPress(
-            self.render.state.terminal,
+            self.renderer_state.terminal,
             .{ .word_boundary_codepoints = self.config.selection_word_chars },
         );
 
@@ -4558,15 +4648,15 @@ pub fn cursorPosCallback(
             try self.queueRender();
         }
 
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // No mouse point so we don't highlight links
-        self.render.state.mouse.point = null;
+        self.renderer_state.mouse.point = null;
 
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
-        self.render.state.terminal.screens.active.dirty.hyperlink_hover = true;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
     }
 
     // Always show the mouse again if it is hidden
@@ -4585,20 +4675,20 @@ pub fn cursorPosCallback(
     self.mouse.over_link = false;
 
     // We are reading/writing state for the remainder
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     // Update our mouse state. We set this to null initially because we only
     // want to set it when we're not selecting or doing any other mouse
     // event.
-    self.render.state.mouse.point = null;
+    self.renderer_state.mouse.point = null;
 
     // If we have an inspector, we need to always record position information
     if (self.inspector) |insp| {
         insp.mouse.last_xpos = pos.x;
         insp.mouse.last_ypos = pos.y;
 
-        const screen: *terminal.Screen = self.render.state.terminal.screens.active;
+        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         insp.mouse.last_point = screen.pages.pin(.{ .viewport = .{
             .x = pos_vp.x,
             .y = pos_vp.y,
@@ -4664,7 +4754,7 @@ pub fn cursorPosCallback(
         // don't process this. We don't invalidate our pin or mouse state
         // because if the same screen switches back then we can continue our
         // selection.
-        const t: *terminal.Terminal = self.render.state.terminal;
+        const t: *terminal.Terminal = self.renderer_state.terminal;
         if (self.mouse.activeLeftClickPin(&t.screens) == null) break :select;
 
         // All roads lead to requiring a re-render at this point.
@@ -4842,8 +4932,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // CSI/ESC triggers a scroll.
             {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 self.scrollToBottom() catch |err| {
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
@@ -4869,8 +4959,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Text triggers a scroll.
             {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 self.scrollToBottom() catch |err| {
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
@@ -4882,8 +4972,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // in cursor keys mode. We're in "normal" mode if cursor
             // keys mode is NOT set.
             const normal = normal: {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
 
                 // With the lock held, we must scroll to the bottom.
                 // We always scroll to the bottom for these inputs.
@@ -4902,9 +4992,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
-            self.render.state.terminal.fullReset();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.renderer_state.terminal.fullReset();
         },
 
         .start_search => {
@@ -4958,8 +5048,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 // a stable pointer back to the thread state.
                 self.search = .{
                     .state = try .init(self.alloc, .{
-                        .mutex = self.render.state.mutex,
-                        .terminal = self.render.state.terminal,
+                        .mutex = self.renderer_state.mutex,
+                        .terminal = self.renderer_state.terminal,
                         .event_cb = &searchCallback,
                         .event_userdata = self,
                     }),
@@ -5010,8 +5100,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .copy_to_clipboard => |format| {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             if (self.io.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
@@ -5042,8 +5132,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             if (!self.mouse.over_link) return false;
             const pos = try self.rt_surface.getCursorPos();
 
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             if (try self.linkAtPos(pos)) |link_info| {
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
@@ -5059,9 +5149,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
                     ._open_osc8 => url_text: {
                         // For OSC8 links, get the URI directly from hyperlink data
-                        const uri = self.io.terminal.screens.active.hyperlinkURI(
-                            link_info.selection.start(),
-                        ) orelse {
+                        const uri = self.osc8URI(link_info.selection.start()) orelse {
                             log.warn("failed to get URI for OSC8 hyperlink", .{});
                             return false;
                         };
@@ -5206,8 +5294,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // alternate screen then clear screen does nothing so we want to
             // return false so the keybind can be unconsumed.
             {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 if (self.io.terminal.screens.active_key == .alternate) return false;
             }
 
@@ -5230,9 +5318,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_to_row => |n| {
             {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
-                const t: *terminal.Terminal = self.render.state.terminal;
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                const t: *terminal.Terminal = self.renderer_state.terminal;
                 t.screens.active.scroll(.{ .row = n });
             }
 
@@ -5241,8 +5329,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_to_selection => {
             {
-                self.render.state.mutex.lockUncancelable(global.io());
-                defer self.render.state.mutex.unlock(global.io());
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
@@ -5486,8 +5574,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .select_all => {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             const sel = self.io.terminal.screens.active.selectAll();
             if (sel) |s| {
@@ -5608,7 +5696,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .main => @panic("crash binding action, crashing intentionally"),
 
             .render => {
-                _ = self.render.thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
+                _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
                 self.queueRender() catch |err| {
                     // Not a big deal if this fails.
                     log.warn("failed to notify renderer of crash message err={}", .{err});
@@ -5619,8 +5707,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .adjust_selection => |direction| {
-            self.render.state.mutex.lockUncancelable(global.io());
-            defer self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = if (screen.selection) |*sel| sel else {
@@ -5733,8 +5821,8 @@ fn writeScreenFile(
 
     // Write the scrollback contents. This requires a lock.
     {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // We only dump history if we have history. We still keep
         // the file and write the empty file to the pty so that this
@@ -6078,9 +6166,9 @@ fn startClipboardRequest(
             // Snapshot the mode before asking the apprt for clipboard data.
             // Event pastes request only a MIME listing, while ordinary
             // pastes request the text representation as before.
-            self.render.state.mutex.lockUncancelable(global.io());
+            self.renderer_state.mutex.lockUncancelable(global.io());
             const event = self.io.terminal.modes.get(.kitty_paste_events);
-            self.render.state.mutex.unlock(global.io());
+            self.renderer_state.mutex.unlock(global.io());
 
             break :effective if (event)
                 .{ .list = clipboard }
@@ -6121,8 +6209,8 @@ fn completeClipboardPaste(
     if (data.len == 0) return;
 
     const encode_opts: input.paste.Options = encode_opts: {
-        self.render.state.mutex.lockUncancelable(global.io());
-        defer self.render.state.mutex.unlock(global.io());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
 
         // If we have paste protection enabled, we detect unsafe pastes and return
@@ -6221,8 +6309,8 @@ fn completeClipboardPasteEvent(
     var aw: std.Io.Writer.Allocating = .init(self.alloc);
     defer aw.deinit();
 
-    self.render.state.mutex.lockUncancelable(global.io());
-    defer self.render.state.mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const pasted = try terminal.paste.paste(.{
         .terminal = &self.io.terminal,
