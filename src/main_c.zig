@@ -46,7 +46,7 @@ comptime {
     _ = @import("benchmark/main.zig").CApi;
 
     // Sans-I/O tmux control-mode embedding API.
-    _ = @import("terminal/tmux/c.zig");
+    _ = @import("remux/tmux/c.zig");
 
     // Generic terminal producer and shared terminal lifetime API.
     _ = @import("terminal/TerminalProducerC.zig");
