@@ -159,8 +159,10 @@ pub fn stop(self: *Runtime) void {
 
 /// Deinitialize an unstarted or already-stopped runtime.
 pub fn deinit(self: *Runtime) void {
-    self.thread.deinit();
+    // The renderer goes first: on macOS its display link callback targets
+    // the thread's draw_now handle until the renderer's deinit stops it.
     self.renderer.deinit();
+    self.thread.deinit();
     self.font_grid_set.deref(self.font_grid_key);
     if (self.state.preedit) |*preedit| preedit.deinit(self.alloc);
 }
