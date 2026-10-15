@@ -13,7 +13,6 @@ const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
-const terminal_config = @import("../terminal/config.zig");
 const global = @import("../global.zig");
 const xev = global.xev;
 const renderer = @import("../renderer.zig");
@@ -169,10 +168,13 @@ const ThreadEnterState = struct {
 pub const DerivedConfig = struct {
     arena: ArenaAllocator,
 
-    colors: terminal_config.ColorDefaults,
+    palette: terminalpkg.color.Palette,
     image_storage_limit: usize,
     cursor_style: terminalpkg.CursorStyle,
     cursor_blink: ?bool,
+    cursor_color: ?configpkg.Config.TerminalColor,
+    foreground: configpkg.Config.Color,
+    background: configpkg.Config.Color,
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_write_limit: usize,
@@ -187,11 +189,29 @@ pub const DerivedConfig = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
+        const palette: terminalpkg.color.Palette = palette: {
+            if (config.@"palette-generate") generate: {
+                if (config.palette.mask.findFirstSet() == null) {
+                    // If the user didn't set any values manually, then
+                    // we're using the default palette and we don't need
+                    // to apply the generation code to it.
+                    break :generate;
+                }
+
+                break :palette terminalpkg.color.generate256Color(config.palette.value, config.palette.mask, config.background.toTerminalRGB(), config.foreground.toTerminalRGB(), config.@"palette-harmonious");
+            }
+
+            break :palette config.palette.value;
+        };
+
         return .{
-            .colors = terminal_config.colorDefaults(config),
+            .palette = palette,
             .image_storage_limit = config.@"image-storage-limit",
             .cursor_style = config.@"cursor-style",
             .cursor_blink = config.@"cursor-style-blink",
+            .cursor_color = config.@"cursor-color",
+            .foreground = config.foreground,
+            .background = config.background,
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .clipboard_write_limit = config.@"clipboard-write-limit-bytes".value,
@@ -243,12 +263,13 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .default_cursor_style = opts.config.cursor_style,
             .default_cursor_blink = opts.config.cursor_blink,
             .colors = .{
-                .background = .init(opts.config.colors.background),
-                .foreground = .init(opts.config.colors.foreground),
-                .cursor = if (opts.config.colors.cursor) |value|
-                    .init(value)
-                else
-                    .unset,
+                .background = .init(opts.config.background.toTerminalRGB()),
+                .foreground = .init(opts.config.foreground.toTerminalRGB()),
+                .cursor = cursor: {
+                    const color = opts.config.cursor_color orelse break :cursor .unset;
+                    const rgb = color.toTerminalRGB() orelse break :cursor .unset;
+                    break :cursor .init(rgb);
+                },
                 .palette = .default,
             },
             .kitty_image_storage_limit = opts.config.image_storage_limit,
@@ -259,7 +280,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
 
     // The default palette may be an allocator-owned copy, so it is set
     // once the terminal owns its memory and can release it on deinit.
-    try term.colors.palette.changeDefault(alloc, opts.config.colors.palette);
+    try term.colors.palette.changeDefault(alloc, opts.config.palette);
 
     // Setup our terminal size in pixels for certain requests.
     term.width_px = term.cols * opts.size.cell.width;
@@ -446,7 +467,25 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     //   - command, working-directory: we never restart the underlying
     //   process so we don't care or need to know about these.
 
-    terminal_config.applyColorDefaults(self.alloc, &self.terminal, config.colors);
+    // Update the default palette. A config change must not fail here, so
+    // if we can't allocate the copy of the configured palette we fall back
+    // to the built-in default, which never allocates.
+    self.terminal.colors.palette.changeDefault(
+        self.alloc,
+        config.palette,
+    ) catch |err| {
+        log.warn("error changing default palette, using built-in default err={}", .{err});
+        self.terminal.colors.palette.resetDefault(self.alloc);
+    };
+    self.terminal.flags.dirty.palette = true;
+
+    // Update all our other colors
+    self.terminal.colors.background.default = config.background.toTerminalRGB();
+    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
+    self.terminal.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);

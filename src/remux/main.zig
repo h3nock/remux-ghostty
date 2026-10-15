@@ -4,6 +4,7 @@
 pub const Runtime = @import("Runtime.zig");
 pub const Shared = @import("Shared.zig");
 pub const TerminalSurface = @import("TerminalSurface.zig");
+pub const terminal_config = @import("terminal_config.zig");
 pub const tmux = @import("tmux.zig");
 
 test {

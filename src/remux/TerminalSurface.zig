@@ -15,7 +15,7 @@ const renderer_link = @import("../renderer/link.zig");
 const sizepkg = @import("../renderer/size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
-const terminal_config = @import("../terminal/config.zig");
+const terminal_config = @import("terminal_config.zig");
 
 const log = std.log.scoped(.terminal_surface);
 

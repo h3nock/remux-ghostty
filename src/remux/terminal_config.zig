@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const Config = @import("../config/Config.zig");
-const Terminal = @import("Terminal.zig");
-const color = @import("color.zig");
+const Terminal = @import("../terminal/Terminal.zig");
+const color = @import("../terminal/color.zig");
 
 pub const ColorDefaults = struct {
     background: color.RGB,
@@ -82,4 +82,47 @@ test "config color defaults preserve terminal overrides" {
     try testing.expectEqual(color.RGB{ .r = 22, .g = 23, .b = 24 }, terminal.colors.cursor.get().?);
     try testing.expectEqual(config.palette.value[2], terminal.colors.palette.original[2]);
     try testing.expectEqual(color.RGB{ .r = 13, .g = 14, .b = 15 }, terminal.colors.palette.current[2]);
+}
+
+test "color defaults match the derivation in upstream's Termio" {
+    const testing = std.testing;
+    const Termio = @import("../termio/Termio.zig");
+
+    const cases = [_]struct {
+        generate: bool = false,
+        harmonious: bool = false,
+        set_entry: bool = false,
+        cursor: ?Config.TerminalColor = null,
+    }{
+        .{},
+        .{ .generate = true },
+        .{ .generate = true, .set_entry = true },
+        .{ .generate = true, .harmonious = true, .set_entry = true },
+        .{ .cursor = .{ .color = .{ .r = 16, .g = 17, .b = 18 } } },
+        .{ .cursor = .@"cell-foreground" },
+    };
+
+    for (cases) |case| {
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        config.background = .{ .r = 1, .g = 2, .b = 3 };
+        config.foreground = .{ .r = 250, .g = 251, .b = 252 };
+        config.@"palette-generate" = case.generate;
+        config.@"palette-harmonious" = case.harmonious;
+        if (case.set_entry) {
+            config.palette.value[3] = .{ .r = 7, .g = 8, .b = 9 };
+            config.palette.mask.set(3);
+        }
+        config.@"cursor-color" = case.cursor;
+
+        var derived = try Termio.DerivedConfig.init(testing.allocator, &config);
+        defer derived.deinit();
+        const defaults = colorDefaults(&config);
+
+        try testing.expectEqual(derived.palette, defaults.palette);
+        try testing.expectEqual(derived.background.toTerminalRGB(), defaults.background);
+        try testing.expectEqual(derived.foreground.toTerminalRGB(), defaults.foreground);
+        const cursor: ?color.RGB = if (derived.cursor_color) |value| value.toTerminalRGB() else null;
+        try testing.expectEqual(cursor, defaults.cursor);
+    }
 }
