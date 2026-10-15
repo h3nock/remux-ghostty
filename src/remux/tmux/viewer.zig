@@ -1785,6 +1785,12 @@ pub const Viewer = struct {
                     size.CellCountInt,
                     data.scroll_region_lower,
                 ) orelse break :scroll;
+
+                // Ignore invalid regions. The terminal assumes the scroll
+                // region is always within the screen bounds.
+                if (scroll_top >= scroll_bottom or
+                    scroll_bottom >= t.rows) break :scroll;
+
                 t.scrolling_region.top = scroll_top;
                 t.scrolling_region.bottom = scroll_bottom;
             }
@@ -2590,12 +2596,15 @@ const TestPaneState = struct {
     pane_id: usize = 1,
     pane_current_command: []const u8 = "zsh",
     pane_current_path: []const u8 = "/Users/test/project",
+    cursor_y: usize = 0,
     alternate_on: bool = false,
     mouse_all: bool = false,
     mouse_button: bool = false,
     mouse_standard: bool = false,
     mouse_utf8: bool = false,
     mouse_sgr: bool = false,
+    scroll_region_upper: usize = 0,
+    scroll_region_lower: usize = 2,
 };
 
 fn testPaneState(
@@ -2604,16 +2613,19 @@ fn testPaneState(
 ) std.fmt.BufPrintError![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "%{d};10;3;0;0;1;block;;0;{d};4294967295;4294967295;" ++
-            "0;1;0;0;0;{d};{d};{d};{d};{d};0;0;0;0;2;;{s};{s}",
+        "%{d};10;3;0;{d};1;block;;0;{d};4294967295;4294967295;" ++
+            "0;1;0;0;0;{d};{d};{d};{d};{d};0;0;0;{d};{d};;{s};{s}",
         .{
             state.pane_id,
+            state.cursor_y,
             @intFromBool(state.alternate_on),
             @intFromBool(state.mouse_all),
             @intFromBool(state.mouse_button),
             @intFromBool(state.mouse_standard),
             @intFromBool(state.mouse_utf8),
             @intFromBool(state.mouse_sgr),
+            state.scroll_region_upper,
+            state.scroll_region_lower,
             state.pane_current_command,
             state.pane_current_path,
         },
@@ -2904,6 +2916,37 @@ test "pane hydration restores tmux mouse modes and effective flags" {
         try testing.expect(!terminal.modes.get(.mouse_format_urxvt));
         try testing.expect(!terminal.modes.get(.mouse_format_sgr_pixels));
     }
+}
+
+test "pane state ignores out of bounds scroll regions" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    const pane = try addTestPane(&viewer);
+    const terminal = &pane.terminal_owner.terminal;
+    var state_buffer: [256]u8 = undefined;
+
+    // An empty region, then one far past the screen. The rest of the line
+    // still applies.
+    for ([_][2]usize{ .{ 2, 1 }, .{ 0, 60000 } }) |region| {
+        _ = try viewer.receivedPaneState(null, try testPaneState(&state_buffer, .{
+            .cursor_y = 2,
+            .scroll_region_upper = region[0],
+            .scroll_region_lower = region[1],
+        }));
+        try testing.expectEqual(2, pane.cursor.?.y);
+        try testing.expectEqual(0, terminal.scrolling_region.top);
+        try testing.expectEqual(terminal.rows - 1, terminal.scrolling_region.bottom);
+    }
+
+    // Vertical tabs act as linefeeds and must scroll within the screen.
+    pane.phase = .live;
+    var vertical_tabs = [_]u8{0x0b} ** 30;
+    _ = viewer.next(.{ .tmux = .{ .output = .{
+        .pane_id = 1,
+        .data = &vertical_tabs,
+    } } });
+    try testing.expectEqual(terminal.rows - 1, terminal.screens.active.cursor.y);
 }
 
 test "pane refresh preserves parser-only mouse modes" {
