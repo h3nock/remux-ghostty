@@ -7,7 +7,7 @@ const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const rendererpkg = @import("../renderer.zig");
-const sizepkg = @import("size.zig");
+const sizepkg = @import("../renderer/size.zig");
 const terminal = @import("../terminal/main.zig");
 
 const log = std.log.scoped(.renderer_runtime);

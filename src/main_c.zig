@@ -49,10 +49,10 @@ comptime {
     _ = @import("remux/tmux/c.zig");
 
     // Generic terminal producer and shared terminal lifetime API.
-    _ = @import("terminal/TerminalProducerC.zig");
+    _ = @import("remux/TerminalProducerC.zig");
 
     // Renderer-only surface over an externally owned terminal.
-    _ = @import("renderer/TerminalSurfaceC.zig").CAPI;
+    _ = @import("remux/TerminalSurfaceC.zig").CAPI;
 
     // Force-reference our memset override so its export is emitted.
     // See quirks_memset.zig for details on why this exists.

@@ -9,8 +9,10 @@ const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const rendererpkg = @import("../renderer.zig");
-const renderer_link = @import("link.zig");
-const sizepkg = @import("size.zig");
+const Runtime = @import("Runtime.zig");
+const Shared = @import("Shared.zig");
+const renderer_link = @import("../renderer/link.zig");
+const sizepkg = @import("../renderer/size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_config = @import("../terminal/config.zig");
@@ -18,9 +20,9 @@ const terminal_config = @import("../terminal/config.zig");
 const log = std.log.scoped(.terminal_surface);
 
 alloc: std.mem.Allocator,
-runtime: rendererpkg.Runtime,
+runtime: Runtime,
 size: rendererpkg.Size,
-shared: *terminal.Shared,
+shared: *Shared,
 write_sink: ?WriteSink,
 macos_option_as_alt: input.OptionAsAlt,
 vt_kam_allowed: bool,
@@ -172,8 +174,8 @@ pub const Options = struct {
     alloc: std.mem.Allocator,
     config: *const configpkg.Config,
     rt_surface: *apprt.RendererSurface,
-    shared: *terminal.Shared,
-    prepared_layout: *rendererpkg.Runtime.PreparedLayout,
+    shared: *Shared,
+    prepared_layout: *Runtime.PreparedLayout,
     event_sink: rendererpkg.EventSink,
     write_sink: ?WriteSink = null,
     macos_option_as_alt: input.OptionAsAlt = .false,
@@ -183,7 +185,7 @@ pub const Options = struct {
 
 pub const UpdateConfigOptions = struct {
     config: *const configpkg.Config,
-    prepared_layout: *rendererpkg.Runtime.PreparedLayout,
+    prepared_layout: *Runtime.PreparedLayout,
     macos_option_as_alt: input.OptionAsAlt,
 };
 
@@ -1748,7 +1750,7 @@ fn queueAndWake(self: *TerminalSurface, message: rendererpkg.Message) !void {
 }
 
 const TestSink = struct {
-    shared: *terminal.Shared,
+    shared: *Shared,
     accept: bool = true,
     calls: usize = 0,
     lock_was_free: bool = false,
@@ -1774,7 +1776,7 @@ const TestSink = struct {
 
 fn testSurface(
     alloc: std.mem.Allocator,
-    shared: *terminal.Shared,
+    shared: *Shared,
     write_sink: ?WriteSink,
 ) TerminalSurface {
     var result: TerminalSurface = .{
@@ -1815,7 +1817,7 @@ fn testSurface(
     return result;
 }
 
-fn testFeed(shared: *terminal.Shared, bytes: []const u8) void {
+fn testFeed(shared: *Shared, bytes: []const u8) void {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     var stream = shared.terminal.vtStream();
@@ -1825,7 +1827,7 @@ fn testFeed(shared: *terminal.Shared, bytes: []const u8) void {
 
 test "terminal surface config derivation failure does not partially commit" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1844,7 +1846,7 @@ test "terminal surface config derivation failure does not partially commit" {
         .fail_index = 0,
     });
     var surface = testSurface(failing.allocator(), shared, null);
-    var prepared: rendererpkg.Runtime.PreparedLayout = undefined;
+    var prepared: Runtime.PreparedLayout = undefined;
     try testing.expectError(error.OutOfMemory, surface.updateConfig(.{
         .config = &config,
         .prepared_layout = &prepared,
@@ -1857,7 +1859,7 @@ test "terminal surface config derivation failure does not partially commit" {
     try testing.expectEqualDeep(before_palette, shared.terminal.colors.palette);
 }
 
-fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
+fn setTestSelectionAndViewport(shared: *Shared) !void {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     const screen = shared.terminal.screens.active;
@@ -1866,7 +1868,7 @@ fn setTestSelectionAndViewport(shared: *terminal.Shared) !void {
     shared.terminal.scrollViewport(.top);
 }
 
-fn testCompressionActivity(shared: *terminal.Shared) u64 {
+fn testCompressionActivity(shared: *Shared) u64 {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     return shared.terminal.compressionActivity();
@@ -1874,7 +1876,7 @@ fn testCompressionActivity(shared: *terminal.Shared) u64 {
 
 test "terminal surface key admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2003,7 +2005,7 @@ test "terminal surface key admission contract" {
 
 test "terminal surface committed text admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2150,7 +2152,7 @@ test "terminal surface committed text admission contract" {
 
 test "terminal surface paste admission contract" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2303,7 +2305,7 @@ test "terminal surface interaction state and position scrolling" {
         normalizeScrollPosition(0, usize_boundary, 10),
     );
 
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback_bytes = 100,
@@ -2383,7 +2385,7 @@ test "terminal surface interaction state and position scrolling" {
 
 test "terminal surface selection snapshot follows viewport and active screen" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback_bytes = 100,
@@ -2453,7 +2455,7 @@ test "terminal surface selection snapshot follows viewport and active screen" {
 
 test "terminal surface cursor geometry follows viewport and active screen" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback_bytes = 100,
@@ -2520,7 +2522,7 @@ test "terminal surface cursor geometry follows viewport and active screen" {
 
 test "terminal surface word selection is local and refreshes after reflow" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 20,
         .rows = 3,
     });
@@ -2578,7 +2580,7 @@ test "terminal surface word selection is local and refreshes after reflow" {
 
 test "terminal surface link selection preserves no-match and target ownership" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 8,
         .rows = 3,
     });
@@ -2629,7 +2631,7 @@ test "terminal surface link selection preserves no-match and target ownership" {
 
 test "terminal surface selects scheme-less loopback host:port spans" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 26,
         .rows = 3,
     });
@@ -2664,7 +2666,7 @@ test "terminal surface selects scheme-less loopback host:port spans" {
 
 test "terminal surface OSC 8 link selection takes precedence over configured links" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 5,
         .rows = 3,
     });
@@ -2728,7 +2730,7 @@ test "terminal surface OSC 8 link selection takes precedence over configured lin
 
 test "terminal surface selection endpoints preserve roles and allocation" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2807,7 +2809,7 @@ test "terminal surface selection endpoints preserve roles and allocation" {
 
 test "terminal surface local pointer selection pressure and text ownership" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2917,7 +2919,7 @@ test "terminal surface local pointer selection pressure and text ownership" {
 
 test "terminal surface remote mouse admission and rejection state" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
@@ -3020,7 +3022,7 @@ test "terminal surface remote mouse admission and rejection state" {
 
 test "terminal surface scroll routing concatenation and remainders" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback_bytes = 100,
@@ -3138,7 +3140,7 @@ test "terminal surface scroll routing concatenation and remainders" {
 
 test "terminal surface pointer and pressure validation" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.io, testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
         .rows = 3,
     });
