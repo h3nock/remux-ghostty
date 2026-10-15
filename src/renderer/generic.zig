@@ -3848,10 +3848,10 @@ test "scrollbar delivery remains dirty until accepted" {
         .redraw = Context.redraw,
     };
     var context: Context = .{};
-    const sink: renderer.EventSink = .{
+    const sink: renderer.EventSink = .{ .callbacks = .{
         .ptr = &context,
         .vtable = &vtable,
-    };
+    } };
     var dirty = true;
 
     emitScrollbar(sink, .zero, &dirty);

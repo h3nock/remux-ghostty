@@ -6,7 +6,6 @@ const global = @import("../global.zig");
 const builtin = @import("builtin");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
-const crash = @import("../crash/main.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -178,7 +177,6 @@ pub const Options = struct {
     event_sink: rendererpkg.EventSink,
     write_sink: ?WriteSink = null,
     macos_option_as_alt: input.OptionAsAlt = .false,
-    crash_context: ?crash.sentry.ThreadState,
     visible: bool = true,
     focused: bool = true,
 };
@@ -241,7 +239,6 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .prepared_layout = opts.prepared_layout,
         .size = &self.size,
         .event_sink = opts.event_sink,
-        .crash_context = opts.crash_context,
         .visible = opts.visible,
         .focused = opts.focused,
     });

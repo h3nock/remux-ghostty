@@ -5,7 +5,6 @@ const std = @import("std");
 const global = @import("../global.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
-const crash = @import("../crash/main.zig");
 const font = @import("../font/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const sizepkg = @import("size.zig");
@@ -30,7 +29,6 @@ pub const Options = struct {
     prepared_layout: *PreparedLayout,
     size: *rendererpkg.Size,
     event_sink: rendererpkg.EventSink,
-    crash_context: ?crash.sentry.ThreadState,
     visible: bool = true,
     focused: bool = true,
 };
@@ -112,6 +110,7 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
             .size = opts.size.*,
             .event_sink = opts.event_sink,
             .rt_surface = opts.rt_surface,
+            .thread = &self.thread,
         });
     };
     errdefer self.renderer.deinit();
@@ -126,13 +125,10 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
         opts.rt_surface,
         &self.renderer,
         &self.state,
-        opts.crash_context,
-        .{
-            .visible = opts.visible,
-            .focused = opts.focused,
-        },
     );
     errdefer self.thread.deinit();
+    self.thread.flags.visible = opts.visible;
+    self.thread.flags.focused = opts.focused;
 
     self.font_grid_set = prepared.font_grid_set;
     self.font_grid_key = prepared.font_grid_key;
