@@ -98,6 +98,10 @@ flags: packed struct {
     /// This is true when the view is focused. This defaults to true
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
+
+    /// This is true when a frame was requested since the last render. A
+    /// requested frame is rendered and drawn even while the view is hidden.
+    frame_requested: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -295,7 +299,7 @@ fn setQosClass(self: *const Thread) void {
 }
 
 /// Drain the mailbox.
-fn drainMailbox(self: *Thread, frame_requested: *bool) !void {
+fn drainMailbox(self: *Thread) !void {
     // There's probably a more elegant way to do this...
     //
     // This is effectively an @autoreleasepool{} block, which we need in
@@ -339,7 +343,7 @@ fn drainMailbox(self: *Thread, frame_requested: *bool) !void {
                 // check the visible state themselves to control their behavior.
             },
 
-            .request_frame => frame_requested.* = true,
+            .request_frame => self.flags.frame_requested = true,
 
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
@@ -469,8 +473,9 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
-fn drawFrame(self: *Thread, now: bool, allow_hidden: bool) void {
-    if (!self.flags.visible and !allow_hidden) return;
+fn drawFrame(self: *Thread, now: bool) void {
+    // If we're invisible, we do not draw.
+    if (!self.flags.visible) return;
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
@@ -478,20 +483,6 @@ fn drawFrame(self: *Thread, now: bool, allow_hidden: bool) void {
 
     self.renderer.drawFrame(false) catch |err|
         log.warn("error drawing err={}", .{err});
-}
-
-/// Rebuild terminal-derived renderer state and publish it through the normal
-/// draw path. Explicit requests may do this while presentation is hidden.
-fn renderFrame(self: *Thread, allow_hidden: bool) void {
-    if (!self.flags.visible and !allow_hidden) return;
-
-    self.renderer.updateFrame(
-        self.state,
-        self.flags.cursor_blink_visible,
-    ) catch |err|
-        log.warn("error rendering err={}", .{err});
-
-    self.drawFrame(allow_hidden, allow_hidden);
 }
 
 fn wakeupCallback(
@@ -509,8 +500,7 @@ fn wakeupCallback(
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
-    var frame_requested = false;
-    t.drainMailbox(&frame_requested) catch |err| {
+    t.drainMailbox() catch |err| {
         log.err("error draining mailbox err={}", .{err});
 
         // Async notifications may be coalesced, so ensure messages after the
@@ -519,8 +509,8 @@ fn wakeupCallback(
             log.err("error rescheduling mailbox drain err={}", .{notify_err});
     };
 
-    t.renderFrame(frame_requested);
-    if (t.flags.visible) t.armAnimationTimer();
+    // Render immediately
+    _ = renderCallback(t, undefined, undefined, {});
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -559,7 +549,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
-    t.drawFrame(true, false);
+    t.drawFrame(true);
 
     return .rearm;
 }
@@ -594,11 +584,29 @@ fn renderCallback(
         return .disarm;
     }
 
-    if (!t.flags.visible) return .disarm;
-    t.renderFrame(false);
+    // If we're not visible there's no point spending CPU rebuilding cells —
+    // we'll catch up when the .visible mailbox message flips us back on.
+    // Kitty graphics animations pause with us and resume on visibility.
+    // A requested frame is still rendered and drawn once.
+    const requested = t.flags.frame_requested;
+    t.flags.frame_requested = false;
+    if (!t.flags.visible and !requested) return .disarm;
+
+    // Update our frame data
+    t.renderer.updateFrame(
+        t.state,
+        t.flags.cursor_blink_visible,
+    ) catch |err|
+        log.warn("error rendering err={}", .{err});
+
+    // Draw. A requested frame draws now, even while hidden.
+    if (requested) {
+        t.renderer.drawFrame(false) catch |err|
+            log.warn("error drawing err={}", .{err});
+    } else t.drawFrame(false);
 
     // Schedule the next animation wake, if the renderer needs one.
-    t.armAnimationTimer();
+    if (t.flags.visible) t.armAnimationTimer();
 
     return .disarm;
 }
@@ -662,7 +670,7 @@ fn animationTimerCallback(
         // Draw calls don't update from the terminal state so they
         // are much cheaper than a frame update.
         .draw => {
-            t.drawFrame(false, false);
+            t.drawFrame(false);
             t.armAnimationTimer();
             return .disarm;
         },
