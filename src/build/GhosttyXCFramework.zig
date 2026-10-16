@@ -25,8 +25,9 @@ pub fn init(
     ));
 
     // iOS
-    const ios = try GhosttyLib.initStatic(b, &try deps.retarget(
+    const ios = try GhosttyLib.initStatic(b, &try iosDeps(
         b,
+        deps,
         b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
             .os_tag = .ios,
@@ -36,8 +37,9 @@ pub fn init(
     ));
 
     // iOS Simulator
-    const ios_sim = try GhosttyLib.initStatic(b, &try deps.retarget(
+    const ios_sim = try GhosttyLib.initStatic(b, &try iosDeps(
         b,
+        deps,
         b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
             .os_tag = .ios,
@@ -99,6 +101,26 @@ pub fn init(
         .xcframework = xcframework,
         .target = target,
     };
+}
+
+/// Retarget our dependencies for an iOS slice, built without Sentry. Its iOS
+/// crash handler neither restores the previous handlers nor exits after
+/// writing its dump, so a crash would leave the app hanging. `retarget`
+/// keeps the host's choice for every slice, so the config is copied here the
+/// way `SharedDeps.changeEntrypoint` copies it.
+fn iosDeps(
+    b: *std.Build,
+    deps: *const SharedDeps,
+    target: std.Build.ResolvedTarget,
+) !SharedDeps {
+    var result = try deps.retarget(b, target);
+    const config = try b.allocator.create(Config);
+    config.* = result.config.*;
+    config.sentry = false;
+    result.config = config;
+    result.options = b.addOptions();
+    try config.addOptions(result.options);
+    return result;
 }
 
 pub fn install(self: *const GhosttyXCFramework) void {
