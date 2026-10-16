@@ -11,7 +11,7 @@ const input = @import("../input.zig");
 const rendererpkg = @import("../renderer.zig");
 const Runtime = @import("Runtime.zig");
 const Shared = @import("Shared.zig");
-const renderer_link = @import("../renderer/link.zig");
+const terminal_link = @import("link.zig");
 const sizepkg = @import("../renderer/size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
@@ -72,7 +72,7 @@ const InteractionConfig = struct {
     word_chars: []const u21,
     click_repeat_interval: u64,
     scroll_multiplier: configpkg.Config.MouseScrollMultiplier,
-    links: renderer_link.Set,
+    links: terminal_link.Set,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -99,7 +99,7 @@ const InteractionConfig = struct {
             .word_chars = word_chars,
             .click_repeat_interval = @as(u64, config.@"click-repeat-interval") * 1_000_000,
             .scroll_multiplier = config.@"mouse-scroll-multiplier",
-            .links = try renderer_link.Set.fromConfig(
+            .links = try terminal_link.Set.fromConfig(
                 alloc,
                 link_items.items,
             ),
@@ -454,7 +454,7 @@ pub fn selectLink(
         const screen = self.shared.terminal.screens.active;
         var selection: terminal.Selection = undefined;
         var target: ?[:0]const u8 = null;
-        if (screen.selectHyperlink(pin)) |hyperlink| {
+        if (terminal_link.selectHyperlink(pin)) |hyperlink| {
             selection = hyperlink.selection;
             target = self.alloc.dupeZ(u8, hyperlink.uri) catch |err| {
                 out.* = self.selectionSnapshotLocked();
@@ -2588,7 +2588,7 @@ test "terminal surface link selection preserves no-match and target ownership" {
     var surface = testSurface(testing.allocator, shared, null);
     surface.size.screen.width = 80;
 
-    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+    var links = try terminal_link.Set.fromConfig(testing.allocator, &.{.{
         .regex = "https://[^ ]+",
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = .{ .ctrl = true } },
@@ -2639,7 +2639,7 @@ test "terminal surface selects scheme-less loopback host:port spans" {
     var surface = testSurface(testing.allocator, shared, null);
     surface.size.screen.width = 260;
 
-    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+    var links = try terminal_link.Set.fromConfig(testing.allocator, &.{.{
         .regex = loopback_host_port_regex,
         .action = .{ .open = {} },
         .highlight = .{ .always = {} },
@@ -2674,7 +2674,7 @@ test "terminal surface OSC 8 link selection takes precedence over configured lin
     var surface = testSurface(testing.allocator, shared, null);
     surface.size.screen.width = 50;
 
-    var links = try renderer_link.Set.fromConfig(testing.allocator, &.{.{
+    var links = try terminal_link.Set.fromConfig(testing.allocator, &.{.{
         .regex = "https://[^ ]+",
         .action = .{ .open = {} },
         .highlight = .{ .always = {} },
