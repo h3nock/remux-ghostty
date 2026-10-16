@@ -15,6 +15,55 @@ const terminal = @import("../terminal/main.zig");
 
 const log = std.log.scoped(.terminal_surface_c);
 
+/// The Zig counterpart of ghostty_input_key_s for terminal surfaces. The action
+/// arrives as a plain integer so that an out-of-range value is rejected rather
+/// than becoming an invalid enum.
+const KeyEventC = extern struct {
+    action: c_int,
+    mods: c_int,
+    consumed_mods: c_int,
+    keycode: u32,
+    text: ?[*:0]const u8,
+    unshifted_codepoint: u32,
+    composing: bool,
+
+    /// Convert to a validated Zig key event.
+    fn core(self: KeyEventC) ?input.KeyEvent {
+        const action = std.enums.fromInt(
+            input.Action,
+            self.action,
+        ) orelse return null;
+        const text: []const u8 = if (self.text) |ptr|
+            std.mem.sliceTo(ptr, 0)
+        else
+            "";
+        const unshifted_codepoint = std.math.cast(
+            u21,
+            self.unshifted_codepoint,
+        ) orelse 0;
+
+        const physical_key = keycode: for (input.keycodes.entries) |entry| {
+            if (entry.native == self.keycode) break :keycode entry.key;
+        } else .unidentified;
+
+        return .{
+            .action = action,
+            .key = physical_key,
+            .mods = @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(self.mods))),
+            )),
+            .consumed_mods = @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+            )),
+            .composing = self.composing,
+            .utf8 = text,
+            .unshifted_codepoint = unshifted_codepoint,
+        };
+    }
+};
+
 pub const Result = enum(c_int) {
     ok,
     invalid_input,
@@ -662,7 +711,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
 
     export fn ghostty_terminal_surface_key(
         surface: ?*Surface,
-        event: apprt.embedded.KeyEventC,
+        event: KeyEventC,
     ) InputResult {
         const value = surface orelse return .invalid_input;
         const core_event = event.core() orelse return .invalid_input;
@@ -877,7 +926,7 @@ test "terminal surface C ABI matches ghostty header" {
         c.ghostty_terminal_surface_selection_snapshot_s,
     );
     try expectStructLayout(Text, c.ghostty_text_s);
-    try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
+    try expectStructLayout(KeyEventC, c.ghostty_input_key_s);
     try testing.expectEqual(
         @as(c_int, @intFromEnum(ScrollRoute.viewport)),
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_VIEWPORT),
@@ -1272,7 +1321,7 @@ test "terminal surface C input validation and key mapping" {
     const bytes = "a\x00b";
     try testing.expectEqualSlices(u8, bytes, inputSlice(bytes.ptr, bytes.len).?);
 
-    const valid: apprt.embedded.KeyEventC = .{
+    const valid: KeyEventC = .{
         .action = @intFromEnum(input.Action.press),
         .mods = 0,
         .consumed_mods = 0,
@@ -1309,4 +1358,102 @@ test "terminal surface C input validation and key mapping" {
     try testing.expect(scrollMods(0x10) == null);
     try testing.expect(scrollMods(0x0e) == null);
     try testing.expect(scrollMods(0x0d) != null);
+}
+
+test "terminal surface C key conversion matches upstream's" {
+    // KeyEventC.core copies the C key conversion that apprt/embedded.zig
+    // keeps private (CAPI.KeyEvent.keyEvent, then App.KeyEvent.core), except
+    // that it rejects an out-of-range action. If the source check fails,
+    // upstream's conversion changed: update KeyEventC.core to match, then
+    // copy upstream's new text here.
+    const testing = std.testing;
+    const upstream = @embedFile("../apprt/embedded.zig");
+    const capi_key_event =
+        \\        fn keyEvent(self: KeyEvent) App.KeyEvent {
+        \\            return .{
+        \\                .action = self.action,
+        \\                .mods = @bitCast(@as(
+        \\                    input.Mods.Backing,
+        \\                    @truncate(@as(c_uint, @bitCast(self.mods))),
+        \\                )),
+        \\                .consumed_mods = @bitCast(@as(
+        \\                    input.Mods.Backing,
+        \\                    @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+        \\                )),
+        \\                .keycode = self.keycode,
+        \\                .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
+        \\                .unshifted_codepoint = self.unshifted_codepoint,
+        \\                .composing = self.composing,
+        \\            };
+        \\        }
+    ;
+    const key_event_core =
+        \\        fn core(self: KeyEvent) ?input.KeyEvent {
+        \\            const text: []const u8 = if (self.text) |v| v else "";
+        \\            const unshifted_codepoint: u21 = std.math.cast(
+        \\                u21,
+        \\                self.unshifted_codepoint,
+        \\            ) orelse 0;
+        \\
+        \\            // We want to get the physical unmapped key to process keybinds.
+        \\            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+        \\                if (entry.native == self.keycode) break :keycode entry.key;
+        \\            } else .unidentified;
+        \\
+        \\            // Build our final key event
+        \\            return .{
+        \\                .action = self.action,
+        \\                .key = physical_key,
+        \\                .mods = self.mods,
+        \\                .consumed_mods = self.consumed_mods,
+        \\                .composing = self.composing,
+        \\                .utf8 = text,
+        \\                .unshifted_codepoint = unshifted_codepoint,
+        \\            };
+        \\        }
+    ;
+    try testing.expect(std.mem.indexOf(u8, upstream, capi_key_event) != null);
+    try testing.expect(std.mem.indexOf(u8, upstream, key_event_core) != null);
+
+    // The copy must produce what that conversion produces.
+    const key_a = for (input.keycodes.entries) |entry| {
+        if (entry.key == .key_a) break entry;
+    } else unreachable;
+    const mods: input.Mods = .{ .shift = true, .alt = true };
+    const consumed: input.Mods = .{ .shift = true };
+    const event = (KeyEventC{
+        .action = @intFromEnum(input.Action.repeat),
+        .mods = @as(input.Mods.Backing, @bitCast(mods)),
+        .consumed_mods = @as(input.Mods.Backing, @bitCast(consumed)),
+        .keycode = key_a.native,
+        .text = "A",
+        .unshifted_codepoint = 'a',
+        .composing = true,
+    }).core().?;
+    try testing.expectEqual(input.Action.repeat, event.action);
+    try testing.expectEqual(input.Key.key_a, event.key);
+    try testing.expectEqual(mods, event.mods);
+    try testing.expectEqual(consumed, event.consumed_mods);
+    try testing.expectEqualStrings("A", event.utf8);
+    try testing.expectEqual(@as(u21, 'a'), event.unshifted_codepoint);
+    try testing.expect(event.composing);
+
+    // Every field differs from the event above, so a copy that returns a
+    // constant for any field fails one of the two.
+    const fallback = (KeyEventC{
+        .action = @intFromEnum(input.Action.release),
+        .mods = 0,
+        .consumed_mods = 0,
+        .keycode = std.math.maxInt(u32),
+        .text = null,
+        .unshifted_codepoint = std.math.maxInt(u32),
+        .composing = false,
+    }).core().?;
+    try testing.expectEqual(input.Action.release, fallback.action);
+    try testing.expectEqual(input.Key.unidentified, fallback.key);
+    try testing.expectEqual(input.Mods{}, fallback.mods);
+    try testing.expectEqual(input.Mods{}, fallback.consumed_mods);
+    try testing.expectEqualStrings("", fallback.utf8);
+    try testing.expectEqual(@as(u21, 0), fallback.unshifted_codepoint);
+    try testing.expect(!fallback.composing);
 }
