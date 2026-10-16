@@ -15,6 +15,55 @@ const terminal = @import("../terminal/main.zig");
 
 const log = std.log.scoped(.terminal_surface_c);
 
+/// The Zig counterpart of ghostty_input_key_s for terminal surfaces. The action
+/// arrives as a plain integer so that an out-of-range value is rejected rather
+/// than becoming an invalid enum.
+const KeyEventC = extern struct {
+    action: c_int,
+    mods: c_int,
+    consumed_mods: c_int,
+    keycode: u32,
+    text: ?[*:0]const u8,
+    unshifted_codepoint: u32,
+    composing: bool,
+
+    /// Convert to a validated Zig key event.
+    fn core(self: KeyEventC) ?input.KeyEvent {
+        const action = std.enums.fromInt(
+            input.Action,
+            self.action,
+        ) orelse return null;
+        const text: []const u8 = if (self.text) |ptr|
+            std.mem.sliceTo(ptr, 0)
+        else
+            "";
+        const unshifted_codepoint = std.math.cast(
+            u21,
+            self.unshifted_codepoint,
+        ) orelse 0;
+
+        const physical_key = keycode: for (input.keycodes.entries) |entry| {
+            if (entry.native == self.keycode) break :keycode entry.key;
+        } else .unidentified;
+
+        return .{
+            .action = action,
+            .key = physical_key,
+            .mods = @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(self.mods))),
+            )),
+            .consumed_mods = @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+            )),
+            .composing = self.composing,
+            .utf8 = text,
+            .unshifted_codepoint = unshifted_codepoint,
+        };
+    }
+};
+
 pub const Result = enum(c_int) {
     ok,
     invalid_input,
@@ -662,7 +711,7 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
 
     export fn ghostty_terminal_surface_key(
         surface: ?*Surface,
-        event: apprt.embedded.KeyEventC,
+        event: KeyEventC,
     ) InputResult {
         const value = surface orelse return .invalid_input;
         const core_event = event.core() orelse return .invalid_input;
@@ -877,7 +926,7 @@ test "terminal surface C ABI matches ghostty header" {
         c.ghostty_terminal_surface_selection_snapshot_s,
     );
     try expectStructLayout(Text, c.ghostty_text_s);
-    try expectStructLayout(apprt.embedded.KeyEventC, c.ghostty_input_key_s);
+    try expectStructLayout(KeyEventC, c.ghostty_input_key_s);
     try testing.expectEqual(
         @as(c_int, @intFromEnum(ScrollRoute.viewport)),
         @as(c_int, c.GHOSTTY_TERMINAL_SURFACE_SCROLL_ROUTE_VIEWPORT),
@@ -1272,7 +1321,7 @@ test "terminal surface C input validation and key mapping" {
     const bytes = "a\x00b";
     try testing.expectEqualSlices(u8, bytes, inputSlice(bytes.ptr, bytes.len).?);
 
-    const valid: apprt.embedded.KeyEventC = .{
+    const valid: KeyEventC = .{
         .action = @intFromEnum(input.Action.press),
         .mods = 0,
         .consumed_mods = 0,

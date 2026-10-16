@@ -99,6 +99,43 @@ pub const App = struct {
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
     };
 
+    /// This is the key event sent for ghostty_surface_key and
+    /// ghostty_app_key.
+    pub const KeyEvent = struct {
+        action: input.Action,
+        mods: input.Mods,
+        consumed_mods: input.Mods,
+        keycode: u32,
+        text: ?[:0]const u8,
+        unshifted_codepoint: u32,
+        composing: bool,
+
+        /// Convert a libghostty key event into a core key event.
+        fn core(self: KeyEvent) ?input.KeyEvent {
+            const text: []const u8 = if (self.text) |v| v else "";
+            const unshifted_codepoint: u21 = std.math.cast(
+                u21,
+                self.unshifted_codepoint,
+            ) orelse 0;
+
+            // We want to get the physical unmapped key to process keybinds.
+            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+                if (entry.native == self.keycode) break :keycode entry.key;
+            } else .unidentified;
+
+            // Build our final key event
+            return .{
+                .action = self.action,
+                .key = physical_key,
+                .mods = self.mods,
+                .consumed_mods = self.consumed_mods,
+                .composing = self.composing,
+                .utf8 = text,
+                .unshifted_codepoint = unshifted_codepoint,
+            };
+        }
+    };
+
     core_app: *CoreApp,
     opts: Options,
 
@@ -165,8 +202,12 @@ pub const App = struct {
     pub fn keyEvent(
         self: *App,
         target: KeyTarget,
-        input_event: input.KeyEvent,
+        event: KeyEvent,
     ) !bool {
+        // Convert our C key event into a Zig one.
+        const input_event: input.KeyEvent = event.core() orelse
+            return false;
+
         // Invoke the core Ghostty logic to handle this input.
         const effect: CoreSurface.InputEffect = switch (target) {
             .app => if (self.core_app.keyEvent(
@@ -1446,58 +1487,37 @@ pub const Inspector = struct {
     }
 };
 
-/// C ABI key event shared by the process and terminal-backed surface APIs.
-/// This is the Zig counterpart of ghostty_input_key_s and the single mapping
-/// from that public representation to input.KeyEvent.
-pub const KeyEventC = extern struct {
-    action: c_int,
-    mods: c_int,
-    consumed_mods: c_int,
-    keycode: u32,
-    text: ?[*:0]const u8,
-    unshifted_codepoint: u32,
-    composing: bool,
-
-    /// Convert to a validated Zig key event.
-    pub fn core(self: KeyEventC) ?input.KeyEvent {
-        const action = std.enums.fromInt(
-            input.Action,
-            self.action,
-        ) orelse return null;
-        const text: []const u8 = if (self.text) |ptr|
-            std.mem.sliceTo(ptr, 0)
-        else
-            "";
-        const unshifted_codepoint = std.math.cast(
-            u21,
-            self.unshifted_codepoint,
-        ) orelse 0;
-
-        const physical_key = keycode: for (input.keycodes.entries) |entry| {
-            if (entry.native == self.keycode) break :keycode entry.key;
-        } else .unidentified;
-
-        return .{
-            .action = action,
-            .key = physical_key,
-            .mods = @bitCast(@as(
-                input.Mods.Backing,
-                @truncate(@as(c_uint, @bitCast(self.mods))),
-            )),
-            .consumed_mods = @bitCast(@as(
-                input.Mods.Backing,
-                @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
-            )),
-            .composing = self.composing,
-            .utf8 = text,
-            .unshifted_codepoint = unshifted_codepoint,
-        };
-    }
-};
-
 // C API
 pub const CAPI = struct {
-    const KeyEvent = KeyEventC;
+    /// This is the same as Surface.KeyEvent but this is the raw C API version.
+    const KeyEvent = extern struct {
+        action: input.Action,
+        mods: c_int,
+        consumed_mods: c_int,
+        keycode: u32,
+        text: ?[*:0]const u8,
+        unshifted_codepoint: u32,
+        composing: bool,
+
+        /// Convert to Zig key event.
+        fn keyEvent(self: KeyEvent) App.KeyEvent {
+            return .{
+                .action = self.action,
+                .mods = @bitCast(@as(
+                    input.Mods.Backing,
+                    @truncate(@as(c_uint, @bitCast(self.mods))),
+                )),
+                .consumed_mods = @bitCast(@as(
+                    input.Mods.Backing,
+                    @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+                )),
+                .keycode = self.keycode,
+                .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
+                .unshifted_codepoint = self.unshifted_codepoint,
+                .composing = self.composing,
+            };
+        }
+    };
 
     const SurfaceSize = extern struct {
         columns: u16,
@@ -1721,8 +1741,7 @@ pub const CAPI = struct {
         app: *App,
         event: KeyEvent,
     ) bool {
-        const core_event = event.core() orelse return false;
-        return app.keyEvent(.app, core_event) catch |err| {
+        return app.keyEvent(.app, event.keyEvent()) catch |err| {
             log.warn("error processing key event err={}", .{err});
             return false;
         };
@@ -1736,7 +1755,7 @@ pub const CAPI = struct {
         config: *Config,
         event: KeyEvent,
     ) bool {
-        const core_event = event.core() orelse {
+        const core_event = event.keyEvent().core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };
@@ -2034,10 +2053,9 @@ pub const CAPI = struct {
         surface: *Surface,
         event: KeyEvent,
     ) bool {
-        const core_event = event.core() orelse return false;
         return surface.app.keyEvent(
             .{ .surface = surface },
-            core_event,
+            event.keyEvent(),
         ) catch |err| {
             log.warn("error processing key event err={}", .{err});
             return false;
@@ -2053,7 +2071,7 @@ pub const CAPI = struct {
         event: KeyEvent,
         c_flags: ?*input.Binding.Flags.C,
     ) bool {
-        const core_event = event.core() orelse {
+        const core_event = event.keyEvent().core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };
