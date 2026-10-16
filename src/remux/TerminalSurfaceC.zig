@@ -1359,3 +1359,101 @@ test "terminal surface C input validation and key mapping" {
     try testing.expect(scrollMods(0x0e) == null);
     try testing.expect(scrollMods(0x0d) != null);
 }
+
+test "terminal surface C key conversion matches upstream's" {
+    // KeyEventC.core copies the C key conversion that apprt/embedded.zig
+    // keeps private (CAPI.KeyEvent.keyEvent, then App.KeyEvent.core), except
+    // that it rejects an out-of-range action. If the source check fails,
+    // upstream's conversion changed: update KeyEventC.core to match, then
+    // copy upstream's new text here.
+    const testing = std.testing;
+    const upstream = @embedFile("../apprt/embedded.zig");
+    const capi_key_event =
+        \\        fn keyEvent(self: KeyEvent) App.KeyEvent {
+        \\            return .{
+        \\                .action = self.action,
+        \\                .mods = @bitCast(@as(
+        \\                    input.Mods.Backing,
+        \\                    @truncate(@as(c_uint, @bitCast(self.mods))),
+        \\                )),
+        \\                .consumed_mods = @bitCast(@as(
+        \\                    input.Mods.Backing,
+        \\                    @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+        \\                )),
+        \\                .keycode = self.keycode,
+        \\                .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
+        \\                .unshifted_codepoint = self.unshifted_codepoint,
+        \\                .composing = self.composing,
+        \\            };
+        \\        }
+    ;
+    const key_event_core =
+        \\        fn core(self: KeyEvent) ?input.KeyEvent {
+        \\            const text: []const u8 = if (self.text) |v| v else "";
+        \\            const unshifted_codepoint: u21 = std.math.cast(
+        \\                u21,
+        \\                self.unshifted_codepoint,
+        \\            ) orelse 0;
+        \\
+        \\            // We want to get the physical unmapped key to process keybinds.
+        \\            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+        \\                if (entry.native == self.keycode) break :keycode entry.key;
+        \\            } else .unidentified;
+        \\
+        \\            // Build our final key event
+        \\            return .{
+        \\                .action = self.action,
+        \\                .key = physical_key,
+        \\                .mods = self.mods,
+        \\                .consumed_mods = self.consumed_mods,
+        \\                .composing = self.composing,
+        \\                .utf8 = text,
+        \\                .unshifted_codepoint = unshifted_codepoint,
+        \\            };
+        \\        }
+    ;
+    try testing.expect(std.mem.indexOf(u8, upstream, capi_key_event) != null);
+    try testing.expect(std.mem.indexOf(u8, upstream, key_event_core) != null);
+
+    // The copy must produce what that conversion produces.
+    const key_a = for (input.keycodes.entries) |entry| {
+        if (entry.key == .key_a) break entry;
+    } else unreachable;
+    const mods: input.Mods = .{ .shift = true, .alt = true };
+    const consumed: input.Mods = .{ .shift = true };
+    const event = (KeyEventC{
+        .action = @intFromEnum(input.Action.repeat),
+        .mods = @as(input.Mods.Backing, @bitCast(mods)),
+        .consumed_mods = @as(input.Mods.Backing, @bitCast(consumed)),
+        .keycode = key_a.native,
+        .text = "A",
+        .unshifted_codepoint = 'a',
+        .composing = true,
+    }).core().?;
+    try testing.expectEqual(input.Action.repeat, event.action);
+    try testing.expectEqual(input.Key.key_a, event.key);
+    try testing.expectEqual(mods, event.mods);
+    try testing.expectEqual(consumed, event.consumed_mods);
+    try testing.expectEqualStrings("A", event.utf8);
+    try testing.expectEqual(@as(u21, 'a'), event.unshifted_codepoint);
+    try testing.expect(event.composing);
+
+    // Every field differs from the event above, so a copy that returns a
+    // constant for any field fails one of the two.
+    const fallback = (KeyEventC{
+        .action = @intFromEnum(input.Action.release),
+        .mods = 0,
+        .consumed_mods = 0,
+        .keycode = std.math.maxInt(u32),
+        .text = null,
+        .unshifted_codepoint = std.math.maxInt(u32),
+        .composing = false,
+    }).core().?;
+    try testing.expectEqual(input.Action.release, fallback.action);
+    try testing.expectEqual(input.Key.unidentified, fallback.key);
+    try testing.expectEqual(input.Mods{}, fallback.mods);
+    try testing.expectEqual(input.Mods{}, fallback.consumed_mods);
+    try testing.expectEqualStrings("", fallback.utf8);
+    try testing.expectEqual(@as(u21, 0), fallback.unshifted_codepoint);
+    try testing.expect(!fallback.composing);
+}
