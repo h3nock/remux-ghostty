@@ -156,7 +156,13 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 }
 
 pub fn deinit(self: *Metal) void {
-    self.layer.deactivate();
+    // On iOS we added our layer as a sublayer of the view's layer in init,
+    // and the view keeps it after we release our reference. Remove it so a
+    // view that outlives this renderer doesn't keep our last frame.
+    if (comptime builtin.os.tag == .ios) {
+        self.layer.layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+    }
+
     self.queue.release();
     self.device.release();
     self.layer.release();
