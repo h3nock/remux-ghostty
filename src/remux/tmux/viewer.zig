@@ -16,6 +16,7 @@ const RGB = @import("../../terminal/color.zig").RGB;
 const Layout = @import("../../terminal/tmux/layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
+const resize = @import("resize.zig");
 
 const log = std.log.scoped(.terminal_tmux_viewer);
 
@@ -213,6 +214,12 @@ pub const Viewer = struct {
     /// Incomplete UTF-8 prefixes received before their pane is discovered.
     untracked_utf8: std.AutoArrayHashMapUnmanaged(usize, Utf8Carry),
 
+    /// The client resize waiting for its reply, and the newest size asked
+    /// for since. One resize at a time keeps each reply bracketing exactly
+    /// one tmux resize.
+    resize_inflight: ?ResizeInflight = null,
+    resize_pending: ?ClientSize = null,
+
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
     action_arena: ArenaAllocator.State,
@@ -224,6 +231,27 @@ pub const Viewer = struct {
 
     pub const CommandQueue = CircBuf(QueuedCommand, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
+
+    const ResizeInflight = struct {
+        /// Owns `before`.
+        arena: ArenaAllocator,
+        before: []const resize.Sample = &.{},
+
+        /// Panes whose output arrived while the resize was in flight. tmux
+        /// sends each pane's output in order and holds a reply only behind
+        /// output queued before it, so one pane's later output can pass the
+        /// reply only while another pane's earlier output is still queued.
+        /// That output also arrives before the reply. With output from at
+        /// most one pane, nothing was reordered around the resize.
+        output_panes: std.AutoArrayHashMapUnmanaged(usize, void) = .empty,
+
+        failed: bool = false,
+
+        fn deinit(self: *ResizeInflight, alloc: Allocator) void {
+            self.output_panes.deinit(alloc);
+            self.arena.deinit();
+        }
+    };
 
     pub const ClientSize = struct {
         columns: size.CellCountInt,
@@ -371,8 +399,52 @@ pub const Viewer = struct {
         saved_primary_cursor: ?CursorPosition = null,
         utf8_carry: Utf8Carry = .{},
 
+        /// Output that arrived after tmux paused this pane for a recapture.
+        /// It postdates the snapshot and is applied after it.
+        replay: std.ArrayList(u8) = .empty,
+
+        /// Whether output while `.refreshing` is kept for replay (a paused
+        /// recapture) or already covered by the snapshot (tmux 3.1, which
+        /// can't pause a pane).
+        replay_output: bool = false,
+
+        /// The replies of a recapture. The pane stays shown while it's
+        /// recaptured, so they're applied together when the last arrives.
+        snapshot: Snapshot = .{},
+
+        /// `Terminal.region_rows_scrolled_out` when the mirror last matched
+        /// tmux. A later scroll of a region below the top row put rows into
+        /// tmux's history but not the mirror's, so rows pulled back by a
+        /// resize would differ.
+        region_rows_baseline: u64 = 0,
+
+        /// The pane's window isn't shown and the mirror no longer matches
+        /// tmux. It's recaptured when its window becomes active.
+        stale: bool = false,
+
+        /// Resized while the alternate screen was active. tmux keeps the
+        /// normal screen at its old size until the program leaves the
+        /// alternate screen, so the pane is recaptured then.
+        primary_stale: bool = false,
+
+        /// Rows of tmux's normal screen in the last snapshot taken while the
+        /// alternate screen was active: the height tmux keeps it at until
+        /// the program leaves.
+        saved_primary_rows: usize = 0,
+
+        /// The pane's size in tmux's latest layout. A live mirror of another
+        /// size was resized by something other than a resize this Viewer
+        /// sent, and can't follow it exactly.
+        layout_cols: size.CellCountInt = 0,
+        layout_rows: size.CellCountInt = 0,
+
         pub const Phase = enum {
             initial_hydrating,
+
+            /// Waiting for tmux to pause this pane's output before a
+            /// recapture. Output until then is covered by the snapshot.
+            refresh_pausing,
+
             refreshing,
             live,
         };
@@ -380,12 +452,41 @@ pub const Viewer = struct {
         const CursorPosition = struct {
             x: size.CellCountInt,
             y: size.CellCountInt,
+
+            /// tmux reports a cursor waiting to wrap at the right edge one
+            /// column past the last; Ghostty keeps it on the last column.
+            pending_wrap: bool = false,
+        };
+
+        const Snapshot = struct {
+            parts: std.EnumArray(Part, ?[]u8) = .initFill(null),
+
+            const Part = enum { state, history, saved_visible, visible };
+
+            fn keep(
+                self: *Snapshot,
+                alloc: Allocator,
+                part: Part,
+                content: []const u8,
+            ) Allocator.Error!void {
+                const copy = try alloc.dupe(u8, content);
+                if (self.parts.get(part)) |old| alloc.free(old);
+                self.parts.set(part, copy);
+            }
+
+            fn deinit(self: *Snapshot, alloc: Allocator) void {
+                for (&self.parts.values) |*part| {
+                    if (part.*) |content| alloc.free(content);
+                    part.* = null;
+                }
+            }
         };
 
         fn restoreCursor(screen: *Screen, position: ?CursorPosition) void {
             const pos = position orelse return;
             if (pos.x >= screen.pages.cols or pos.y >= screen.pages.rows) return;
             screen.cursorAbsolute(pos.x, pos.y);
+            screen.cursor.pending_wrap = pos.pending_wrap;
         }
 
         fn init(
@@ -415,6 +516,8 @@ pub const Viewer = struct {
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             if (self.current_command.len > 0) alloc.free(self.current_command);
             if (self.current_path.len > 0) alloc.free(self.current_path);
+            self.replay.deinit(alloc);
+            self.snapshot.deinit(alloc);
             self.stream.deinit();
             self.terminal_owner.release();
             alloc.destroy(self);
@@ -471,6 +574,7 @@ pub const Viewer = struct {
             self.panes.deinit(self.alloc);
         }
         self.untracked_utf8.deinit(self.alloc);
+        if (self.resize_inflight) |*inflight| inflight.deinit(self.alloc);
         if (self.session_name.len > 0) {
             self.alloc.free(self.session_name);
         }
@@ -495,6 +599,10 @@ pub const Viewer = struct {
         const pane = self.panes.get(pane_id) orelse return error.PaneUnknown;
         if (pane.phase != .live) return error.NotReady;
 
+        // A recapture pauses the pane's output, which would void the
+        // ordering a client resize relies on.
+        if (self.resize_inflight != null) return error.NotReady;
+
         // ControlClient submits every Viewer group synchronously. Refusing a
         // refresh while a group is not yet submitted preserves one FIFO cut
         // between Viewer semantics and Channel framing.
@@ -502,20 +610,15 @@ pub const Viewer = struct {
             return error.NotReady;
         }
 
-        var command_storage: [5]Command = undefined;
-        command_storage[0] = .{ .pane_refresh_state = pane_id };
-        const hydration = self.paneHydrationCommands(
-            pane_id,
-            command_storage[1..],
-        );
-        const commands = command_storage[0 .. hydration.len + 1];
+        var command_storage: [recapture_command_capacity]Command = undefined;
+        const commands = self.recaptureCommands(pane_id, &command_storage);
 
         // The formatted members live only through the synchronous submit.
         // The arena is independent of the action arena because refresh is
         // also valid from a host action callback.
         var arena = ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        var members: [5][]const u8 = undefined;
+        var members: [recapture_command_capacity][]const u8 = undefined;
         for (commands, 0..) |command, i| {
             var builder: std.Io.Writer.Allocating = .init(arena.allocator());
             command.formatCommand(&builder.writer) catch
@@ -527,12 +630,12 @@ pub const Viewer = struct {
         // Channel submit reserves all of its storage before mutation, so an
         // enqueue failure can restore the pane without a half-queued group.
         try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
-        const prior_carry = pane.utf8_carry;
-        pane.phase = .refreshing;
-        pane.utf8_carry.clear();
+        const prior = pane.*;
+        self.beginRecapture(pane);
         submitter.submitPaneRefresh(members[0..commands.len]) catch |err| {
-            pane.phase = .live;
-            pane.utf8_carry = prior_carry;
+            pane.phase = prior.phase;
+            pane.utf8_carry = prior.utf8_carry;
+            pane.stale = prior.stale;
             return err;
         };
 
@@ -544,6 +647,170 @@ pub const Viewer = struct {
             });
         }
         self.sent_command_count += commands.len;
+    }
+
+    /// Resize the control client. When the reply arrives, tmux's resize of
+    /// every pane is applied to its mirror with tmux's own row rules. While
+    /// a resize or a recapture is in flight only the newest size is kept, and
+    /// it's sent once they finish. `submitter.submitClientResize` must
+    /// synchronously enqueue the supplied command group.
+    pub fn setClientSize(
+        self: *Viewer,
+        client_size: ClientSize,
+        submitter: anytype,
+    ) !void {
+        if (client_size.columns == 0 or client_size.rows == 0) return error.InvalidInput;
+        switch (self.state) {
+            .defunct => return error.NotReady,
+
+            // Sent with the startup commands.
+            .startup_block, .startup_session => {
+                self.resize_pending = client_size;
+                return;
+            },
+
+            .command_queue => {},
+        }
+        if (self.resize_inflight != null or self.recaptureInFlight()) {
+            self.resize_pending = client_size;
+            return;
+        }
+        if (self.sent_command_count != self.command_queue.len()) {
+            return error.NotReady;
+        }
+
+        const commands = resizeCommands(client_size);
+        var arena = ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var members: [commands.len][]const u8 = undefined;
+        for (commands, 0..) |command, i| {
+            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+            command.formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            members[i] = builder.writer.buffered();
+        }
+
+        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
+        try submitter.submitClientResize(&members);
+        for (commands, 0..) |command, i| {
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = i + 1 == commands.len,
+            });
+        }
+        self.sent_command_count += commands.len;
+        self.resize_inflight = .{ .arena = .init(self.alloc) };
+        self.resize_pending = null;
+    }
+
+    fn resizeCommands(client_size: ClientSize) [3]Command {
+        return .{
+            .resize_sample_before,
+            .{ .resize_client = client_size },
+            .resize_sample_after,
+        };
+    }
+
+    /// Queue a client resize from inside an input. It's emitted with that
+    /// input's other commands.
+    fn queueResize(self: *Viewer, client_size: ClientSize) Allocator.Error!void {
+        const commands = resizeCommands(client_size);
+        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
+        for (commands, 0..) |command, i| {
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = i + 1 == commands.len,
+            });
+        }
+        self.resize_inflight = .{ .arena = .init(self.alloc) };
+    }
+
+    fn flushPendingResize(self: *Viewer) Allocator.Error!void {
+        if (self.resize_inflight != null or self.recaptureInFlight()) return;
+        const pending = self.resize_pending orelse return;
+        self.resize_pending = null;
+        try self.queueResize(pending);
+    }
+
+    fn recaptureInFlight(self: *const Viewer) bool {
+        for (self.panes.values()) |pane| switch (pane.phase) {
+            .refresh_pausing, .refreshing => return true,
+            .initial_hydrating, .live => {},
+        };
+        return false;
+    }
+
+    /// A refresh state query, the hydration captures and a continue.
+    const recapture_command_capacity = 6;
+
+    /// The commands that start a recapture: a pause, whose reply sends the
+    /// snapshot, or on tmux 3.1, which can't pause a pane, the snapshot
+    /// itself.
+    fn recaptureCommands(
+        self: *const Viewer,
+        pane_id: usize,
+        storage: *[recapture_command_capacity]Command,
+    ) []const Command {
+        if (self.supportsPanePause()) {
+            storage[0] = .{ .pane_pause = pane_id };
+            return storage[0..1];
+        }
+        storage[0] = .{ .pane_refresh_state = pane_id };
+        const hydration = self.paneHydrationCommands(pane_id, storage[1..]);
+        return storage[0 .. hydration.len + 1];
+    }
+
+    fn beginRecapture(self: *const Viewer, pane: *Pane) void {
+        pane.phase = if (self.supportsPanePause()) .refresh_pausing else .refreshing;
+        pane.replay_output = false;
+        pane.replay.clearRetainingCapacity();
+        pane.snapshot.deinit(self.alloc);
+        pane.utf8_carry.clear();
+        pane.stale = false;
+    }
+
+    fn queueRecapture(self: *Viewer, pane_id: usize, pane: *Pane) Allocator.Error!void {
+        var storage: [recapture_command_capacity]Command = undefined;
+        const commands = self.recaptureCommands(pane_id, &storage);
+        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
+        self.beginRecapture(pane);
+        for (commands, 0..) |command, i| {
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = i + 1 == commands.len,
+                .refresh_pane_id = pane_id,
+            });
+        }
+    }
+
+    /// tmux paused the pane. Nothing it sends for the pane from now on is in
+    /// the snapshot, so it's kept and applied after it.
+    fn receivedPanePaused(self: *Viewer, pane_id: usize) Allocator.Error!void {
+        const pane = self.panes.get(pane_id) orelse return;
+        if (pane.phase != .refresh_pausing) return;
+
+        var storage: [recapture_command_capacity]Command = undefined;
+        storage[0] = .{ .pane_refresh_state = pane_id };
+        const hydration = self.paneHydrationCommands(pane_id, storage[1..]);
+        storage[hydration.len + 1] = .{ .pane_continue = pane_id };
+        const commands = storage[0 .. hydration.len + 2];
+
+        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
+        pane.phase = .refreshing;
+        pane.replay_output = true;
+        for (commands, 0..) |command, i| {
+            self.command_queue.appendAssumeCapacity(.{
+                .command = command,
+                .group_end = i + 1 == commands.len,
+                .refresh_pane_id = pane_id,
+            });
+        }
+    }
+
+    /// `refresh-client -A` exists from tmux 3.2.
+    fn supportsPanePause(self: *const Viewer) bool {
+        const version = parseTmuxVersion(self.tmux_version) orelse return false;
+        return version.major > 3 or (version.major == 3 and version.minor >= 2);
     }
 
     /// Refresh the lightweight metadata for every pane in one known window.
@@ -683,7 +950,9 @@ pub const Viewer = struct {
                 defer self.action_arena = arena.state;
                 _ = arena.reset(.free_all);
 
-                const commands: []const Command = if (self.options.initial_client_size) |client_size|
+                const startup_size = self.resize_pending orelse self.options.initial_client_size;
+                self.resize_pending = null;
+                const commands: []const Command = if (startup_size) |client_size|
                     &.{ .tmux_version, .{ .client_size = client_size }, .list_windows }
                 else
                     &.{ .tmux_version, .list_windows };
@@ -715,19 +984,22 @@ pub const Viewer = struct {
         // already in flight. Pane output therefore never needs to dispatch a
         // command and can bypass the action arena entirely. Active topology
         // notifications likewise update only Viewer-owned window state.
+        var left_alternate: ?usize = null;
+        var shown_stale = false;
         switch (n) {
             .output => |out| {
-                const pane_id = self.receivedOutput(out) catch |err| {
+                const result = self.receivedOutput(out) catch |err| {
                     log.warn(
                         "failed to process output for pane id={}, becoming defunct: {}",
                         .{ out.pane_id, err },
                     );
                     return self.defunct();
                 };
-                return if (pane_id) |id|
-                    self.singleAction(.{ .pane_changed = id })
-                else
-                    &.{};
+                const changed = result orelse return &.{};
+                if (!changed.recapture) {
+                    return self.singleAction(.{ .pane_changed = changed.pane_id });
+                }
+                left_alternate = changed.pane_id;
             },
             .window_pane_changed => |info| return if (self.windowPaneChanged(
                 info.window_id,
@@ -736,13 +1008,13 @@ pub const Viewer = struct {
                 self.singleAction(.{ .windows = self.windows.items })
             else
                 &.{},
-            .session_window_changed => |info| return if (self.sessionWindowChanged(
-                info.session_id,
-                info.window_id,
-            ))
-                self.singleAction(.{ .windows = self.windows.items })
-            else
-                &.{},
+            .session_window_changed => |info| {
+                if (!self.sessionWindowChanged(info.session_id, info.window_id)) return &.{};
+                if (!self.hasStaleShownPane()) {
+                    return self.singleAction(.{ .windows = self.windows.items });
+                }
+                shown_stale = true;
+            },
             .window_renamed => |info| {
                 const changed = self.windowRenamed(info.id, info.name) catch {
                     log.warn("failed to retain window name, becoming defunct", .{});
@@ -766,6 +1038,23 @@ pub const Viewer = struct {
 
         // Setup our empty actions list that commands can populate.
         var actions: std.ArrayList(Action) = .empty;
+
+        // A pane left the alternate screen after a resize, or a window with
+        // out-of-date panes became visible: recapture them.
+        if (left_alternate != null or shown_stale) {
+            {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                const action: Action = if (left_alternate) |pane_id|
+                    .{ .pane_changed = pane_id }
+                else
+                    .{ .windows = self.windows.items };
+                actions.append(arena.allocator(), action) catch return self.defunct();
+            }
+            self.recaptureStaleShownPanes() catch return self.defunct();
+            self.appendQueuedCommandActions(&actions) catch return self.defunct();
+            return actions.items;
+        }
 
         switch (n) {
             .enter => unreachable,
@@ -998,48 +1287,7 @@ pub const Viewer = struct {
             log.info("layout change for unknown window id={}", .{window_id});
             return;
         };
-
-        // Clear our prior window arena and parse both topology and canonical
-        // visible geometry from the same notification.
-        {
-            var arena = window.layout_arena.promote(self.alloc);
-            defer window.layout_arena = arena.state;
-            _ = arena.reset(.retain_capacity);
-            const layout = Layout.parseWithChecksum(
-                arena.allocator(),
-                layout_str,
-            ) catch |err| {
-                log.info(
-                    "failed to parse window layout id={} layout={s}",
-                    .{ window_id, layout_str },
-                );
-                return err;
-            };
-            const is_zoomed = !std.mem.eql(u8, layout_str, visible_layout_str);
-            const visible_layout = if (is_zoomed)
-                Layout.parseWithChecksum(
-                    arena.allocator(),
-                    visible_layout_str,
-                ) catch |err| {
-                    log.info(
-                        "failed to parse visible window layout id={} layout={s}",
-                        .{ window_id, visible_layout_str },
-                    );
-                    return err;
-                }
-            else
-                layout;
-            const active_pane_id = if (is_zoomed) switch (visible_layout.content) {
-                .pane => |id| id,
-                .horizontal, .vertical => return error.InvalidVisibleLayout,
-            } else window.active_pane_id;
-            window.width = layout.width;
-            window.height = layout.height;
-            window.is_zoomed = is_zoomed;
-            window.active_pane_id = active_pane_id;
-            window.layout = layout;
-            window.visible_layout = visible_layout;
-        }
+        try self.setWindowLayout(window, layout_str, visible_layout_str);
 
         // Reset our arena so we can build up actions.
         var arena = self.action_arena.promote(self.alloc);
@@ -1052,6 +1300,54 @@ pub const Viewer = struct {
 
         // Sync up our panes
         try self.syncLayouts(self.windows.items);
+        try self.afterTopologyChange();
+    }
+
+    /// Replace a window's layout, parsing both topology and canonical visible
+    /// geometry from the same pair of layout strings.
+    fn setWindowLayout(
+        self: *Viewer,
+        window: *Window,
+        layout_str: []const u8,
+        visible_layout_str: []const u8,
+    ) !void {
+        var arena = window.layout_arena.promote(self.alloc);
+        defer window.layout_arena = arena.state;
+        _ = arena.reset(.retain_capacity);
+        const layout = Layout.parseWithChecksum(
+            arena.allocator(),
+            layout_str,
+        ) catch |err| {
+            log.info(
+                "failed to parse window layout id={} layout={s}",
+                .{ window.id, layout_str },
+            );
+            return err;
+        };
+        const is_zoomed = !std.mem.eql(u8, layout_str, visible_layout_str);
+        const visible_layout = if (is_zoomed)
+            Layout.parseWithChecksum(
+                arena.allocator(),
+                visible_layout_str,
+            ) catch |err| {
+                log.info(
+                    "failed to parse visible window layout id={} layout={s}",
+                    .{ window.id, visible_layout_str },
+                );
+                return err;
+            }
+        else
+            layout;
+        const active_pane_id = if (is_zoomed) switch (visible_layout.content) {
+            .pane => |id| id,
+            .horizontal, .vertical => return error.InvalidVisibleLayout,
+        } else window.active_pane_id;
+        window.width = layout.width;
+        window.height = layout.height;
+        window.is_zoomed = is_zoomed;
+        window.active_pane_id = active_pane_id;
+        window.layout = layout;
+        window.visible_layout = visible_layout;
     }
 
     /// When a window is added to the session, we need to refresh our window
@@ -1085,6 +1381,7 @@ pub const Viewer = struct {
 
         removed.deinit(self.alloc);
         actions.appendAssumeCapacity(.{ .windows = self.windows.items });
+        try self.afterTopologyChange();
     }
 
     fn syncLayouts(
@@ -1232,6 +1529,216 @@ pub const Viewer = struct {
         }
     }
 
+    /// Live mirrors whose size differs from tmux's layout were resized by
+    /// something other than a resize this Viewer sent. Their geometry
+    /// follows the layout and their contents are recaptured.
+    fn reconcileGeometry(self: *Viewer) Terminal.ResizeError!void {
+        if (self.resize_inflight != null) return;
+        for (self.panes.values()) |pane| {
+            if (pane.phase != .live or pane.layout_cols == 0) continue;
+            const owner = pane.terminal_owner;
+            owner.mutex.lockUncancelable(owner.terminal.io());
+            defer owner.mutex.unlock(owner.terminal.io());
+            const t = &owner.terminal;
+            if (t.cols == pane.layout_cols and t.rows == pane.layout_rows) continue;
+            try t.resize(self.alloc, .{ .cols = pane.layout_cols, .rows = pane.layout_rows });
+            pane.stale = true;
+            if (t.screens.active_key == .alternate) pane.primary_stale = true;
+        }
+    }
+
+    fn recaptureStaleShownPanes(self: *Viewer) Allocator.Error!void {
+        if (self.resize_inflight != null) return;
+        var it = self.panes.iterator();
+        while (it.next()) |kv| {
+            const pane = kv.value_ptr.*;
+            if (!pane.stale or pane.phase != .live) continue;
+            if (!self.paneShown(kv.key_ptr.*)) continue;
+            try self.queueRecapture(kv.key_ptr.*, pane);
+        }
+    }
+
+    fn hasStaleShownPane(self: *const Viewer) bool {
+        var it = self.panes.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.*.stale and self.paneShown(kv.key_ptr.*)) return true;
+        }
+        return false;
+    }
+
+    /// Whether the pane is in the session's current window.
+    fn paneShown(self: *const Viewer, pane_id: usize) bool {
+        for (self.windows.items) |window| {
+            if (window.is_active) return layoutContains(window.layout, pane_id);
+        }
+        return false;
+    }
+
+    fn layoutContains(layout: Layout, pane_id: usize) bool {
+        return switch (layout.content) {
+            .pane => |id| id == pane_id,
+            .horizontal, .vertical => |children| for (children) |child| {
+                if (layoutContains(child, pane_id)) break true;
+            } else false,
+        };
+    }
+
+    fn afterTopologyChange(self: *Viewer) !void {
+        try self.reconcileGeometry();
+        try self.recaptureStaleShownPanes();
+
+        // A removed pane may have been the recapture a pending resize waited
+        // for.
+        try self.flushPendingResize();
+    }
+
+    fn parseResizeSamples(
+        alloc: Allocator,
+        content: []const u8,
+    ) ![]const resize.Sample {
+        var samples: std.ArrayList(resize.Sample) = .empty;
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trimEnd(u8, line_raw, "\r");
+            if (line.len == 0) continue;
+            const data = output.parseFormatStruct(
+                Format.resize_sample.Struct(),
+                line,
+                Format.resize_sample.delim,
+            ) catch |err| {
+                log.info("failed to parse resize sample line: {s}", .{line});
+                return err;
+            };
+            try samples.append(alloc, .{
+                .pane_id = data.pane_id,
+                .width = data.pane_width,
+                .height = data.pane_height,
+                .cursor_x = data.cursor_x,
+                .cursor_y = data.cursor_y,
+                .history = data.history_size,
+                .alternate = data.alternate_on,
+                .layout = try alloc.dupe(u8, data.window_layout),
+                .visible_layout = try alloc.dupe(u8, data.window_visible_layout),
+            });
+        }
+        return samples.items;
+    }
+
+    fn finishResize(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        after_content: ?[]const u8,
+    ) !void {
+        var inflight = self.resize_inflight orelse return;
+        self.resize_inflight = null;
+        defer inflight.deinit(self.alloc);
+
+        if (after_content) |content| if (!inflight.failed) {
+            try self.applyResize(arena_alloc, actions, &inflight, content);
+        };
+        try self.afterTopologyChange();
+    }
+
+    fn applyResize(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        inflight: *const ResizeInflight,
+        content: []const u8,
+    ) !void {
+        const after_samples = try parseResizeSamples(arena_alloc, content);
+
+        // tmux sends each window's %layout-change after this reply. Until
+        // then a window would keep its old layout, and the notification for
+        // another window would size this window's panes back to it.
+        var windows_changed = false;
+        for (self.windows.items) |*window| {
+            const sample = for (after_samples) |sample| {
+                if (sample.layout.len > 0 and layoutContains(window.layout, sample.pane_id)) break sample;
+            } else continue;
+            const visible = if (sample.visible_layout.len > 0) sample.visible_layout else sample.layout;
+            try self.setWindowLayout(window, sample.layout, visible);
+            windows_changed = true;
+        }
+        if (windows_changed) try actions.append(arena_alloc, .{ .windows = self.windows.items });
+
+        const reordered = inflight.output_panes.count() > 1;
+        for (after_samples) |after| {
+            const pane = self.panes.get(after.pane_id) orelse continue;
+            if (pane.phase != .live) continue;
+            const cols = std.math.cast(size.CellCountInt, after.width) orelse
+                return error.InvalidPaneGeometry;
+            const rows = std.math.cast(size.CellCountInt, after.height) orelse
+                return error.InvalidPaneGeometry;
+            if (cols == 0 or rows == 0) return error.InvalidPaneGeometry;
+            pane.layout_cols = cols;
+            pane.layout_rows = rows;
+
+            const before = for (inflight.before) |sample| {
+                if (sample.pane_id == after.pane_id) break sample;
+            } else null;
+            const outcome: PaneResize = if (before) |b|
+                try self.resizePane(
+                    pane,
+                    b,
+                    after,
+                    reordered and inflight.output_panes.contains(after.pane_id),
+                )
+            else
+                .mismatch;
+
+            switch (outcome) {
+                .unchanged => {},
+                .applied => try actions.append(arena_alloc, .{ .pane_changed = after.pane_id }),
+                .mismatch => {
+                    // Keep the geometry current; the contents are recaptured
+                    // once the pane is shown.
+                    const owner = pane.terminal_owner;
+                    owner.mutex.lockUncancelable(owner.terminal.io());
+                    defer owner.mutex.unlock(owner.terminal.io());
+                    try owner.terminal.resize(self.alloc, .{ .cols = cols, .rows = rows });
+                    pane.stale = true;
+                    try actions.append(arena_alloc, .{ .pane_changed = after.pane_id });
+                },
+            }
+        }
+    }
+
+    const PaneResize = enum { unchanged, applied, mismatch };
+
+    /// Repeat tmux's resize of one pane on its mirror.
+    fn resizePane(
+        self: *Viewer,
+        pane: *Pane,
+        before: resize.Sample,
+        after: resize.Sample,
+        reordered: bool,
+    ) !PaneResize {
+        const p = try resize.plan(self.alloc, before, after) orelse return .mismatch;
+        if (p.len == 0) return .unchanged;
+        if (pane.stale or reordered) return .mismatch;
+
+        const owner = pane.terminal_owner;
+        owner.mutex.lockUncancelable(owner.terminal.io());
+        defer owner.mutex.unlock(owner.terminal.io());
+        const t = &owner.terminal;
+
+        // The mirror must be where tmux was when the resize ran.
+        if (t.cols != before.width or t.rows != before.height) return .mismatch;
+        if ((t.screens.active_key == .alternate) != before.alternate) return .mismatch;
+        if (!resize.cursorMatches(t, before.cursor_x, before.cursor_y)) return .mismatch;
+        if (p.pulled() > 0 and t.region_rows_scrolled_out != pane.region_rows_baseline) {
+            return .mismatch;
+        }
+        if (!resize.canApply(t, &p)) return .mismatch;
+
+        if (!try resize.apply(self.alloc, t, &p)) return .mismatch;
+        if (!resize.cursorMatches(t, after.cursor_x, after.cursor_y)) return .mismatch;
+        if (before.alternate) pane.primary_stale = true;
+        return .applied;
+    }
+
     /// When a session changes, we have to basically reset our whole state.
     /// To do this, we emit an empty windows event (so callers can clear all
     /// windows), reset ourself, and start all over.
@@ -1323,6 +1830,19 @@ pub const Viewer = struct {
                 if (command.isHydration()) return error.HydrationFailed;
                 switch (command) {
                     .pane_metadata, .user => return null,
+
+                    // tmux skips the rest of a group after a failed member,
+                    // so the after sample always reports the outcome.
+                    .resize_sample_before, .resize_client => {
+                        if (self.resize_inflight) |*inflight| inflight.failed = true;
+                        return null;
+                    },
+                    .resize_sample_after => {
+                        var arena = self.action_arena.promote(self.alloc);
+                        defer self.action_arena = arena.state;
+                        try self.finishResize(arena.allocator(), actions, null);
+                        return null;
+                    },
                     else => return error.CommandFailed,
                 }
             },
@@ -1364,13 +1884,34 @@ pub const Viewer = struct {
 
             .pane_pending => |id| if (try self.receivedPanePending(id, content)) {
                 try actions.append(arena_alloc, .{ .pane_changed = id });
+                try self.recaptureStaleShownPanes();
+                try self.flushPendingResize();
             },
+
+            .pane_pause => |id| try self.receivedPanePaused(id),
+
+            .pane_continue => {},
 
             .tmux_version => if (try self.receivedTmuxVersion(content)) |reason| {
                 return reason;
             },
 
-            .client_size => {},
+            .client_size, .resize_client => {},
+
+            .resize_sample_before => if (self.resize_inflight) |*inflight| {
+                inflight.before = parseResizeSamples(
+                    inflight.arena.allocator(),
+                    content,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => failed: {
+                        inflight.failed = true;
+                        break :failed &.{};
+                    },
+                };
+            },
+
+            .resize_sample_after => try self.finishResize(arena_alloc, actions, content),
         }
         return null;
     }
@@ -1562,6 +2103,7 @@ pub const Viewer = struct {
         // Publish the Viewer-owned slice. `windows` is temporary and its
         // backing allocation is freed when this function returns.
         actions.appendAssumeCapacity(.{ .windows = self.windows.items });
+        try self.afterTopologyChange();
     }
 
     fn appendWindowListRecord(
@@ -1659,156 +2201,175 @@ pub const Viewer = struct {
             ) or metadata_changed;
 
             if (!hydrate_terminal) continue;
+            if (pane.phase == .refreshing) {
+                try pane.snapshot.keep(self.alloc, .state, line);
+                continue;
+            }
 
             const terminal_owner = pane.terminal_owner;
             terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
             defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
-            const t: *Terminal = &terminal_owner.terminal;
-
-            const cols = std.math.cast(
-                size.CellCountInt,
-                data.pane_width,
-            ) orelse return error.InvalidPaneGeometry;
-            const rows = std.math.cast(
-                size.CellCountInt,
-                data.pane_height,
-            ) orelse return error.InvalidPaneGeometry;
-            if (cols == 0 or rows == 0) return error.InvalidPaneGeometry;
-
-            if (pane.phase == .refreshing) {
-                // Replace only content that the snapshots reconstruct. A DEC
-                // RIS/fullReset would also discard live protocol state that
-                // tmux does not expose, including charset and Kitty keyboard
-                // state. Title, pwd, colors, palette, and terminal modes stay
-                // intact until the pane-state fields below overwrite the
-                // subset tmux reports.
-                const active_key = t.screens.active_key;
-                for ([_]ScreenSet.Key{ .primary, .alternate }) |key| {
-                    const screen = t.screens.get(key) orelse continue;
-                    t.screens.switchTo(key);
-                    t.eraseDisplay(.scroll_complete, false);
-                    screen.eraseHistory(null);
-                    screen.clearSelection();
-                }
-                t.screens.switchTo(active_key);
-                try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
-
-                // Snapshot replay starts at a fresh protocol boundary. The
-                // canonical Terminal and SharedTerminal identities remain
-                // unchanged; only the private parser state is replaced.
-                pane.stream.deinit();
-                pane.stream = t.vtStream();
-            } else if (t.cols != cols or t.rows != rows) {
-                try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
-            }
-
-            pane.active_screen = if (data.alternate_on) .alternate else .primary;
-            pane.has_history = data.history_size > 0;
-            _ = try t.switchScreen(pane.active_screen);
-
-            // Set cursor position on the appropriate screen (tmux uses 0-based)
-            const screen = t.screens.active;
-            pane.cursor = position: {
-                const x = std.math.cast(
-                    size.CellCountInt,
-                    data.cursor_x,
-                ) orelse break :position null;
-                const y = std.math.cast(
-                    size.CellCountInt,
-                    data.cursor_y,
-                ) orelse break :position null;
-                if (x >= screen.pages.cols or y >= screen.pages.rows) {
-                    break :position null;
-                }
-                break :position .{ .x = x, .y = y };
-            };
-
-            // Set cursor shape on the canonical screen.
-            if (std.mem.eql(u8, data.cursor_shape, "block")) {
-                screen.cursor.cursor_style = .block;
-            } else if (std.mem.eql(u8, data.cursor_shape, "underline")) {
-                screen.cursor.cursor_style = .underline;
-            } else if (std.mem.eql(u8, data.cursor_shape, "bar")) {
-                screen.cursor.cursor_style = .bar;
-            }
-
-            // Tmux's alternate_saved coordinates are the primary cursor
-            // saved while the alternate screen is active.
-            const primary = t.screens.get(.primary).?;
-            pane.saved_primary_cursor = position: {
-                const x = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_x,
-                ) orelse break :position null;
-                const y = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_y,
-                ) orelse break :position null;
-
-                // If our coordinates are outside our screen we ignore it.
-                // tmux actually sends MAX_INT for when there isn't a set
-                // cursor position, so this isn't theoretical.
-                if (x >= primary.pages.cols or y >= primary.pages.rows) {
-                    break :position null;
-                }
-
-                break :position .{ .x = x, .y = y };
-            };
-
-            // Set cursor visibility
-            t.modes.set(.cursor_visible, data.cursor_flag);
-
-            // Set cursor blinking
-            t.modes.set(.cursor_blinking, data.cursor_blinking);
-
-            // Terminal modes
-            t.modes.set(.insert, data.insert_flag);
-            t.modes.set(.wraparound, data.wrap_flag);
-            t.modes.set(.keypad_keys, data.keypad_flag);
-            t.modes.set(.cursor_keys, data.keypad_cursor_flag);
-            t.modes.set(.origin, data.origin_flag);
-
-            // Mouse modes
-            reconcileMouseState(t, data);
-
-            // Focus and bracketed paste
-            t.modes.set(.focus_event, data.focus_flag);
-            t.modes.set(.bracketed_paste, data.bracketed_paste);
-
-            // Scroll region (tmux uses 0-based values)
-            scroll: {
-                const scroll_top = std.math.cast(
-                    size.CellCountInt,
-                    data.scroll_region_upper,
-                ) orelse break :scroll;
-                const scroll_bottom = std.math.cast(
-                    size.CellCountInt,
-                    data.scroll_region_lower,
-                ) orelse break :scroll;
-
-                // Ignore invalid regions. The terminal assumes the scroll
-                // region is always within the screen bounds.
-                if (scroll_top >= scroll_bottom or
-                    scroll_bottom >= t.rows) break :scroll;
-
-                t.scrolling_region.top = scroll_top;
-                t.scrolling_region.bottom = scroll_bottom;
-            }
-
-            // Tab stops - parse comma-separated list and set
-            t.tabstops.reset(0); // Clear all tabstops first
-            if (data.pane_tabs.len > 0) {
-                var tabs_it = std.mem.splitScalar(u8, data.pane_tabs, ',');
-                while (tabs_it.next()) |tab_str| {
-                    const col = std.fmt.parseInt(usize, tab_str, 10) catch continue;
-                    const col_cell = std.math.cast(size.CellCountInt, col) orelse continue;
-                    if (col_cell >= t.cols) continue;
-                    t.tabstops.set(col_cell);
-                }
-            }
+            try self.hydratePaneState(pane, &terminal_owner.terminal, data);
         }
 
         return metadata_changed;
+    }
+
+    /// Apply a pane's tmux state to its locked terminal.
+    fn hydratePaneState(
+        self: *Viewer,
+        pane: *Pane,
+        t: *Terminal,
+        data: Format.list_panes.Struct(),
+    ) !void {
+        const cols = std.math.cast(
+            size.CellCountInt,
+            data.pane_width,
+        ) orelse return error.InvalidPaneGeometry;
+        const rows = std.math.cast(
+            size.CellCountInt,
+            data.pane_height,
+        ) orelse return error.InvalidPaneGeometry;
+        if (cols == 0 or rows == 0) return error.InvalidPaneGeometry;
+        pane.layout_cols = cols;
+        pane.layout_rows = rows;
+
+        if (pane.phase == .refreshing) {
+            // Replace only content that the snapshots reconstruct. A DEC
+            // RIS/fullReset would also discard live protocol state that
+            // tmux does not expose, including charset and Kitty keyboard
+            // state. Title, pwd, colors, palette, and terminal modes stay
+            // intact until the pane-state fields below overwrite the
+            // subset tmux reports.
+            const active_key = t.screens.active_key;
+            for ([_]ScreenSet.Key{ .primary, .alternate }) |key| {
+                const screen = t.screens.get(key) orelse continue;
+                t.screens.switchTo(key);
+                t.eraseDisplay(.scroll_complete, false);
+                screen.eraseHistory(null);
+                screen.clearSelection();
+            }
+            t.screens.switchTo(active_key);
+            try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
+
+            // Snapshot replay starts at a fresh protocol boundary. The
+            // canonical Terminal and SharedTerminal identities remain
+            // unchanged; only the private parser state is replaced.
+            pane.stream.deinit();
+            pane.stream = t.vtStream();
+        } else if (t.cols != cols or t.rows != rows) {
+            try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
+        }
+
+        pane.active_screen = if (data.alternate_on) .alternate else .primary;
+        pane.has_history = data.history_size > 0;
+        _ = try t.switchScreen(pane.active_screen);
+
+        // Set cursor position on the appropriate screen (tmux uses 0-based)
+        const screen = t.screens.active;
+        pane.cursor = position: {
+            const x = std.math.cast(
+                size.CellCountInt,
+                data.cursor_x,
+            ) orelse break :position null;
+            const y = std.math.cast(
+                size.CellCountInt,
+                data.cursor_y,
+            ) orelse break :position null;
+            if (y >= screen.pages.rows) break :position null;
+
+            // tmux reports a cursor waiting to wrap one column past the
+            // last.
+            if (x == screen.pages.cols) {
+                break :position .{ .x = x - 1, .y = y, .pending_wrap = true };
+            }
+            if (x > screen.pages.cols) break :position null;
+            break :position .{ .x = x, .y = y };
+        };
+
+        // Set cursor shape on the canonical screen.
+        if (std.mem.eql(u8, data.cursor_shape, "block")) {
+            screen.cursor.cursor_style = .block;
+        } else if (std.mem.eql(u8, data.cursor_shape, "underline")) {
+            screen.cursor.cursor_style = .underline;
+        } else if (std.mem.eql(u8, data.cursor_shape, "bar")) {
+            screen.cursor.cursor_style = .bar;
+        }
+
+        // Tmux's alternate_saved coordinates are the primary cursor
+        // saved while the alternate screen is active.
+        const primary = t.screens.get(.primary).?;
+        pane.saved_primary_cursor = position: {
+            const x = std.math.cast(
+                size.CellCountInt,
+                data.alternate_saved_x,
+            ) orelse break :position null;
+            const y = std.math.cast(
+                size.CellCountInt,
+                data.alternate_saved_y,
+            ) orelse break :position null;
+
+            // If our coordinates are outside our screen we ignore it.
+            // tmux actually sends MAX_INT for when there isn't a set
+            // cursor position, so this isn't theoretical.
+            if (x >= primary.pages.cols or y >= primary.pages.rows) {
+                break :position null;
+            }
+
+            break :position .{ .x = x, .y = y };
+        };
+
+        // Set cursor visibility
+        t.modes.set(.cursor_visible, data.cursor_flag);
+
+        // Set cursor blinking
+        t.modes.set(.cursor_blinking, data.cursor_blinking);
+
+        // Terminal modes
+        t.modes.set(.insert, data.insert_flag);
+        t.modes.set(.wraparound, data.wrap_flag);
+        t.modes.set(.keypad_keys, data.keypad_flag);
+        t.modes.set(.cursor_keys, data.keypad_cursor_flag);
+        t.modes.set(.origin, data.origin_flag);
+
+        // Mouse modes
+        reconcileMouseState(t, data);
+
+        // Focus and bracketed paste
+        t.modes.set(.focus_event, data.focus_flag);
+        t.modes.set(.bracketed_paste, data.bracketed_paste);
+
+        // Scroll region (tmux uses 0-based values)
+        scroll: {
+            const scroll_top = std.math.cast(
+                size.CellCountInt,
+                data.scroll_region_upper,
+            ) orelse break :scroll;
+            const scroll_bottom = std.math.cast(
+                size.CellCountInt,
+                data.scroll_region_lower,
+            ) orelse break :scroll;
+
+            // Ignore invalid regions. The terminal assumes the scroll
+            // region is always within the screen bounds.
+            if (scroll_top >= scroll_bottom or
+                scroll_bottom >= t.rows) break :scroll;
+
+            t.scrolling_region.top = scroll_top;
+            t.scrolling_region.bottom = scroll_bottom;
+        }
+
+        // Tab stops - parse comma-separated list and set
+        t.tabstops.reset(0); // Clear all tabstops first
+        if (data.pane_tabs.len > 0) {
+            var tabs_it = std.mem.splitScalar(u8, data.pane_tabs, ',');
+            while (tabs_it.next()) |tab_str| {
+                const col = std.fmt.parseInt(usize, tab_str, 10) catch continue;
+                const col_cell = std.math.cast(size.CellCountInt, col) orelse continue;
+                if (col_cell >= t.cols) continue;
+                t.tabstops.set(col_cell);
+            }
+        }
     }
 
     fn receivedPaneMetadata(
@@ -1913,17 +2474,19 @@ pub const Viewer = struct {
         id: usize,
         content: []const u8,
     ) !void {
-        // Get our pane
-        const entry = self.panes.getEntry(id) orelse {
+        const pane = self.panes.get(id) orelse {
             log.info("received pane history for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr.*;
-        if (!pane.has_history) return;
+        if (pane.phase == .refreshing) return pane.snapshot.keep(self.alloc, .history, content);
         const terminal_owner = pane.terminal_owner;
         terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
         defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
-        const t: *Terminal = &terminal_owner.terminal;
+        try hydratePaneHistory(pane, &terminal_owner.terminal, content);
+    }
+
+    fn hydratePaneHistory(pane: *const Pane, t: *Terminal, content: []const u8) !void {
+        if (!pane.has_history) return;
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
         _ = try t.switchScreen(.primary);
@@ -1964,8 +2527,18 @@ pub const Viewer = struct {
             log.info("received saved pane content for untracked pane id={}", .{id});
             return;
         };
+        if (pane.phase == .refreshing) return pane.snapshot.keep(self.alloc, .saved_visible, content);
+        const terminal_owner = pane.terminal_owner;
+        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
+        try hydratePaneSavedVisible(pane, &terminal_owner.terminal, content);
+    }
+
+    fn hydratePaneSavedVisible(pane: *Pane, t: *Terminal, content: []const u8) !void {
         if (pane.active_screen != .alternate) return;
-        try self.receivedPaneVisibleOnScreen(.primary, id, content);
+        // tmux prints one line per row; the reply drops the last newline.
+        pane.saved_primary_rows = if (content.len == 0) 0 else std.mem.count(u8, content, "\n") + 1;
+        try hydrateScreen(t, .primary, content);
     }
 
     fn receivedPaneVisible(
@@ -1977,25 +2550,18 @@ pub const Viewer = struct {
             log.info("received pane visible for untracked pane id={}", .{id});
             return;
         };
-        try self.receivedPaneVisibleOnScreen(pane.active_screen, id, content);
-    }
-
-    fn receivedPaneVisibleOnScreen(
-        self: *Viewer,
-        screen_key: ScreenSet.Key,
-        id: usize,
-        content: []const u8,
-    ) !void {
-        // Get our pane
-        const entry = self.panes.getEntry(id) orelse {
-            log.info("received pane visible for untracked pane id={}", .{id});
-            return;
-        };
-        const pane: *Pane = entry.value_ptr.*;
+        if (pane.phase == .refreshing) return pane.snapshot.keep(self.alloc, .visible, content);
         const terminal_owner = pane.terminal_owner;
         terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
         defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
-        const t: *Terminal = &terminal_owner.terminal;
+        try hydrateScreen(&terminal_owner.terminal, pane.active_screen, content);
+    }
+
+    fn hydrateScreen(
+        t: *Terminal,
+        screen_key: ScreenSet.Key,
+        content: []const u8,
+    ) !void {
         const replay_state = SnapshotReplayState.begin(t);
         defer replay_state.restore(t);
         _ = try t.switchScreen(screen_key);
@@ -2026,6 +2592,8 @@ pub const Viewer = struct {
         terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
         defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
         const t = &terminal_owner.terminal;
+        if (pane.phase == .refreshing) try self.hydrateSnapshot(pane, t);
+
         Pane.restoreCursor(t.screens.get(.primary).?, pane.saved_primary_cursor);
         _ = try t.switchScreen(pane.active_screen);
         Pane.restoreCursor(t.screens.active, pane.cursor);
@@ -2038,15 +2606,67 @@ pub const Viewer = struct {
             pane.stream.nextSlice(pane.utf8_carry.slice());
         }
 
+        // Output tmux sent after pausing the pane postdates the snapshot.
+        if (pane.replay_output) {
+            pane.stream.nextSlice(pane.replay.items);
+            pane.replay.clearRetainingCapacity();
+            pane.replay_output = false;
+        }
+
         pane.utf8_carry.clear();
+        pane.region_rows_baseline = t.region_rows_scrolled_out;
         pane.phase = .live;
+
+        // tmux keeps the normal screen at the size it had when the program
+        // entered the alternate screen and resizes it when the program
+        // leaves. If that size differs from the pane's, the snapshot can't
+        // hold it as tmux will, so it's recaptured when the program leaves,
+        // or now if it left in the output after the snapshot.
+        const snapshot_alternate = pane.active_screen == .alternate;
+        const primary_stale = snapshot_alternate and
+            (pane.primary_stale or pane.saved_primary_rows != t.rows);
+        const left_alternate = snapshot_alternate and t.screens.active_key == .primary;
+        pane.primary_stale = primary_stale and !left_alternate;
+        if (primary_stale and left_alternate) pane.stale = true;
         return true;
     }
+
+    /// Apply a recapture's kept replies to the pane's locked terminal.
+    fn hydrateSnapshot(self: *Viewer, pane: *Pane, t: *Terminal) !void {
+        defer pane.snapshot.deinit(self.alloc);
+        const parts = &pane.snapshot.parts;
+        if (parts.get(.state)) |line| {
+            const data = output.parseFormatStructFinalRemainder(
+                Format.list_panes.Struct(),
+                line,
+                Format.list_panes.delim,
+            ) catch |err| {
+                log.info("failed to parse pane state line: {s}", .{line});
+                return err;
+            };
+            try self.hydratePaneState(pane, t, data);
+        }
+        if (parts.get(.history)) |content| try hydratePaneHistory(pane, t, content);
+        if (parts.get(.saved_visible)) |content| try hydratePaneSavedVisible(pane, t, content);
+        if (parts.get(.visible)) |content| try hydrateScreen(t, pane.active_screen, content);
+    }
+
+    const OutputResult = struct {
+        pane_id: usize,
+
+        /// The pane left the alternate screen after a resize, and its normal
+        /// screen must be recaptured.
+        recapture: bool = false,
+    };
 
     fn receivedOutput(
         self: *Viewer,
         out: control.Notification.Output,
-    ) !?usize {
+    ) !?OutputResult {
+        if (self.resize_inflight) |*inflight| {
+            try inflight.output_panes.put(self.alloc, out.pane_id, {});
+        }
+
         const entry = self.panes.getEntry(out.pane_id) orelse {
             var carry = self.untracked_utf8.get(out.pane_id) orelse Utf8Carry{};
             carry.update(out.data);
@@ -2060,15 +2680,30 @@ pub const Viewer = struct {
         const pane: *Pane = entry.value_ptr.*;
         const data = control.decodeEscapedOutput(out.data);
         return switch (pane.phase) {
-            .initial_hydrating, .refreshing => hydrating: {
+            .initial_hydrating, .refresh_pausing => hydrating: {
                 pane.utf8_carry.update(data);
                 break :hydrating null;
             },
+            .refreshing => refreshing: {
+                if (pane.replay_output) {
+                    try pane.replay.appendSlice(self.alloc, data);
+                } else {
+                    pane.utf8_carry.update(data);
+                }
+                break :refreshing null;
+            },
             .live => live: {
-                pane.terminal_owner.mutex.lockUncancelable(pane.terminal_owner.terminal.io());
-                defer pane.terminal_owner.mutex.unlock(pane.terminal_owner.terminal.io());
+                const owner = pane.terminal_owner;
+                owner.mutex.lockUncancelable(owner.terminal.io());
+                defer owner.mutex.unlock(owner.terminal.io());
                 pane.stream.nextSlice(data);
-                break :live out.pane_id;
+                const left_alternate = pane.primary_stale and
+                    owner.terminal.screens.active_key == .primary;
+                if (left_alternate) {
+                    pane.primary_stale = false;
+                    pane.stale = true;
+                }
+                break :live .{ .pane_id = out.pane_id, .recapture = left_alternate };
             },
         };
     }
@@ -2138,21 +2773,33 @@ pub const Viewer = struct {
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
                 // If we already have this pane, it is already initialized
-                // so just copy it over.
+                // so just copy it over. A live mirror keeps its size: either
+                // a resize this Viewer sent has already applied tmux's rows,
+                // or `reconcileGeometry` handles a resize from elsewhere. A
+                // snapshot in progress replaces the contents anyway.
                 if (panes_old.getEntry(id)) |entry| {
-                    const terminal_owner = entry.value_ptr.*.terminal_owner;
-                    terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
-                    defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
-                    try terminal_owner.terminal.resize(gpa_alloc, .{ .cols = cols, .rows = rows });
-                    gop.value_ptr.* = entry.value_ptr.*;
+                    const pane = entry.value_ptr.*;
+                    pane.layout_cols = cols;
+                    pane.layout_rows = rows;
+                    if (pane.phase != .live) {
+                        const terminal_owner = pane.terminal_owner;
+                        terminal_owner.mutex.lockUncancelable(terminal_owner.terminal.io());
+                        defer terminal_owner.mutex.unlock(terminal_owner.terminal.io());
+                        try terminal_owner.terminal.resize(gpa_alloc, .{ .cols = cols, .rows = rows });
+                        if (pane.active_screen == .alternate) pane.primary_stale = true;
+                    }
+                    gop.value_ptr.* = pane;
                     break :pane;
                 }
 
-                gop.value_ptr.* = try Pane.init(io, gpa_alloc, .{
+                const pane = try Pane.init(io, gpa_alloc, .{
                     .cols = cols,
                     .rows = rows,
                     .max_scrollback_bytes = max_scrollback,
                 });
+                pane.layout_cols = cols;
+                pane.layout_rows = rows;
+                gop.value_ptr.* = pane;
             },
         }
     }
@@ -2363,6 +3010,18 @@ const Command = union(enum) {
     /// Report the initial control-client grid before querying topology.
     client_size: Viewer.ClientSize,
 
+    /// A client resize Remux applies itself: every pane sampled before and
+    /// after `refresh-client -C` in one command line, which tmux runs without
+    /// parsing pane output in between.
+    resize_sample_before,
+    resize_client: Viewer.ClientSize,
+    resize_sample_after,
+
+    /// Stop and resume tmux's output for one pane around a recapture, so
+    /// output the snapshot already contains is never applied again.
+    pane_pause: usize,
+    pane_continue: usize,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -2384,6 +3043,11 @@ const Command = union(enum) {
             .pane_metadata,
             .tmux_version,
             .client_size,
+            .resize_sample_before,
+            .resize_client,
+            .resize_sample_after,
+            .pane_pause,
+            .pane_continue,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -2397,11 +3061,16 @@ const Command = union(enum) {
             .pane_saved_visible,
             .pane_visible,
             .pane_pending,
+            .pane_pause,
+            .pane_continue,
             => true,
             .list_windows,
             .pane_metadata,
             .tmux_version,
             .client_size,
+            .resize_sample_before,
+            .resize_client,
+            .resize_sample_after,
             .user,
             => false,
         };
@@ -2478,10 +3147,19 @@ const Command = union(enum) {
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
 
-            .client_size => |client_size| try writer.print(
+            .client_size, .resize_client => |client_size| try writer.print(
                 "refresh-client -C {d}x{d}",
                 .{ client_size.columns, client_size.rows },
             ),
+
+            .resize_sample_before, .resize_sample_after => try writer.writeAll(std.fmt.comptimePrint(
+                "list-panes -s -F '{s}'",
+                .{Format.resize_sample_format},
+            )),
+
+            .pane_pause => |id| try writer.print("refresh-client -A '%{d}:pause'", .{id}),
+
+            .pane_continue => |id| try writer.print("refresh-client -A '%{d}:continue'", .{id}),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -2547,6 +3225,36 @@ const Format = struct {
             .pane_current_command,
             .pane_current_path,
         },
+    };
+
+    const resize_sample: Format = .{
+        .delim = ';',
+        .vars = &.{
+            .pane_id,
+            .pane_width,
+            .pane_height,
+            .cursor_x,
+            .cursor_y,
+            .history_size,
+            .alternate_on,
+            .window_layout,
+            .window_visible_layout,
+        },
+    };
+
+    /// The `resize_sample` fields, sent on every resize for every pane in
+    /// the session. A window's layout is needed once, and its visible
+    /// layout only while it's zoomed, so tmux prints them only for the
+    /// window's top-left pane and its zoomed (active) pane and leaves both
+    /// fields empty elsewhere.
+    const resize_sample_format = format: {
+        const pane_fields: Format = .{
+            .delim = ';',
+            .vars = resize_sample.vars[0 .. resize_sample.vars.len - 2],
+        };
+        break :format pane_fields.comptimeFormat() ++
+            ";#{?#{||:#{&&:#{window_zoomed_flag},#{pane_active}},#{&&:#{pane_at_top},#{pane_at_left}}}," ++
+            "#{window_layout};#{?window_zoomed_flag,#{window_visible_layout},},;}";
     };
 
     const list_windows: Format = .{
@@ -2960,13 +3668,16 @@ test "pane refresh preserves parser-only mouse modes" {
     pane.stream.nextSlice("\x1b[?9h\x1b[?1015h");
     pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
+    _ = try viewer.receivedPanePending(1, "");
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.urxvt, terminal.flags.mouse_format);
     try testing.expect(terminal.modes.get(.mouse_format_urxvt));
 
     pane.stream.nextSlice("\x1b[?1016h");
+    pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
+    _ = try viewer.receivedPanePending(1, "");
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.sgr_pixels, terminal.flags.mouse_format);
@@ -3887,8 +4598,14 @@ test "zoomed geometry follows visible layout" {
         .visible_layout = "b7de,83x44,0,0,1",
         .raw_flags = "*",
     } } });
-    try testing.expectEqual(1, actions.len);
+
+    // Zoom moved to pane 1 without a client resize from this Viewer, so both
+    // shown panes take the new geometry and are recaptured. tmux 3.1 can't
+    // pause a pane, so each recapture is the snapshot group itself.
+    try testing.expectEqual(3, actions.len);
     try testing.expect(actions[0] == .windows);
+    try testing.expect(actions[1] == .command);
+    try testing.expect(actions[2] == .command);
     try testing.expect(viewer.windows.items[0].is_zoomed);
     try testing.expectEqual(1, viewer.windows.items[0].active_pane_id);
     try testing.expectEqual(83, viewer.windows.items[0].width);
@@ -3901,8 +4618,8 @@ test "zoomed geometry follows visible layout" {
     try testing.expectEqual(pane_1, viewer.panes.get(1).?);
     try testing.expectEqual(terminal_0, &viewer.panes.get(0).?.terminal_owner.terminal);
     try testing.expectEqual(terminal_1, &viewer.panes.get(1).?.terminal_owner.terminal);
-    try testing.expectEqual(Viewer.Pane.Phase.live, pane_0.phase);
-    try testing.expectEqual(Viewer.Pane.Phase.live, pane_1.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane_0.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane_1.phase);
 
     const successor_actions = viewer.next(.{ .tmux = .{ .layout_change = .{
         .window_id = 0,
@@ -3992,8 +4709,14 @@ test "layout change" {
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expect(v.panes.contains(0));
                     try testing.expect(v.panes.contains(2));
-                    // Commands should be queued for the new pane (4 capture-pane + 1 pane_state)
-                    try testing.expectEqual(5, v.command_queue.len());
+                    // Commands should be queued for the new pane (4
+                    // capture-pane + 1 pane_state), and pane 0, which the
+                    // split resized, is recaptured starting with a pause.
+                    try testing.expectEqual(6, v.command_queue.len());
+                    try testing.expectEqual(
+                        Viewer.Pane.Phase.refresh_pausing,
+                        v.panes.get(0).?.phase,
+                    );
                     try testing.expectEqual(1, v.untracked_utf8.get(99).?.len);
                 }
             }).check,
@@ -4685,6 +5408,14 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
         1,
         "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;8;0;one",
     );
+
+    // The shown terminal changes only once the whole snapshot is in.
+    try testing.expectEqual(10, pane_1.terminal_owner.terminal.cols);
+    const kept_contents = try pane_1.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(kept_contents);
+    try testing.expectEqualStrings("stale-one", kept_contents);
+
+    try testing.expect(try viewer.receivedPanePending(1, ""));
     try testing.expectEqual(12, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(3, pane_1.terminal_owner.terminal.rows);
     try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
@@ -4710,6 +5441,354 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
         2,
         "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;3;8;1;two",
     );
+    try testing.expect(try viewer.receivedPanePending(2, ""));
     try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
     try testing.expectEqual(4, pane_2.terminal_owner.terminal.rows);
+}
+
+fn testResizeWindow(id: usize, layout_str: []const u8, active: bool) !Viewer.Window {
+    var arena = ArenaAllocator.init(testing.allocator);
+    errdefer arena.deinit();
+    const layout = try Layout.parseWithChecksum(arena.allocator(), layout_str);
+    return .{
+        .id = id,
+        .name = "",
+        .width = layout.width,
+        .height = layout.height,
+        .is_zoomed = false,
+        .is_active = active,
+        .active_pane_id = 0,
+        .layout_arena = arena.state,
+        .layout = layout,
+        .visible_layout = layout,
+    };
+}
+
+fn testResizePane(
+    viewer: *Viewer,
+    id: usize,
+    rows: size.CellCountInt,
+    bytes: []const u8,
+) !*Viewer.Pane {
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
+        .cols = 20,
+        .rows = rows,
+        .max_scrollback_bytes = 1_000_000,
+    });
+    pane.phase = .live;
+    pane.layout_cols = 20;
+    pane.layout_rows = rows;
+    viewer.panes.put(testing.allocator, id, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+    pane.stream.nextSlice(bytes);
+    return pane;
+}
+
+const TestAcceptResize = struct {
+    pub fn submitClientResize(_: @This(), members: []const []const u8) !void {
+        try testing.expectEqual(3, members.len);
+        try testing.expect(std.mem.startsWith(u8, members[0], "list-panes -s -F '#{pane_id};"));
+        try testing.expect(std.mem.startsWith(u8, members[1], "refresh-client -C "));
+        try testing.expectEqualStrings(members[0], members[2]);
+    }
+};
+
+fn testComplete(viewer: *Viewer, body: []const u8) []const Viewer.Action {
+    return viewer.next(.{ .command_complete = .{ .success = body } });
+}
+
+fn testOutput(viewer: *Viewer, pane_id: usize, comptime data: []const u8) void {
+    var buffer: [data.len]u8 = data[0..data.len].*;
+    _ = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = pane_id, .data = &buffer } } });
+}
+
+fn testCommandWith(actions: []const Viewer.Action, member: []const u8) ?Viewer.CommandGroup {
+    for (actions) |action| switch (action) {
+        .command => |group| for (group.members) |m| {
+            if (std.mem.eql(u8, m, member)) return group;
+        },
+        else => {},
+    };
+    return null;
+}
+
+test "client resize applies tmux's row rules in place" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(
+        &viewer,
+        1,
+        10,
+        "L0\r\nL1\r\nL2\r\nL3\r\nL4\x1b[7;1HF6\r\nF7\r\nF8\r\nF9\x1b[6;1H",
+    );
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+
+    // A size asked for while the resize is in flight waits for its reply.
+    try viewer.setClientSize(.{ .columns = 20, .rows = 10 }, TestAcceptResize{});
+    try testing.expectEqual(Viewer.ClientSize{ .columns = 20, .rows = 10 }, viewer.resize_pending.?);
+
+    _ = testComplete(&viewer, "%1;20;10;0;5;0;0;9ede,20x10,0,0,1;9ede,20x10,0,0,1");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%1;20;6;0;5;0;0;f15e,20x6,0,0,1;f15e,20x6,0,0,1");
+
+    // tmux deleted the four rows below the cursor and moved nothing into
+    // history; the mirror matches.
+    const t = &pane.terminal_owner.terminal;
+    try testing.expectEqual(6, t.rows);
+    try testing.expectEqual(0, resize.localHistory(t));
+    const contents = try t.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("L0\nL1\nL2\nL3\nL4", contents);
+    try testing.expect(!pane.stale);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+
+    // The pending size goes out with the reply's actions.
+    try testing.expect(testCommandWith(actions, "refresh-client -C 20x10") != null);
+    try testing.expect(viewer.resize_inflight != null);
+    try testing.expect(viewer.resize_pending == null);
+}
+
+test "client resize keeps panes in place when tmux's layout notifications follow the reply" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", false));
+    try viewer.windows.append(testing.allocator, try testResizeWindow(2, "9edf,20x10,0,0,2", true));
+    const hidden = try testResizePane(&viewer, 1, 10, "a");
+    const shown = try testResizePane(&viewer, 2, 10, "b");
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%1;20;10;1;0;0;0;9ede,20x10,0,0,1;9ede,20x10,0,0,1\n" ++
+        "%2;20;10;1;0;0;0;9edf,20x10,0,0,2;9edf,20x10,0,0,2");
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "%1;20;6;1;0;0;0;f15e,20x6,0,0,1;f15e,20x6,0,0,1\n" ++
+        "%2;20;6;1;0;0;0;f15f,20x6,0,0,2;f15f,20x6,0,0,2");
+
+    // tmux's notification for each window arrives after the reply, the
+    // shown window's last.
+    const first = viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = 1,
+        .layout = "f15e,20x6,0,0,1",
+        .visible_layout = "f15e,20x6,0,0,1",
+        .raw_flags = "-",
+    } } });
+    for (first) |action| try testing.expect(action != .command);
+    for ([_]*Viewer.Pane{ hidden, shown }) |pane| {
+        try testing.expect(!pane.stale);
+        try testing.expectEqual(6, pane.terminal_owner.terminal.rows);
+    }
+}
+
+test "client resize follows panes whose sample line has no layout" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(
+        1,
+        "b972,20x10,0,0[20x5,0,0,1,20x4,0,6,2]",
+        true,
+    ));
+    const top = try testResizePane(&viewer, 1, 5, "");
+    const bottom = try testResizePane(&viewer, 2, 4, "");
+
+    // tmux prints the window's layout once, on its top-left pane.
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%1;20;5;0;0;0;0;b972,20x10,0,0[20x5,0,0,1,20x4,0,6,2];\n" ++
+        "%2;20;4;0;0;0;0;;");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%1;20;3;0;0;0;0;f805,20x6,0,0[20x3,0,0,1,20x2,0,4,2];\n" ++
+        "%2;20;2;0;0;0;0;;");
+
+    for (actions) |action| try testing.expect(action != .command);
+    try testing.expectEqual(3, top.terminal_owner.terminal.rows);
+    try testing.expectEqual(2, bottom.terminal_owner.terminal.rows);
+    try testing.expect(!top.stale and !bottom.stale);
+    try testing.expectEqual(6, viewer.windows.items[0].height);
+    try testing.expect(!viewer.windows.items[0].is_zoomed);
+}
+
+test "client resize recaptures panes whose output may have passed the reply" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    try viewer.windows.append(testing.allocator, try testResizeWindow(2, "9edf,20x10,0,0,2", false));
+    const shown = try testResizePane(&viewer, 1, 10, "");
+    const hidden = try testResizePane(&viewer, 2, 10, "");
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    testOutput(&viewer, 1, "a");
+    testOutput(&viewer, 2, "b");
+    _ = testComplete(&viewer, "%1;20;10;1;0;0;0;9ede,20x10,0,0,1;9ede,20x10,0,0,1\n" ++
+        "%2;20;10;1;0;0;0;9edf,20x10,0,0,2;9edf,20x10,0,0,2");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%1;20;6;1;0;0;0;f15e,20x6,0,0,1;f15e,20x6,0,0,1\n" ++
+        "%2;20;6;1;0;0;0;f15f,20x6,0,0,2;f15f,20x6,0,0,2");
+
+    // Both panes printed during the resize, so either could be out of order.
+    // The shown pane is recaptured now; the hidden one when it's shown.
+    try testing.expect(testCommandWith(actions, "refresh-client -A '%1:pause'") != null);
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, shown.phase);
+    try testing.expectEqual(Viewer.Pane.Phase.live, hidden.phase);
+    try testing.expect(hidden.stale);
+    try testing.expectEqual(6, hidden.terminal_owner.terminal.rows);
+
+    const switched = viewer.next(.{ .tmux = .{ .session_window_changed = .{
+        .session_id = viewer.session_id,
+        .window_id = 2,
+    } } });
+    try testing.expect(testCommandWith(switched, "refresh-client -A '%2:pause'") != null);
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, hidden.phase);
+}
+
+test "paused recapture replays output that postdates the snapshot" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    const pane = try testResizePane(&viewer, 1, 3, "stale");
+
+    const AcceptPause = struct {
+        pub fn submitPaneRefresh(_: @This(), members: []const []const u8) !void {
+            try testing.expectEqual(1, members.len);
+            try testing.expectEqualStrings("refresh-client -A '%1:pause'", members[0]);
+        }
+    };
+    try viewer.refreshPane(1, AcceptPause{});
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, pane.phase);
+
+    // Output before the pause took effect is in the snapshot.
+    testOutput(&viewer, 1, "early");
+    const paused = testComplete(&viewer, "");
+    const group = testCommandWith(paused, "refresh-client -A '%1:continue'").?;
+    try testing.expectEqual(6, group.members.len);
+    try testing.expect(std.mem.startsWith(u8, group.members[0], "display-message -p -t %1 "));
+    try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane.phase);
+
+    // Output after it postdates the snapshot, even if it arrives first.
+    testOutput(&viewer, 1, "LATE");
+    _ = testComplete(&viewer, "%1;20;3;4;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "SNAP");
+
+    // The shown terminal keeps its contents until the snapshot is whole.
+    {
+        const kept = try pane.terminal_owner.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(kept);
+        try testing.expectEqualStrings("stale", kept);
+    }
+
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "");
+
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    const contents = try pane.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("SNAPLATE", contents);
+}
+
+const TestAcceptPause = struct {
+    pub fn submitPaneRefresh(_: @This(), members: []const []const u8) !void {
+        try testing.expectEqual(1, members.len);
+        try testing.expectEqualStrings("refresh-client -A '%1:pause'", members[0]);
+    }
+};
+
+const test_alternate_state =
+    "%1;20;3;0;0;1;block;;0;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;;vim;/tmp";
+
+/// Recapture pane 1 (3 rows) while its program is on the alternate screen,
+/// up to the snapshot, and return the pane.
+fn testAlternateRecapture(viewer: *Viewer) !*Viewer.Pane {
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(viewer, 1, 3, "stale");
+    try viewer.refreshPane(1, TestAcceptPause{});
+    _ = testComplete(viewer, "");
+    return pane;
+}
+
+fn testFinishAlternateRecapture(viewer: *Viewer, saved: []const u8) []const Viewer.Action {
+    _ = testComplete(viewer, test_alternate_state);
+    _ = testComplete(viewer, "");
+    _ = testComplete(viewer, saved);
+    _ = testComplete(viewer, "ALT");
+    return testComplete(viewer, "");
+}
+
+test "the normal screen tmux kept at another height is recaptured when the program leaves" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testAlternateRecapture(&viewer);
+    _ = testFinishAlternateRecapture(&viewer, "N0\nN1");
+    _ = testComplete(&viewer, "");
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expect(pane.primary_stale);
+    try testing.expect(!pane.stale);
+
+    var leave = "\x1b[?1049l".*;
+    const left = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &leave } } });
+    try testing.expect(testCommandWith(left, "refresh-client -A '%1:pause'") != null);
+    try testing.expect(!pane.primary_stale);
+}
+
+test "the normal screen tmux kept at the pane's size needs no recapture" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testAlternateRecapture(&viewer);
+    _ = testFinishAlternateRecapture(&viewer, "N0\nN1\nN2");
+    _ = testComplete(&viewer, "");
+    try testing.expect(!pane.primary_stale);
+
+    var leave = "\x1b[?1049l".*;
+    const left = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &leave } } });
+    for (left) |action| try testing.expect(action != .command);
+    try testing.expect(!pane.stale);
+    const contents = try pane.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("N0\nN1\nN2", contents);
+}
+
+test "leaving the alternate screen in the replayed output recaptures at once" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testAlternateRecapture(&viewer);
+    testOutput(&viewer, 1, "\x1b[?1049l");
+    const pending = testFinishAlternateRecapture(&viewer, "N0\nN1");
+    try testing.expect(testCommandWith(pending, "refresh-client -A '%1:pause'") != null);
+    try testing.expect(!pane.primary_stale);
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, pane.phase);
+}
+
+test "pane state restores a cursor waiting to wrap" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    const pane = try testResizePane(&viewer, 1, 3, "");
+
+    const Accept = struct {
+        pub fn submitPaneRefresh(_: @This(), _: []const []const u8) !void {}
+    };
+    try viewer.refreshPane(1, Accept{});
+    _ = testComplete(&viewer, "%1;20;3;20;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "");
+    _ = testComplete(&viewer, "XXXXXXXXXXXXXXXXXXXX\r\nZ");
+    _ = testComplete(&viewer, "");
+
+    testOutput(&viewer, 1, "Y");
+    const contents = try pane.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("XXXXXXXXXXXXXXXXXXXX\nY", contents);
 }

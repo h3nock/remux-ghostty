@@ -1640,10 +1640,12 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_feed(
     const uint8_t*,
     size_t);
 
-// The returned outbound bytes are borrowed until the next feed, enqueue,
-// consume, or free call. Outbound read inside an action callback is valid only
-// for that callback and is invalidated immediately by a callback enqueue; the
-// active feed may also enqueue after the callback returns. Hosts should
+// The returned outbound bytes are borrowed until the next feed, consume, or
+// free call, or the next call that queues commands or input: enqueue, pane
+// input, refresh_pane, refresh_window_pane_metadata, or set_client_size.
+// Outbound read inside an action callback is valid only for that callback and
+// is invalidated immediately by a callback enqueue; the active feed may also
+// enqueue after the callback returns. Hosts should
 // normally read outbound after feed returns. A transport may consume a
 // successfully written prefix and retrieve the remaining suffix again.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_outbound(
@@ -1705,20 +1707,34 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_literal_input_tr
 // Rehydrates one live pane into its existing canonical terminal. This does not
 // select, zoom, or otherwise change tmux presentation. Enqueue any required
 // presentation command immediately before this call; both operations remain in
-// one ordered outbound buffer. Successful submission makes the pane HYDRATING
-// immediately. No PANE_CHANGED action is emitted for that pane while it is
-// hydrating; its next PANE_CHANGED action reports deterministic completion with
-// the same terminal identity, refreshed grid/screens/scrollback/parser state,
-// and the pane geometry captured by the refresh group. Dynamic OSC colors,
-// palette entries, title, pwd, and live protocol/mode state not represented by
-// tmux pane state are preserved. If an in-flight refresh member fails, no false
-// PANE_CHANGED is emitted and the pane remains HYDRATING until authoritative
-// topology removes it. Other panes and independent commands remain usable.
+// one ordered outbound buffer. The pane stays LIVE and its terminal keeps its
+// current contents while the refresh is in flight; no PANE_CHANGED action is
+// emitted for it until the next one reports completion. The refreshed
+// grid/screens/scrollback/parser state and the pane geometry captured by the
+// refresh group replace the contents in one step, with the same terminal
+// identity. Dynamic OSC colors, palette entries, title, pwd, and live
+// protocol/mode state not represented by tmux pane state are preserved. The
+// client also refreshes panes on its own when tmux resized them in a way their
+// terminals can't follow. If an in-flight refresh member fails, no false
+// PANE_CHANGED is emitted and the terminal keeps its last contents until
+// authoritative topology removes the pane. Other panes and independent
+// commands remain usable.
 // NOT_READY means the client or pane cannot accept a refresh yet; PANE_UNKNOWN
 // means the pane is not tracked.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_refresh_pane(
     ghostty_tmux_client_t,
     uint64_t);
+
+// Resizes the control client with refresh-client -C, bracketed by pane samples
+// in one command line. When the reply arrives each pane's terminal repeats
+// tmux's resize with tmux's own row rules, and a pane it can't follow exactly
+// is recaptured from tmux. While a resize or recapture is in flight only the
+// newest size is kept and sent afterwards. NOT_READY means the client cannot
+// accept commands yet; INVALID_INPUT means a zero dimension.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
+    ghostty_tmux_client_t,
+    uint16_t,
+    uint16_t);
 
 // Refreshes current command and path metadata for every pane in one known
 // window using one list-panes command. Terminal contents, pane phases, and tmux
