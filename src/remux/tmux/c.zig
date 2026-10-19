@@ -475,6 +475,17 @@ export fn ghostty_tmux_client_refresh_pane(
     return .ok;
 }
 
+export fn ghostty_tmux_client_set_client_size(
+    client: ?*Client,
+    columns: u16,
+    rows: u16,
+) Result {
+    const value = client orelse return .invalid_input;
+    value.control.setClientSize(.{ .columns = columns, .rows = rows }) catch |err|
+        return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_refresh_window_pane_metadata(
     client: ?*Client,
     window_id: u64,
@@ -1224,7 +1235,7 @@ test "tmux C client pane refresh boundary" {
         ghostty_tmux_client_refresh_pane(&client, 0),
     );
     try testing.expectEqual(
-        ControlClient.PanePhase.hydrating,
+        ControlClient.PanePhase.live,
         client.control.panePhase(0).?,
     );
 

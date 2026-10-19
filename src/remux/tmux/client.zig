@@ -84,8 +84,9 @@ pub const ControlClient = struct {
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
     /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`,
-    /// `sendPaneInputTracked`, `sendPaneLiteralInputTracked`, or
-    /// `consumeOutbound` call.
+    /// `sendPaneInputTracked`, `sendPaneLiteralInputTracked`, `refreshPane`,
+    /// `refreshWindowPaneMetadata`, `setClientSize`, or `consumeOutbound`
+    /// call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -123,8 +124,10 @@ pub const ControlClient = struct {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
         return .{
             .phase = switch (pane.phase) {
-                .initial_hydrating, .refreshing => .hydrating,
-                .live => .live,
+                .initial_hydrating => .hydrating,
+
+                // A recapture replaces the contents only once complete.
+                .refresh_pausing, .refreshing, .live => .live,
             },
             .current_command = pane.current_command,
             .current_path = pane.current_path,
@@ -170,6 +173,35 @@ pub const ControlClient = struct {
             }
         };
         try self.viewer.refreshPane(pane_id, Submitter{
+            .channel = &self.channel,
+        });
+    }
+
+    /// Resize the control client. Each pane's mirror follows tmux's resize
+    /// with tmux's own row rules when the reply arrives; panes it can't
+    /// follow exactly are recaptured. While a resize or recapture is in
+    /// flight only the newest size is kept and sent afterwards.
+    pub fn setClientSize(
+        self: *ControlClient,
+        client_size: Viewer.ClientSize,
+    ) Error!void {
+        try self.validateCommandAdmission();
+
+        const Submitter = struct {
+            channel: *channel_pkg.Channel,
+
+            pub fn submitClientResize(
+                value: @This(),
+                members: []const []const u8,
+            ) channel_pkg.Channel.EnqueueError!void {
+                try value.channel.enqueueCommandGroupFrom(
+                    .viewer,
+                    members,
+                    null,
+                );
+            }
+        };
+        try self.viewer.setClientSize(client_size, Submitter{
             .channel = &self.channel,
         });
     }
@@ -1171,7 +1203,7 @@ test "control client pane refresh admission and command order" {
 
     _ = try client.enqueueCommand("select-pane -Z -t %0");
     try client.refreshPane(0);
-    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
     try testing.expectError(error.NotReady, client.refreshPane(0));
 
     const outbound = client.outboundBytes();
@@ -1305,22 +1337,19 @@ test "control client pane refresh preserves identity and output cut" {
     actions.records.clearRetainingCapacity();
     try testing.expectEqualStrings("nvim", client.paneInfo(0).?.current_command);
     try testing.expectEqualStrings("/work/editor", client.paneInfo(0).?.current_path);
-    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    // The pane keeps its contents until the whole snapshot has arrived.
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
     const same = client.retainPaneTerminal(0).?;
     defer same.release();
     try testing.expectEqual(retained, same);
     {
         retained.mutex.lockUncancelable(retained.terminal.io());
         defer retained.mutex.unlock(retained.terminal.io());
-        try testing.expectEqual(100, retained.terminal.cols);
-        try testing.expectEqual(40, retained.terminal.rows);
-        const blank = try retained.terminal.plainString(testing.allocator);
-        defer testing.allocator.free(blank);
-        try testing.expectEqualStrings("", blank);
-        try testing.expectEqualStrings("pane title", retained.terminal.getTitle().?);
-        try testing.expectEqualStrings("file:///work", retained.terminal.getPwd().?);
-        try testing.expectEqual(@as(u8, 10), retained.terminal.colors.background.get().?.r);
-        try testing.expectEqual(@as(u8, 13), retained.terminal.colors.palette.current[3].r);
+        try testing.expectEqual(83, retained.terminal.cols);
+        try testing.expectEqual(44, retained.terminal.rows);
+        const kept = try retained.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(kept);
+        try testing.expectEqualStrings("before", kept);
     }
 
     try client.feed(
@@ -1339,9 +1368,15 @@ test "control client pane refresh preserves identity and output cut" {
     try testing.expectEqual(1, actions.records.items.len);
     retained.mutex.lockUncancelable(retained.terminal.io());
     defer retained.mutex.unlock(retained.terminal.io());
+    try testing.expectEqual(100, retained.terminal.cols);
+    try testing.expectEqual(40, retained.terminal.rows);
     const contents = try retained.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("beforeduringafter", contents);
+    try testing.expectEqualStrings("pane title", retained.terminal.getTitle().?);
+    try testing.expectEqualStrings("file:///work", retained.terminal.getPwd().?);
+    try testing.expectEqual(@as(u8, 10), retained.terminal.colors.background.get().?.r);
+    try testing.expectEqual(@as(u8, 13), retained.terminal.colors.palette.current[3].r);
 }
 
 test "control client refresh failure is pane local" {
@@ -1357,7 +1392,7 @@ test "control client refresh failure is pane local" {
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed("%begin 9 9 1\npane gone\n%error 9 9 1\n", &actions);
     try testing.expectEqual(0, actions.records.items.len);
-    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
     try testing.expect(client.viewer.command_queue.empty());
     try testing.expectEqual(0, client.viewer.sent_command_count);
 

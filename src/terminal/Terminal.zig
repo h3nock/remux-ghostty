@@ -156,6 +156,12 @@ flags: packed struct {
     dirty: Dirty = .{},
 } = .{},
 
+/// Rows scrolled off the top of a scroll region that starts below the first
+/// row, on a screen with scrollback. They don't enter scrollback here, but
+/// tmux moves them into its history, so a tmux mirror watches this count to
+/// tell when its history no longer matches.
+region_rows_scrolled_out: u64 = 0,
+
 /// The various color configurations a terminal maintains and that can
 /// be set dynamically via OSC, with defaults usually coming from a
 /// configuration.
@@ -2424,6 +2430,10 @@ pub fn index(self: *Terminal) !void {
             return;
         }
 
+        if (self.scrolling_region.top != 0 and !screen.no_scrollback) {
+            self.region_rows_scrolled_out +%= 1;
+        }
+
         // Slow path for left and right scrolling region margins.
         // scrollUp handles the kitty image adjustment itself.
         if (self.scrolling_region.left != 0 or
@@ -2747,6 +2757,11 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         self.screens.active.cursorAbsolute(0, self.scrolling_region.bottom);
         for (0..adjusted_count) |_| try self.screens.active.cursorScrollAbove();
         return;
+    }
+
+    if (self.scrolling_region.top != 0 and !self.screens.active.no_scrollback) {
+        const region_height = self.scrolling_region.bottom - self.scrolling_region.top + 1;
+        self.region_rows_scrolled_out +%= @min(count, region_height);
     }
 
     // Move to the top of the scroll region
