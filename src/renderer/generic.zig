@@ -51,11 +51,12 @@ const log = std.log.scoped(.generic_renderer);
 fn visibleRenderGrid(
     cells_size: renderer.GridSize,
     state: *const terminal.RenderState,
+    render_rows: terminal.size.CellCountInt,
 ) renderer.GridSize {
     var result = cells_size;
     if (result.columns == state.cols and
-        result.rows == state.render_rows and
-        state.render_rows > state.rows)
+        result.rows == render_rows and
+        render_rows > state.rows)
     {
         result.rows = state.rows;
     }
@@ -73,12 +74,49 @@ fn screenSizeUniformInputs(
     size: renderer.Size,
     cells_size: renderer.GridSize,
     state: *const terminal.RenderState,
+    render_rows: terminal.size.CellCountInt,
 ) ScreenSizeUniformInputs {
     return .{
         .screen = size.screen,
         .padding = size.padding,
         .cell = size.cell,
-        .visible_grid = visibleRenderGrid(cells_size, state),
+        .visible_grid = visibleRenderGrid(cells_size, state, render_rows),
+    };
+}
+
+/// The overscan rows to request below the viewport. Fractional scrolling
+/// draws the row below the viewport, so request it once scrolled by part of
+/// a row and keep it until the viewport is back at the bottom: crossing a
+/// whole row mid-scroll then keeps the row instead of freeing and rebuilding
+/// it. A renderer that never scrolls by part of a row requests none, as
+/// upstream does.
+fn overscanBelow(
+    requested: terminal.size.CellCountInt,
+    scroll_cell_offset: f64,
+    at_bottom: bool,
+) terminal.size.CellCountInt {
+    if (scroll_cell_offset > 0) return 1;
+    return if (at_bottom) 0 else requested;
+}
+
+/// RenderState reports no cursor in its overscan rows. Fractional scrolling
+/// draws the overscan row below the viewport, so while that row is drawn,
+/// report a cursor in it the way RenderState reports one in the viewport.
+fn cursorInRowBelow(
+    state: *const terminal.RenderState,
+    screen: *terminal.Screen,
+) ?terminal.RenderState.Cursor.Viewport {
+    if (state.cursor.viewport != null or state.overscan.below == 0) return null;
+    const pin = state.row_data.items(.pin)[state.viewportStart() + state.rows];
+    if (pin.node != screen.cursor.page_pin.node or
+        pin.y != screen.cursor.page_pin.y) return null;
+    return .{
+        .x = screen.cursor.x,
+        .y = state.rows,
+        .wide_tail = if (screen.cursor.x > 0)
+            screen.cursorCellLeft(1).wide == .wide
+        else
+            false,
     };
 }
 
@@ -300,6 +338,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The render state we update per loop.
         terminal_state: terminal.RenderState = .empty,
+
+        /// The rows drawn from `terminal_state`: its viewport rows, plus
+        /// its overscan row below while scrolled by part of a row.
+        render_rows: terminal.size.CellCountInt = 0,
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -1480,11 +1522,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
-                try self.terminal_state.beginUpdateWithExtraRows(
+                //
+                // Set the overscan request before every update: the state
+                // can be reset to empty (see max_terminal_state_frame_count).
+                self.terminal_state.overscan_request = .{
+                    .below = overscanBelow(
+                        self.terminal_state.overscan_request.below,
+                        scroll_cell_offset,
+                        scrollbar.offset >= max_scroll_row,
+                    ),
+                };
+                try self.terminal_state.beginUpdate(
                     self.alloc,
                     state.terminal,
-                    if (scroll_cell_offset > 0) 1 else 0,
                 );
+                self.render_rows = self.terminal_state.rows;
+                if (scroll_cell_offset > 0) {
+                    self.render_rows += self.terminal_state.overscan.below;
+                    if (cursorInRowBelow(
+                        &self.terminal_state,
+                        state.terminal.screens.active,
+                    )) |viewport| self.terminal_state.cursor.viewport = viewport;
+                }
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1534,7 +1593,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // an image.
                 if (self.images.kittyRequiresUpdate(
                     state.terminal,
-                    self.terminal_state.render_rows,
+                    self.render_rows,
                 )) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
@@ -1547,7 +1606,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .width = self.grid_metrics.cell_width,
                             .height = self.grid_metrics.cell_height,
                         },
-                        self.terminal_state.render_rows,
+                        self.render_rows,
                     );
                 }
 
@@ -1880,6 +1939,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size,
                     self.cells.size,
                     &self.terminal_state,
+                    self.render_rows,
                 ),
             )) self.updateScreenSizeUniforms();
 
@@ -2308,6 +2368,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.size,
                 self.cells.size,
                 &self.terminal_state,
+                self.render_rows,
             );
             const terminal_size = inputs.screen.subPadding(inputs.padding);
 
@@ -2675,12 +2736,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const state: *terminal.RenderState = &self.terminal_state;
 
             const grid_size_diff =
-                self.cells.size.rows != state.render_rows or
+                self.cells.size.rows != self.render_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.render_rows;
+                new_size.rows = self.render_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2728,7 +2789,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.render_rows,
+                self.render_rows,
                 self.cells.size.rows,
             );
 
@@ -3748,21 +3809,19 @@ test "visible render grid preserves asynchronous cell geometry" {
     var state: terminal.RenderState = .empty;
     state.rows = 24;
     state.cols = 80;
-    state.render_rows = 25;
 
     try testing.expectEqualDeep(
         renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 25 }, &state),
+        visibleRenderGrid(.{ .columns = 80, .rows = 25 }, &state, 25),
     );
     try testing.expectEqualDeep(
         renderer.GridSize{ .columns = 100, .rows = 30 },
-        visibleRenderGrid(.{ .columns = 100, .rows = 30 }, &state),
+        visibleRenderGrid(.{ .columns = 100, .rows = 30 }, &state, 25),
     );
 
-    state.render_rows = state.rows;
     try testing.expectEqualDeep(
         renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state),
+        visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state, state.rows),
     );
 }
 
@@ -3777,12 +3836,12 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     var state: terminal.RenderState = .empty;
     state.rows = 22;
     state.cols = 80;
-    state.render_rows = 22;
 
     const before = screenSizeUniformInputs(
         size,
         .{ .columns = 80, .rows = 22 },
         &state,
+        22,
     );
     const before_padding = before.screen.blankPadding(
         before.padding,
@@ -3792,11 +3851,11 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     try testing.expectEqual(@as(u32, 280), before_padding.bottom);
 
     state.rows = 36;
-    state.render_rows = 36;
     const after = screenSizeUniformInputs(
         size,
         .{ .columns = 80, .rows = 36 },
         &state,
+        36,
     );
     const after_padding = after.screen.blankPadding(
         after.padding,
@@ -3812,17 +3871,117 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
             size,
             .{ .columns = 80, .rows = 36 },
             &state,
+            36,
         ),
     ));
-    state.render_rows = 37;
     try testing.expect(std.meta.eql(
         after,
         screenSizeUniformInputs(
             size,
             .{ .columns = 80, .rows = 37 },
             &state,
+            37,
         ),
     ));
+}
+
+test "cursor in the overscan row below the viewport matches RenderState's" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A plain prompt, then a cursor on the tail of a wide character, so the
+    // copied wide_tail logic is compared with RenderState's own.
+    for ([_][]const u8{ "$ ", "$ \u{4e2d}\x1b[D" }) |prompt| {
+        var t = try Terminal.init(testing.io, alloc, .{
+            .cols = 10,
+            .rows = 5,
+            .max_scrollback_bytes = 1_000_000,
+        });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        for (0..20) |_| stream.nextSlice("line\r\n");
+        stream.nextSlice(prompt);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        state.overscan_request = .{ .below = 1 };
+
+        // At the bottom, RenderState reports the cursor in the viewport.
+        try state.update(alloc, &t);
+        const expected = state.cursor.viewport.?;
+        try testing.expect(cursorInRowBelow(&state, t.screens.active) == null);
+
+        // One row up, the cursor's row is the overscan row below the
+        // viewport, where RenderState reports no cursor.
+        t.scrollViewport(.{ .delta = -1 });
+        try state.update(alloc, &t);
+        try testing.expectEqual(1, state.overscan.below);
+        try testing.expect(state.cursor.viewport == null);
+        const below = cursorInRowBelow(&state, t.screens.active).?;
+        try testing.expectEqual(state.rows, below.y);
+        try testing.expectEqual(expected.x, below.x);
+        try testing.expectEqual(expected.wide_tail, below.wide_tail);
+
+        // Two rows up, the cursor is past the overscan row.
+        t.scrollViewport(.{ .delta = -1 });
+        try state.update(alloc, &t);
+        try testing.expect(cursorInRowBelow(&state, t.screens.active) == null);
+    }
+}
+
+test "held overscan row survives whole-row offsets without reallocating" {
+    const testing = std.testing;
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = tracking.allocator();
+
+    var t = try Terminal.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 5,
+        .max_scrollback_bytes = 1_000_000,
+    });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..20) |_| stream.nextSlice("line\r\n");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    t.scrollViewport(.{ .delta = -3 });
+
+    // Scrolled by part of a row, the row below is captured.
+    state.overscan_request.below = overscanBelow(0, 0.5, false);
+    try state.update(alloc, &t);
+    try testing.expectEqual(1, state.overscan.below);
+
+    // Crossing whole rows mid-scroll keeps it, without allocating or freeing.
+    const allocations = tracking.allocations;
+    const deallocations = tracking.deallocations;
+    for ([_]f64{ 0, 0.25, 0, 0.75 }) |offset| {
+        state.overscan_request.below = overscanBelow(
+            state.overscan_request.below,
+            offset,
+            false,
+        );
+        try state.update(alloc, &t);
+        try testing.expectEqual(1, state.overscan.below);
+    }
+    try testing.expectEqual(allocations, tracking.allocations);
+    try testing.expectEqual(deallocations, tracking.deallocations);
+
+    // Back at the bottom it's dropped, so only the viewport is captured.
+    t.scrollViewport(.bottom);
+    state.overscan_request.below = overscanBelow(
+        state.overscan_request.below,
+        0,
+        true,
+    );
+    try state.update(alloc, &t);
+    try testing.expectEqual(0, state.overscan.below);
+    try testing.expectEqual(@as(usize, state.rows), state.row_data.len);
+
+    // A renderer that never scrolls by part of a row requests none.
+    try testing.expectEqual(0, overscanBelow(0, 0, false));
 }
 
 test "scrollbar delivery remains dirty until accepted" {
