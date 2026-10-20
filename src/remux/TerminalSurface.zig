@@ -172,6 +172,7 @@ const ScrollPosition = struct {
 
 pub const Options = struct {
     alloc: std.mem.Allocator,
+    device: *rendererpkg.Device,
     config: *const configpkg.Config,
     rt_surface: *apprt.RendererSurface,
     shared: *Shared,
@@ -234,6 +235,7 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
 
     const metrics = try self.runtime.init(.{
         .alloc = opts.alloc,
+        .device = opts.device,
         .config = opts.config,
         .rt_surface = opts.rt_surface,
         .terminal = &shared.terminal,

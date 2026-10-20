@@ -445,8 +445,17 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         var prepared = try prepareLayout(app, config);
         defer prepared.deinit();
 
+        // Surfaces share the app's render device; the first one creates it.
+        // Embedded surfaces have no device options.
+        const device = app.core_app.device orelse device: {
+            const device: *renderer.Device = try .init(alloc, .{});
+            app.core_app.device = device;
+            break :device device;
+        };
+
         _ = try surface.core.init(.{
             .alloc = alloc,
+            .device = device,
             .config = &app.config,
             .rt_surface = &surface.renderer_surface,
             .shared = shared,
