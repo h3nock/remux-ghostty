@@ -563,6 +563,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if notification.object == nil {
             // Update our derived config
             self.derivedConfig = DerivedConfig(config)
+            syncRestoration(config)
 
             // If we have no surfaces in our window (is that possible?) then we update
             // our window appearance based on the root config. If we have surfaces, we
@@ -576,6 +577,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         /// Surface-level config will be updated in
         /// ``Ghostty/Ghostty/SurfaceView/derivedConfig`` then
         /// ``TerminalController/focusedSurfaceDidChange(to:)``
+    }
+
+    /// Updates the loaded window's restoration policy from the app configuration.
+    private func syncRestoration(_ config: Ghostty.Config) {
+        guard isWindowLoaded, let window else { return }
+        // Setting all three of these is required for restoration to work.
+        window.isRestorable = restorable && config.windowSaveState != "never"
+        window.restorationClass = TerminalWindowRestoration.self
+        window.identifier = .init(String(describing: TerminalWindowRestoration.self))
     }
 
     /// Update the accessory view of each tab according to the keyboard
@@ -1092,12 +1102,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // use whatever the latest app-level config is.
         let config = ghostty.config
 
-        // Setting all three of these is required for restoration to work.
-        window.isRestorable = restorable
-        if restorable {
-            window.restorationClass = TerminalWindowRestoration.self
-            window.identifier = .init(String(describing: TerminalWindowRestoration.self))
-        }
+        syncRestoration(config)
 
         // If we have only a single surface (no splits) and there is a default size then
         // we should resize to that default size.

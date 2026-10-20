@@ -43,7 +43,7 @@ pub const Operation = enum {
     osc_119,
 };
 
-/// Parse OSCs 4, 5, 10-19, 104, 110-119
+/// Parse OSCs 4, 5, 10-19, 104, 105, 110-119
 pub fn parse(parser: *Parser, terminator_ch: ?u8) ?*Command {
     const alloc = parser.alloc orelse {
         parser.state = .invalid;
@@ -70,6 +70,7 @@ pub fn parse(parser: *Parser, terminator_ch: ?u8) ?*Command {
         .@"18" => .osc_18,
         .@"19" => .osc_19,
         .@"104" => .osc_104,
+        .@"105" => .osc_105,
         .@"110" => .osc_110,
         .@"111" => .osc_111,
         .@"112" => .osc_112,

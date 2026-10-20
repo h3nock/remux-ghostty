@@ -52,6 +52,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+aredmondd
 arneshbanerjee
 arvin7liu
 athaapa
@@ -83,9 +84,12 @@ cespare
 charliie-dev
 chernetskyi
 chronologos
+clemg
 cmwetherell
+complexsplit
 crayxt
 craziestowl
+-creativision meatproxying
 cristeahub
 curtismoncoq
 -cznorth Automated advertising + likely AI communication
@@ -97,6 +101,9 @@ danneu
 danulqua
 dariogriffo
 dave92082
+davey-hughes
+davidhodge
+-davidpmclaughlin Refusing to follow AI policy and exhibit good faith behavior
 davidsanchez222
 deblasis
 dervedro
@@ -118,6 +125,7 @@ drepper
 dungdm93
 dzhlobo
 ekaterinepapava
+ekusiadadus
 elias8
 elitex45
 -enkr1
@@ -139,24 +147,30 @@ fornwall
 francescarpi
 francislata
 fru1tworld
+gaborbernat
 gadgetman6
 gagbo
 ghokun
 gmile
 gordonbondon
+-gotar No HITL
 gotenksin
 gpanders
 guilhermetk
 -guysoft LLM communication (likely automated)
 h3nock
+hackattack
 hakonhagland
 halosatrio
 heaths
 heddxh heddxh
+heitoraugustoln
 helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
+howdeploy
 hqnna
+huge
 hulet
 i999rri
 ibaios
@@ -188,6 +202,7 @@ kataokatsuki
 kawarimidoll
 kayleung
 kenvandine
+kgni
 khipp
 kierancanter
 kirwiisp
@@ -197,6 +212,7 @@ kloneets
 knu
 -kody-w
 konstantinhudyakov
+-kooshapari No HITL
 koranir
 korikhin
 kostich
@@ -208,18 +224,22 @@ lebdron
 lepips
 liby
 linustalacko
+locriani
 lonsagisawa
 lotheac
 louisunlimited
 luisnquin
 lynicis
 mac0ne
+maddythewisp
+magnussp
 mahnokropotkinvich
 marijagjorgjieva
 markdorison
 markhuot
 marler8997
 marrocco-simone
+-martzcode Repeated meatproxying in spite of prior warning
 masterflitzer
 matkotiric
 mattn
@@ -236,15 +256,18 @@ mistertea
 mitchellh
 miupa
 mjbommar
+mlabbe
 mohshami
 molechowski
 moonmao42
+moonward
 -morgengeluk Appears to be using AI inappropriately even after it was requested they abide by the AI policy (there is clear evidence of the person-in-the-loop not attempting to clean up AI generated text, and their AI disclosure itself reads like AI-generated text and shows no signs of remorse or intent to improve).
 mpatankar6
 mrconnorkenway
 mrmage
 mtak
 mustafa0x
+myleshen
 nagato-yuzuru
 natesmyth
 neo773
@@ -261,6 +284,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollieatkinson
 ollioddi
 oshdubh
 otomn
@@ -281,25 +305,32 @@ pouwerkerk
 poweruser64
 prakhar54-byte
 preiter93
+pressatojump
 prihlop
 priyans-hu
 pssalman
+pugma
 puzza007
+pyre909
 qappell
 quinnypig
 qwerasd205
 radicaltray
 ragnoroct
 raphamorim
+rayzerrek
+-rebecca-bell-2001 automated vomit
 reo101
 rewdy
 rgehan
 rhodes-b
 rightaditya
+-riskirills66 Demonstrated indefensibly poor taste, judgement and AI steering capabilities
 rjwittams
 rkoten
 rmengelbrecht
 rmunn
+robmorgan
 rockorager
 ronijacobson
 rpfaeffle
@@ -320,6 +351,7 @@ silveirapf
 simonbcn
 slowdub
 slsrepo
+stepankandrushin
 steven-tk
 sunshine-syz
 svector-anu
@@ -370,3 +402,4 @@ zeshi09
 zlitus
 -zorzysty Meatproxying
 zubb
+zzznu

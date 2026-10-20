@@ -204,7 +204,6 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         clipView.needsLayout = true
         accessoryView.needsLayout = true
 
-#if compiler(>=6.4)
         if #available(macOS 27.0, *) {
             // Add some delay to cover the case where:
             // AppKit resets the style after exiting fullscreen
@@ -212,7 +211,6 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
                 self?.reduceTabBarBackgroundGoldenGate()
             }
         }
-#endif
 
         // Setup an observer for the NSTabBar frame. When system appearance changes or
         // other events occur, the tab bar can resize and clear our constraints. When this

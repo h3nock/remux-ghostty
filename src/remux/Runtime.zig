@@ -22,6 +22,7 @@ os_thread: std.Thread,
 
 pub const Options = struct {
     alloc: std.mem.Allocator,
+    device: *rendererpkg.Device,
     config: *const configpkg.Config,
     rt_surface: *apprt.RendererSurface,
     terminal: *terminal.Terminal,
@@ -105,6 +106,7 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
         );
         errdefer derived.deinit();
         break :renderer try rendererpkg.Renderer.init(opts.alloc, .{
+            .device = opts.device,
             .config = derived,
             .font_grid = prepared.font_grid,
             .size = opts.size.*,
