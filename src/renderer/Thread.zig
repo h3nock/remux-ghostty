@@ -248,8 +248,9 @@ fn threadMain_(self: *Thread) !void {
     // Send an initial wakeup message so that we render right away.
     try self.wakeup.notify();
 
-    // Start blinking the cursor.
-    self.cursor_h.run(
+    // Start blinking the cursor. The cursor blinks only while focused, so a
+    // surface that starts unfocused starts blinking on its focus message.
+    if (self.flags.focused) self.cursor_h.run(
         &self.loop,
         &self.cursor_c,
         cursorBlinkInterval(),
