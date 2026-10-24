@@ -518,7 +518,7 @@ pub const ControlClient = struct {
                         .skipped_after_error => |cause| try self.handleCommandCompletion(
                             command.token,
                             command.source,
-                            .failure,
+                            .skipped,
                             .{ .skipped_after_error = cause },
                         ),
                     },
@@ -1118,6 +1118,85 @@ test "control client ends when tmux keeps listing a pane it refuses" {
     };
     try testing.expectEqual(1, exits);
     try testing.expectEqual(.client_failure, actions.exit_reason.?);
+}
+
+test "control client hydrates a pane tmux only skipped after other panes closed twice" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openTracePaneTestClient(&client, &actions);
+
+    // tmux 3.5a: a new window brings %1, %2 and %3, top to bottom, hydrated
+    // in one group. %1 closes before that group runs and %2 before the retry
+    // of %2 and %3, so tmux skips every capture of %3 twice without ever
+    // refusing one.
+    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
+    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
+    try client.feed(
+        "%window-renamed @0 bash\n%window-add @1\n" ++
+            "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
+            "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
+            "%window-renamed @1 zsh\n",
+        &actions,
+    );
+    try testing.expect(std.mem.startsWith(u8, client.outboundBytes(), "list-windows "));
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792879758 286 1\n" ++
+            "$42 @0 1 %0 100 30 a87d,100x30,0,0,0 a87d,100x30,0,0,0 bash\n" ++
+            "$42 @1 0 %1 100 30 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] zsh\n" ++
+            "%end 1792879758 286 1\n",
+        &actions,
+    );
+    const first = client.outboundBytes();
+    try testing.expect(std.mem.indexOf(u8, first, "-t %1 ;").? < std.mem.indexOf(u8, first, "-t %2 ;").?);
+    try testing.expect(std.mem.indexOf(u8, first, "-t %2 ;").? < std.mem.indexOf(u8, first, "-t %3 ;").?);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%layout-change @1 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] \n" ++
+            "%window-pane-changed @1 %2\n%window-renamed @1 sleep\n" ++
+            "%begin 1792879759 292 1\n" ++ state_0 ++ "\n" ++
+            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%end 1792879759 292 1\n" ++
+            "%begin 1792879759 293 1\ncan't find pane: %1\n%error 1792879759 293 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792879759 294 1\n%0\n%2\n%3\n%end 1792879759 294 1\n", &actions);
+    const retry = client.outboundBytes();
+    try testing.expect(std.mem.indexOf(u8, retry, "-t %2 ;").? < std.mem.indexOf(u8, retry, "-t %3 ;").?);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%layout-change @1 a880,100x30,0,0,3 a880,100x30,0,0,3 \n%window-pane-changed @1 %3\n" ++
+            "%begin 1792879760 299 1\n" ++ state_0 ++ "\n" ++ state_3 ++ "\n%end 1792879760 299 1\n" ++
+            "%begin 1792879760 300 1\ncan't find pane: %2\n%error 1792879760 300 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    // tmux still lists %3. It never refused it, so it's hydrated again.
+    try client.feed("%begin 1792879761 301 1\n%0\n%3\n%end 1792879761 301 1\n", &actions);
+    try expectNoExit(&actions);
+    try testing.expect(std.mem.indexOf(u8, client.outboundBytes(), "capture-pane -p -P -C -t %3\n") != null);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792879761 302 1\n" ++ state_0 ++ "\n" ++ state_3 ++ "\n%end 1792879761 302 1\n" ++
+            "%begin 1792879761 303 1\n\n%end 1792879761 303 1\n" ++
+            "%begin 1792879761 304 1\n\n%end 1792879761 304 1\n" ++
+            "%begin 1792879761 305 1\n" ++ "\n" ** 30 ++ "%end 1792879761 305 1\n" ++
+            "%begin 1792879761 306 1\n\n%end 1792879761 306 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(3).?);
 }
 
 test "control client server block cannot consume a Viewer command" {

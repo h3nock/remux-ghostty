@@ -161,8 +161,8 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// screen, cursors, modes, and retained VT parser state are restored.
 ///
 /// tmux refuses a capture for a pane that closed before its group ran and
-/// skips the rest of the group. The refused panes it still lists afterwards
-/// are hydrated again by a new group.
+/// skips the rest of the group. The panes of that group it still lists
+/// afterwards are hydrated again by a new group.
 ///
 /// ## Error Handling
 ///
@@ -378,7 +378,13 @@ pub const Viewer = struct {
 
     pub const CommandCompletion = union(enum) {
         success: []const u8,
+
+        /// Tmux ran the command and returned `%error`.
         failure,
+
+        /// Tmux didn't run the command: an earlier member of its group
+        /// failed.
+        skipped,
     };
 
     pub const Input = union(enum) {
@@ -465,22 +471,16 @@ pub const Viewer = struct {
         /// See `PaneChange.render_hold_generation`.
         render_hold_generation: u64 = 0,
 
-        hydration_retry: HydrationRetry = .none,
+        /// Times tmux refused one of this pane's own first-hydration
+        /// captures. A pane it refuses has closed and isn't listed again, so
+        /// one it lists after refusing it twice is a real failure. A capture
+        /// tmux skipped after refusing another pane says nothing about this
+        /// one and isn't counted.
+        hydration_refusals: u2 = 0,
 
-        /// tmux refuses a capture for a pane that closed before its group
-        /// ran, and skips the rest of the group. A refused pane is hydrated
-        /// again if tmux still lists it; a pane tmux lists after refusing
-        /// it twice is a real failure.
-        const HydrationRetry = enum {
-            none,
-            refused_once,
-            retried,
-            refused_twice,
-
-            fn awaitingRecheck(self: HydrationRetry) bool {
-                return self == .refused_once or self == .refused_twice;
-            }
-        };
+        /// tmux refused or skipped one of this pane's first-hydration
+        /// captures, and the pane waits for tmux to list the session's panes.
+        awaiting_recheck: bool = false,
 
         pub const Phase = enum {
             initial_hydrating,
@@ -1317,8 +1317,8 @@ pub const Viewer = struct {
     }
 
     /// Raw tmux emits only one `%error` block for a failed command group.
-    /// Consume the failed member and the remaining members of that same group
-    /// as failures. The canonical ControlClient path receives those as
+    /// Consume the failed member, then the remaining members of that same
+    /// group as skipped. The canonical ControlClient path receives those as
     /// separate correlated completion events from Channel instead.
     fn nextDirectCommandError(self: *Viewer) []const Action {
         if (self.sent_command_count == 0 or self.command_queue.empty()) {
@@ -1329,9 +1329,10 @@ pub const Viewer = struct {
         self.resetActionArena();
         var actions: std.ArrayList(Action) = .empty;
         var terminal_failure = false;
+        var completion: CommandCompletion = .failure;
         while (true) {
             const ends_group = self.command_queue.first().?.group_end;
-            _ = self.receivedCommandCompletion(&actions, .failure) catch |err| switch (err) {
+            _ = self.receivedCommandCompletion(&actions, completion) catch |err| switch (err) {
                 error.CommandFailed, error.HydrationFailed => terminal_failure = true,
                 else => {
                     log.warn("failed to process command error, becoming defunct: {}", .{err});
@@ -1339,6 +1340,7 @@ pub const Viewer = struct {
                 },
             };
             if (ends_group) break;
+            completion = .skipped;
         }
 
         if (terminal_failure) return self.defunct();
@@ -1876,17 +1878,17 @@ pub const Viewer = struct {
 
         const content = switch (completion) {
             .success => |body| body,
-            .failure => {
+            .failure, .skipped => {
                 // A refresh targets an already-published pane. A capture can
                 // fail if that pane disappears while the group is in flight;
                 // keep the rest of the client alive and leave the pane behind
                 // the hydration barrier until authoritative topology removes
-                // it. Channel supplies failures for every skipped member, so
-                // FIFO correlation remains intact without emitting a false
+                // it. Channel supplies a completion for every skipped member,
+                // so FIFO correlation remains intact without emitting a false
                 // pane-changed completion.
                 if (refresh_pane_id != null) return null;
                 if (command.hydrationPane()) |pane_id| {
-                    try self.hydrationRefused(pane_id);
+                    try self.hydrationNotRun(pane_id, completion == .failure);
                     return null;
                 }
                 if (command.isHydration()) return error.HydrationFailed;
@@ -2927,23 +2929,20 @@ pub const Viewer = struct {
     }
 
     /// tmux refused one of a pane's first-hydration captures, or skipped it
-    /// after refusing another pane in the group. A pane topology already
-    /// removed needs nothing; the others wait for tmux to list the session's
-    /// panes.
-    fn hydrationRefused(self: *Viewer, pane_id: usize) Allocator.Error!void {
+    /// after refusing an earlier command of the group. A pane topology
+    /// already removed needs nothing; the others wait for tmux to list the
+    /// session's panes.
+    fn hydrationNotRun(self: *Viewer, pane_id: usize, refused: bool) Allocator.Error!void {
         const pane = self.panes.get(pane_id) orelse return;
-        pane.hydration_retry = switch (pane.hydration_retry) {
-            .none => .refused_once,
-            .retried => .refused_twice,
-            .refused_once, .refused_twice => return,
-        };
+        if (refused) pane.hydration_refusals +|= 1;
+        pane.awaiting_recheck = true;
         if (self.hydration_recheck_queued) return;
         try self.queueCommands(&.{.hydration_recheck});
         self.hydration_recheck_queued = true;
     }
 
-    /// Hydrate again the refused panes tmux still lists. A refused pane it
-    /// doesn't list closed, and topology removes it.
+    /// Hydrate again the panes of a refused group that tmux still lists. A
+    /// pane it doesn't list closed, and topology removes it.
     fn receivedHydrationRecheck(self: *Viewer, content: []const u8) !void {
         self.hydration_recheck_queued = false;
 
@@ -2964,13 +2963,13 @@ pub const Viewer = struct {
         var it = self.panes.iterator();
         while (it.next()) |kv| {
             const pane = kv.value_ptr.*;
-            if (!pane.hydration_retry.awaitingRecheck()) continue;
+            if (!pane.awaiting_recheck) continue;
             if (!listed.contains(kv.key_ptr.*)) continue;
-            if (pane.hydration_retry == .refused_twice) return error.HydrationFailed;
+            if (pane.hydration_refusals >= 2) return error.HydrationFailed;
             try retry.append(self.alloc, kv.key_ptr.*);
         }
         try self.queueHydrationGroup(retry.items);
-        for (retry.items) |id| self.panes.get(id).?.hydration_retry = .retried;
+        for (retry.items) |id| self.panes.get(id).?.awaiting_recheck = false;
     }
 
     /// Enters the command queue state from any other state, queueing and
@@ -4632,7 +4631,8 @@ test "hydration command errors do not become terminal content" {
     try testing.expectEqual(1, actions[0].command.members.len);
     try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'", actions[0].command.members[0]);
     try testing.expectEqual(Viewer.Pane.Phase.initial_hydrating, pane.phase);
-    try testing.expectEqual(.refused_once, pane.hydration_retry);
+    try testing.expectEqual(1, pane.hydration_refusals);
+    try testing.expect(pane.awaiting_recheck);
     const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("", actual);
