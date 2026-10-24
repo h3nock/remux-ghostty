@@ -124,10 +124,16 @@ pub const ExitAction = extern struct {
     detail: Bytes,
 };
 
+pub const PaneChange = extern struct {
+    pane_id: u64,
+    render_hold: bool,
+    render_hold_generation: u64,
+};
+
 pub const ActionValue = extern union {
     exit: ExitAction,
     topology: TopologyAction,
-    pane_id: u64,
+    pane_change: PaneChange,
     command: CommandCompletion,
     input_failure: Bytes,
 };
@@ -247,10 +253,14 @@ pub const Client = struct {
                 self.emit(&value);
             },
 
-            .pane_changed => |pane_id| {
+            .pane_changed => |change| {
                 var value: Action = .{
                     .tag = .pane_changed,
-                    .value = .{ .pane_id = @intCast(pane_id) },
+                    .value = .{ .pane_change = .{
+                        .pane_id = @intCast(change.pane_id),
+                        .render_hold = change.render_hold,
+                        .render_hold_generation = change.render_hold_generation,
+                    } },
                 };
                 self.emit(&value);
             },
@@ -497,6 +507,16 @@ export fn ghostty_tmux_client_refresh_window_pane_metadata(
     return .ok;
 }
 
+export fn ghostty_tmux_client_end_render_hold(
+    client: ?*Client,
+    pane_id: u64,
+) Result {
+    const value = client orelse return .invalid_input;
+    const id = std.math.cast(usize, pane_id) orelse return .invalid_input;
+    if (!value.control.endRenderHold(id)) return .pane_unknown;
+    return .ok;
+}
+
 export fn ghostty_tmux_client_retain_pane_terminal(
     client: ?*Client,
     pane_id: u64,
@@ -680,7 +700,7 @@ const TestContext = struct {
                 if (self.pane_changed_count >= self.pane_changed_ids.len) {
                     @panic("too many pane changes");
                 }
-                self.pane_changed_ids[self.pane_changed_count] = value.value.pane_id;
+                self.pane_changed_ids[self.pane_changed_count] = value.value.pane_change.pane_id;
                 self.pane_changed_count += 1;
             },
             .command_complete => {
@@ -814,6 +834,7 @@ test "tmux C client public ABI matches ghostty header" {
     try expectStructLayout(CommandCompletion, c.ghostty_tmux_command_completion_s);
     try expectStructLayout(TopologyAction, c.ghostty_tmux_topology_action_s);
     try expectStructLayout(ExitAction, c.ghostty_tmux_exit_action_s);
+    try expectStructLayout(PaneChange, c.ghostty_tmux_pane_change_s);
     try expectUnionLayout(ActionValue, c.ghostty_tmux_action_u);
     try expectStructLayout(Action, c.ghostty_tmux_action_s);
     try expectStructLayout(Config, c.ghostty_tmux_client_config_s);
@@ -1271,6 +1292,9 @@ test "tmux C client pane refresh boundary" {
     );
     try testing.expectEqual(1, context.pane_changed_count);
     try testing.expectEqual(0, context.pane_changed_ids[0]);
+    try testing.expectEqual(Result.invalid_input, ghostty_tmux_client_end_render_hold(null, 0));
+    try testing.expectEqual(Result.pane_unknown, ghostty_tmux_client_end_render_hold(&client, 99));
+    try testing.expectEqual(Result.ok, ghostty_tmux_client_end_render_hold(&client, 0));
     try testing.expectEqual(2, context.topology_count);
     try testing.expectEqual(2, context.record_count);
     const record = context.records[1].value.pane;

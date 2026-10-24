@@ -282,6 +282,23 @@ pub const Viewer = struct {
         client_failure,
     };
 
+    /// What a `pane_changed` action reports about the pane.
+    pub const PaneChange = struct {
+        pane_id: usize,
+
+        /// The pane's program set synchronized output (mode 2026) and hasn't
+        /// reset it, so the pane's renderer draws nothing new. The terminal
+        /// has no clock: a hold whose reset never arrives, because the
+        /// program died mid-frame or tmux dropped the output, lasts until
+        /// the host ends it with `endRenderHold` after a timeout.
+        render_hold: bool,
+
+        /// Counts the holds the pane's output has begun. A hold that ends
+        /// and begins again between two reports, even within one output, is
+        /// a new hold, so a host timing holds starts its timeout again.
+        render_hold_generation: u64,
+    };
+
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
         /// our viewer session in some way.
@@ -303,7 +320,7 @@ pub const Viewer = struct {
         /// A pane's canonical terminal became live or received live output.
         /// The pane exists in `Viewer.panes` and is already updated when this
         /// action is emitted.
-        pane_changed: usize,
+        pane_changed: PaneChange,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -438,6 +455,9 @@ pub const Viewer = struct {
         layout_cols: size.CellCountInt = 0,
         layout_rows: size.CellCountInt = 0,
 
+        /// See `PaneChange.render_hold_generation`.
+        render_hold_generation: u64 = 0,
+
         pub const Phase = enum {
             initial_hydrating,
 
@@ -502,9 +522,52 @@ pub const Viewer = struct {
 
             self.* = .{
                 .terminal_owner = terminal_owner,
-                .stream = terminal_owner.terminal.vtStream(),
+                .stream = terminalStream(&terminal_owner.terminal),
             };
             return self;
+        }
+
+        /// A stream over the pane's terminal that counts the holds its output
+        /// begins. Whether a hold is on comes from the terminal's mode: the
+        /// mirror's resizes and recaptures end holds without telling the
+        /// stream.
+        fn terminalStream(terminal: *Terminal) TerminalStream {
+            var stream = terminal.vtStream();
+            stream.handler.effects.render_hold = &renderHold;
+            return stream;
+        }
+
+        fn renderHold(handler: *TerminalStream.Handler, held: bool) void {
+            if (!held) return;
+            const stream: *TerminalStream = @fieldParentPtr("handler", handler);
+            const pane: *Pane = @fieldParentPtr("stream", stream);
+            pane.render_hold_generation +%= 1;
+        }
+
+        /// The pane's report for a `pane_changed` action. The caller holds
+        /// the pane's terminal lock.
+        fn changeLocked(self: *const Pane, pane_id: usize) PaneChange {
+            return .{
+                .pane_id = pane_id,
+                .render_hold = self.terminal_owner.terminal.modes.get(.synchronized_output),
+                .render_hold_generation = self.render_hold_generation,
+            };
+        }
+
+        fn change(self: *const Pane, pane_id: usize) PaneChange {
+            const owner = self.terminal_owner;
+            owner.mutex.lockUncancelable(owner.terminal.io());
+            defer owner.mutex.unlock(owner.terminal.io());
+            return self.changeLocked(pane_id);
+        }
+
+        /// End the pane's render hold, as a terminal's process runtime does
+        /// when its timeout expires. Ending no hold changes nothing.
+        pub fn endRenderHold(self: *Pane) void {
+            const owner = self.terminal_owner;
+            owner.mutex.lockUncancelable(owner.terminal.io());
+            defer owner.mutex.unlock(owner.terminal.io());
+            owner.terminal.modes.set(.synchronized_output, false);
         }
 
         /// Retain the pane's canonical terminal for use beyond this Pane's
@@ -984,7 +1047,7 @@ pub const Viewer = struct {
         // already in flight. Pane output therefore never needs to dispatch a
         // command and can bypass the action arena entirely. Active topology
         // notifications likewise update only Viewer-owned window state.
-        var left_alternate: ?usize = null;
+        var left_alternate: ?PaneChange = null;
         var shown_stale = false;
         switch (n) {
             .output => |out| {
@@ -997,9 +1060,9 @@ pub const Viewer = struct {
                 };
                 const changed = result orelse return &.{};
                 if (!changed.recapture) {
-                    return self.singleAction(.{ .pane_changed = changed.pane_id });
+                    return self.singleAction(.{ .pane_changed = changed.change });
                 }
-                left_alternate = changed.pane_id;
+                left_alternate = changed.change;
             },
             .window_pane_changed => |info| return if (self.windowPaneChanged(
                 info.window_id,
@@ -1045,8 +1108,8 @@ pub const Viewer = struct {
             {
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
-                const action: Action = if (left_alternate) |pane_id|
-                    .{ .pane_changed = pane_id }
+                const action: Action = if (left_alternate) |change|
+                    .{ .pane_changed = change }
                 else
                     .{ .windows = self.windows.items };
                 actions.append(arena.allocator(), action) catch return self.defunct();
@@ -1690,7 +1753,9 @@ pub const Viewer = struct {
 
             switch (outcome) {
                 .unchanged => {},
-                .applied => try actions.append(arena_alloc, .{ .pane_changed = after.pane_id }),
+                .applied => try actions.append(arena_alloc, .{
+                    .pane_changed = pane.change(after.pane_id),
+                }),
                 .mismatch => {
                     // Keep the geometry current; the contents are recaptured
                     // once the pane is shown.
@@ -1699,7 +1764,9 @@ pub const Viewer = struct {
                     defer owner.mutex.unlock(owner.terminal.io());
                     try owner.terminal.resize(self.alloc, .{ .cols = cols, .rows = rows });
                     pane.stale = true;
-                    try actions.append(arena_alloc, .{ .pane_changed = after.pane_id });
+                    try actions.append(arena_alloc, .{
+                        .pane_changed = pane.changeLocked(after.pane_id),
+                    });
                 },
             }
         }
@@ -1883,7 +1950,7 @@ pub const Viewer = struct {
             .pane_visible => |id| try self.receivedPaneVisible(id, content),
 
             .pane_pending => |id| if (try self.receivedPanePending(id, content)) {
-                try actions.append(arena_alloc, .{ .pane_changed = id });
+                try actions.append(arena_alloc, .{ .pane_changed = self.panes.get(id).?.change(id) });
                 try self.recaptureStaleShownPanes();
                 try self.flushPendingResize();
             },
@@ -2256,7 +2323,7 @@ pub const Viewer = struct {
             // canonical Terminal and SharedTerminal identities remain
             // unchanged; only the private parser state is replaced.
             pane.stream.deinit();
-            pane.stream = t.vtStream();
+            pane.stream = Pane.terminalStream(t);
         } else if (t.cols != cols or t.rows != rows) {
             try t.resize(self.alloc, .{ .cols = cols, .rows = rows });
         }
@@ -2652,7 +2719,7 @@ pub const Viewer = struct {
     }
 
     const OutputResult = struct {
-        pane_id: usize,
+        change: PaneChange,
 
         /// The pane left the alternate screen after a resize, and its normal
         /// screen must be recaptured.
@@ -2703,7 +2770,10 @@ pub const Viewer = struct {
                     pane.primary_stale = false;
                     pane.stale = true;
                 }
-                break :live .{ .pane_id = out.pane_id, .recapture = left_alternate };
+                break :live .{
+                    .change = pane.changeLocked(out.pane_id),
+                    .recapture = left_alternate,
+                };
             },
         };
     }
@@ -4203,7 +4273,7 @@ test "initial flow" {
         const actions = viewer.next(.{ .tmux = .{ .block_end = testClientBlock(response) } });
         if (expected_change) |id| {
             try testing.expectEqual(1, actions.len);
-            try testing.expectEqual(id, actions[0].pane_changed);
+            try testing.expectEqual(id, actions[0].pane_changed.pane_id);
             try testing.expectEqual(Viewer.Pane.Phase.live, viewer.panes.get(id).?.phase);
         } else {
             try testing.expectEqual(0, actions.len);
@@ -4228,7 +4298,7 @@ test "initial flow" {
         .data = &new_output,
     } } });
     try testing.expectEqual(1, changed.len);
-    try testing.expectEqual(0, changed[0].pane_changed);
+    try testing.expectEqual(0, changed[0].pane_changed.pane_id);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     const active = try pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
@@ -4255,7 +4325,7 @@ test "initial flow" {
         .data = &pre_topology_suffix,
     } } });
     try testing.expectEqual(1, fresh_changed.len);
-    try testing.expectEqual(1, fresh_changed[0].pane_changed);
+    try testing.expectEqual(1, fresh_changed[0].pane_changed.pane_id);
     const fresh_after_suffix = try fresh_pane.terminal_owner.terminal.screens.active.dumpStringAlloc(
         testing.allocator,
         .{ .active = .{} },
@@ -4346,7 +4416,7 @@ test "live output action does not allocate" {
         .data = &bytes,
     } } });
     try testing.expectEqual(1, actions.len);
-    try testing.expectEqual(1, actions[0].pane_changed);
+    try testing.expectEqual(1, actions[0].pane_changed.pane_id);
     const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("X", actual);
@@ -4579,7 +4649,7 @@ test "zoomed geometry follows visible layout" {
         };
         if (expected_change) |id| {
             try testing.expectEqual(1, actions.len);
-            try testing.expectEqual(id, actions[0].pane_changed);
+            try testing.expectEqual(id, actions[0].pane_changed.pane_id);
         } else {
             try testing.expectEqual(0, actions.len);
         }
@@ -5166,7 +5236,7 @@ test "window_add emits list_windows while another group is pending" {
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, actions.len);
-                    try testing.expectEqual(0, actions[0].pane_changed);
+                    try testing.expectEqual(0, actions[0].pane_changed.pane_id);
                 }
             }).check,
         },
@@ -5552,6 +5622,139 @@ test "client resize applies tmux's row rules in place" {
     try testing.expect(testCommandWith(actions, "refresh-client -C 20x10") != null);
     try testing.expect(viewer.resize_inflight != null);
     try testing.expect(viewer.resize_pending == null);
+}
+
+test "pane changes report the render holds a pane's output begins" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    const pane = try addTestPane(&viewer);
+    pane.phase = .live;
+
+    const steps = [_]struct { data: []const u8, held: bool, generation: u64 }{
+        // The output leaves a hold on.
+        .{ .data = "\\033[?2026hA", .held = true, .generation = 1 },
+        // Setting the mode during a hold begins no new hold.
+        .{ .data = "\\033[?2026hB", .held = true, .generation = 1 },
+        .{ .data = "C\\033[?2026l", .held = false, .generation = 1 },
+        // A whole frame within one output.
+        .{ .data = "\\033[?2026hD\\033[?2026l", .held = false, .generation = 2 },
+        // A frame ends and the next begins within one output: a new hold,
+        // and the renderer never sees the pane released.
+        .{ .data = "\\033[?2026hE\\033[?2026l\\033[?2026hF", .held = true, .generation = 4 },
+    };
+    for (steps) |step| {
+        var buffer: [64]u8 = undefined;
+        @memcpy(buffer[0..step.data.len], step.data);
+        const actions = viewer.next(.{ .tmux = .{ .output = .{
+            .pane_id = 1,
+            .data = buffer[0..step.data.len],
+        } } });
+        try testing.expectEqual(1, actions.len);
+        try testing.expectEqual(Viewer.PaneChange{
+            .pane_id = 1,
+            .render_hold = step.held,
+            .render_hold_generation = step.generation,
+        }, actions[0].pane_changed);
+    }
+}
+
+test "ending a pane's render hold resets synchronized output" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    const pane = try addTestPane(&viewer);
+    pane.phase = .live;
+    testOutput(&viewer, 1, "\\033[?2026hA");
+    try testing.expect(pane.terminal_owner.terminal.modes.get(.synchronized_output));
+
+    pane.endRenderHold();
+    try testing.expect(!pane.terminal_owner.terminal.modes.get(.synchronized_output));
+    var more = "B".*;
+    const actions = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &more } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expectEqual(Viewer.PaneChange{
+        .pane_id = 1,
+        .render_hold = false,
+        .render_hold_generation = 1,
+    }, actions[0].pane_changed);
+}
+
+test "a resize applied in place reports the render hold it ended" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(
+        &viewer,
+        1,
+        10,
+        "L0\r\nL1\r\nL2\r\nL3\r\nL4\x1b[7;1HF6\r\nF7\r\nF8\r\nF9\x1b[6;1H\x1b[?2026h",
+    );
+    try testing.expect(pane.terminal_owner.terminal.modes.get(.synchronized_output));
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%1;20;10;0;5;0;0;9ede,20x10,0,0,1;9ede,20x10,0,0,1");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%1;20;6;0;5;0;0;f15e,20x6,0,0,1;f15e,20x6,0,0,1");
+
+    try testing.expect(!pane.stale);
+    try testing.expectEqual(6, pane.terminal_owner.terminal.rows);
+    const change = for (actions) |action| switch (action) {
+        .pane_changed => |c| break c,
+        else => {},
+    } else return error.TestExpectedPaneChange;
+    try testing.expectEqual(Viewer.PaneChange{
+        .pane_id = 1,
+        .render_hold = false,
+        .render_hold_generation = 1,
+    }, change);
+}
+
+test "a resize the mirror can't follow reports the render hold it ended" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(&viewer, 1, 10, "L0\r\nL1\x1b[?2026h");
+
+    // tmux's cursor before the resize isn't the mirror's.
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%1;20;10;7;7;0;0;9ede,20x10,0,0,1;9ede,20x10,0,0,1");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%1;20;6;7;5;0;0;f15e,20x6,0,0,1;f15e,20x6,0,0,1");
+
+    // The shown pane is recaptured at once.
+    try testing.expect(testCommandWith(actions, "refresh-client -A '%1:pause'") != null);
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, pane.phase);
+    try testing.expectEqual(6, pane.terminal_owner.terminal.rows);
+    const change = for (actions) |action| switch (action) {
+        .pane_changed => |c| break c,
+        else => {},
+    } else return error.TestExpectedPaneChange;
+    try testing.expectEqual(Viewer.PaneChange{
+        .pane_id = 1,
+        .render_hold = false,
+        .render_hold_generation = 1,
+    }, change);
+}
+
+test "a recaptured pane's new stream keeps counting render holds" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testAlternateRecapture(&viewer);
+    _ = testFinishAlternateRecapture(&viewer, "N0\nN1");
+    _ = testComplete(&viewer, "");
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    const before = pane.render_hold_generation;
+
+    var hold = "\\033[?2026hX".*;
+    const actions = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 1, .data = &hold } } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0].pane_changed.render_hold);
+    try testing.expectEqual(before + 1, actions[0].pane_changed.render_hold_generation);
 }
 
 test "client resize keeps panes in place when tmux's layout notifications follow the reply" {
