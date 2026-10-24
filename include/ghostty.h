@@ -1399,10 +1399,22 @@ typedef struct {
   ghostty_tmux_bytes_s detail;
 } ghostty_tmux_exit_action_s;
 
+typedef struct {
+  uint64_t pane_id;
+  // The pane's program set synchronized output (mode 2026) and hasn't reset
+  // it, so the pane's renderer draws nothing new. The terminal has no clock: a
+  // hold whose reset never arrives lasts until
+  // ghostty_tmux_client_end_render_hold ends it after a timeout.
+  bool render_hold;
+  // Counts the holds the pane's output has begun. A hold that ends and begins
+  // again between two reports is a new hold, whose timeout starts again.
+  uint64_t render_hold_generation;
+} ghostty_tmux_pane_change_s;
+
 typedef union {
   ghostty_tmux_exit_action_s exit;
   ghostty_tmux_topology_action_s topology;
-  uint64_t pane_id;
+  ghostty_tmux_pane_change_s pane_change;
   ghostty_tmux_command_completion_s command;
   ghostty_tmux_bytes_s input_failure;
 } ghostty_tmux_action_u;
@@ -1754,6 +1766,14 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_topology_visit(
     ghostty_tmux_topology_view_t,
     void*,
     ghostty_tmux_topology_visitor_cb);
+
+// Ends a pane's render hold (see ghostty_tmux_pane_change_s), as a terminal's
+// process runtime does when a program doesn't reset synchronized output within
+// its timeout. Wake the pane's renderer afterwards. PANE_UNKNOWN means the pane
+// is not tracked.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_end_render_hold(
+    ghostty_tmux_client_t,
+    uint64_t);
 
 // A retained pane terminal is the canonical Ghostty terminal owned by the
 // control client, not a copy. It may outlive its pane and client and must be

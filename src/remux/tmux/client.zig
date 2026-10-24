@@ -34,7 +34,7 @@ pub const ControlClient = struct {
     pub const Action = union(enum) {
         exit: ExitReason,
         windows: []const Viewer.Window,
-        pane_changed: usize,
+        pane_changed: Viewer.PaneChange,
         command_complete: CommandCompletion,
         input_failed: []const u8,
     };
@@ -144,6 +144,16 @@ pub const ControlClient = struct {
     ) ?*SharedTerminal {
         const pane = self.viewer.panes.get(pane_id) orelse return null;
         return pane.retainTerminal();
+    }
+
+    /// End `pane_id`'s render hold (see `Viewer.PaneChange.render_hold`), or
+    /// return false if that pane is unknown. The host calls this when a hold
+    /// outlasts its timeout, then wakes the pane's renderer. Serialize this
+    /// call with other ControlClient calls.
+    pub fn endRenderHold(self: *ControlClient, pane_id: usize) bool {
+        const pane = self.viewer.panes.get(pane_id) orelse return false;
+        pane.endRenderHold();
+        return true;
     }
 
     /// Rehydrate one live pane into its existing canonical terminal. This does
@@ -555,8 +565,8 @@ pub const ControlClient = struct {
                     .command => |group| try self.enqueueGroup(group),
                     .exit => |reason| self.emitHost(.{ .exit = reason }),
                     .windows => |windows| self.emitHost(.{ .windows = windows }),
-                    .pane_changed => |pane_id| self.emitHost(.{
-                        .pane_changed = pane_id,
+                    .pane_changed => |change| self.emitHost(.{
+                        .pane_changed = change,
                     }),
                 };
             }
@@ -641,7 +651,7 @@ const TestActions = struct {
                 break :exit .exit;
             },
             .windows => |windows| .{ .windows = windows.len },
-            .pane_changed => |pane_id| .{ .pane_changed = pane_id },
+            .pane_changed => |change| .{ .pane_changed = change.pane_id },
             .command_complete => |completion| switch (completion.result) {
                 .success => .{ .command_success = completion.token },
                 .error_block => .{ .command_error = completion.token },
