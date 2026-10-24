@@ -523,10 +523,10 @@ pub const ControlClient = struct {
                         ),
                         // The host gets no reply to use, so for it the
                         // command failed.
-                        .reply_too_large => try self.handleCommandCompletion(
+                        .reply_too_large => |head| try self.handleCommandCompletion(
                             command.token,
                             command.source,
-                            .too_large,
+                            .{ .too_large = head },
                             .{ .error_block = "reply too large" },
                         ),
                     },
@@ -1617,7 +1617,7 @@ test "control client recaptures plain screens after their styled reply is too la
     ));
 }
 
-test "control client recaptures a pane whose pending reply is too large" {
+test "control client reads the rest of a pending escape sequence too large to keep as part of it" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{
@@ -1628,48 +1628,43 @@ test "control client recaptures a pane whose pending reply is too large" {
     defer actions.deinit();
 
     // Traced from tmux 3.5a: a program has written the start of an OSC title
-    // sequence, then finishes it after the pane's capture. With a 256-byte
-    // limit the unfinished sequence is too large.
-    const state = "%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;";
+    // sequence, writes more of it after the pane's capture, and only later the
+    // BEL that ends it and a line of text. With a 256-byte limit the
+    // unfinished sequence is too large.
     client.channel.parser.max_bytes = 256;
-
     try openTraceStartupTestClient(
         &client,
         &actions,
-        "%begin 1792870726 277 1\n3.5a\n%end 1792870726 277 1\n" ++
-            "%begin 1792870727 278 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 zsh\n%end 1792870727 278 1\n",
+        "%begin 1792879996 277 1\n3.5a\n%end 1792879996 277 1\n" ++
+            "%begin 1792879996 278 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 zsh\n%end 1792879996 278 1\n",
     );
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
-        "%begin 1792870727 279 1\n" ++ state ++ "zsh;/private/tmp\n%end 1792870727 279 1\n" ++
-            "%begin 1792870727 280 1\n\n%end 1792870727 280 1\n" ++
-            "%begin 1792870727 281 1\n\n\n%end 1792870727 281 1\n" ++
-            "%begin 1792870727 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792870727 282 1\n" ++
-            "%output %0 \\007\n",
+        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
+            "%begin 1792879997 280 1\n\n%end 1792879997 280 1\n" ++
+            "%begin 1792879997 281 1\n\n\n%end 1792879997 281 1\n" ++
+            "%begin 1792879997 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792879997 282 1\n",
         &actions,
     );
-
-    // The rest of the sequence can't be told from text, so the pane is
-    // captured again once tmux has it.
     for (actions.records.items) |action| try testing.expect(action != .exit);
     try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
-    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
-    try client.consumeOutbound(client.outboundBytes().len);
-    try client.feed("%begin 1792870730 284 1\n%pause %0\n%end 1792870730 284 1\n", &actions);
-    try client.consumeOutbound(client.outboundBytes().len);
-    actions.records.clearRetainingCapacity();
-    try client.feed(
-        "%begin 1792870730 285 1\n" ++ state ++ "sleep;/private/tmp\n%end 1792870730 285 1\n" ++
-            "%begin 1792870730 286 1\n\n%end 1792870730 286 1\n" ++
-            "%begin 1792870730 287 1\n\n\n%end 1792870730 287 1\n" ++
-            "%begin 1792870730 288 1\n\n%end 1792870730 288 1\n" ++
-            "%begin 1792870730 289 1\n%continue %0\n%end 1792870730 289 1\n",
-        &actions,
-    );
-    try testing.expectEqual(2, actions.records.items.len);
-    try testing.expect(actions.records.items[0] == .windows);
-    try testing.expectEqual(@as(usize, 0), actions.records.items[1].pane_changed);
+
+    // Until the program ends the sequence, a capture of the pane gets the
+    // same unfinished sequence again.
     try testing.expectEqualStrings("", client.outboundBytes());
+    try client.feed("%output %0 " ++ "a" ** 200 ++ "\n", &actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try client.feed("%output %0 \\007after\\015\\015\\012\n", &actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const contents = try owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("after", contents);
+    try testing.expect(owner.terminal.getTitle() == null);
 }
 
 test "control client reports a host command reply too large as an error" {

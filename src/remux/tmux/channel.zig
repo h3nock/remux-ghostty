@@ -26,8 +26,8 @@ pub const CommandFailure = union(enum) {
     error_block: []const u8,
 
     /// Tmux executed the command, but its reply exceeded the parser's limit
-    /// and was dropped.
-    reply_too_large,
+    /// and was dropped, save its start (`BlockOverflow.head`).
+    reply_too_large: []const u8,
 
     /// Tmux skipped this command after an earlier member of the same
     /// semicolon-joined command group failed.
@@ -436,7 +436,7 @@ pub const Channel = struct {
                         handler.channelEvent(.{ .command_failed = .{
                             .token = pending.token,
                             .source = pending.source,
-                            .failure = .reply_too_large,
+                            .failure = .{ .reply_too_large = notification.block_overflow.head },
                         } });
                         return;
                     };

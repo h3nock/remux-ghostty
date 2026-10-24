@@ -167,7 +167,9 @@ const COMMAND_QUEUE_INITIAL = 8;
 ///
 /// A capture whose reply is too large for the control parser is taken again
 /// with less once the pane is live: half the history rows tmux has, or the
-/// screens without styles.
+/// screens without styles. Pending output too large to keep is the start of
+/// an escape sequence the program hasn't finished; the pane's parser is put
+/// inside it, so the rest is read as part of it.
 ///
 /// ## Session Changes
 ///
@@ -378,8 +380,8 @@ pub const Viewer = struct {
         failure,
 
         /// Tmux ran the command, but its reply exceeded the control parser's
-        /// limit and was dropped.
-        too_large,
+        /// limit and was dropped, save its start.
+        too_large: []const u8,
     };
 
     pub const Input = union(enum) {
@@ -977,7 +979,7 @@ pub const Viewer = struct {
                 else if (block.is_error)
                     self.nextDirectCommandError()
                 else
-                    self.nextCommandCompletion(.too_large),
+                    self.nextCommandCompletion(.{ .too_large = block.head }),
                 else => self.nextCommandNotification(n),
             },
         };
@@ -1905,6 +1907,7 @@ pub const Viewer = struct {
         self.sent_command_count -= 1;
         defer command.deinit(self.alloc);
 
+        var sequence_start: [2]u8 = undefined;
         const content = switch (completion) {
             .success => |body| body,
             .failure => return self.receivedCommandFailure(
@@ -1915,7 +1918,7 @@ pub const Viewer = struct {
 
             // A capture's reply depends on the pane's contents, so the pane
             // is captured again with less once it's live.
-            .too_large => switch (command) {
+            .too_large => |head| switch (command) {
                 .pane_history => |capture| {
                     if (self.panes.get(capture.id)) |pane| {
                         const rows = @min(
@@ -1941,14 +1944,15 @@ pub const Viewer = struct {
                 },
 
                 // The start of an escape sequence the program hasn't
-                // finished. Without it the rest would be taken for text, so
-                // the pane is captured again once tmux has the whole of it.
+                // finished; the rest arrives as output. Its introducer puts
+                // the parser inside the sequence, so the rest is read as part
+                // of it and not as text. What the sequence does is lost, and
+                // a capture can't restore it, so the pane isn't captured
+                // again: until the program ends the sequence, that capture
+                // would be this one again.
                 .pane_pending => |id| pending: {
-                    if (self.panes.get(id)) |pane| {
-                        pane.utf8_carry.clear();
-                        pane.stale = true;
-                    }
-                    break :pending "";
+                    if (self.panes.get(id)) |pane| pane.utf8_carry.clear();
+                    break :pending escapeSequenceIntroducer(head, &sequence_start);
                 },
                 else => return self.receivedCommandFailure(
                     actions,
@@ -2031,6 +2035,20 @@ pub const Viewer = struct {
             .resize_sample_after => try self.finishResize(arena_alloc, actions, content),
         }
         return null;
+    }
+
+    /// The introducer of the escape sequence that starts a pending capture,
+    /// from the capture's octal-escaped start: ESC and the byte naming the
+    /// sequence. Empty if the start holds neither.
+    fn escapeSequenceIntroducer(head: []const u8, out: *[2]u8) []const u8 {
+        var buffer: [control.Parser.block_head_capacity]u8 = undefined;
+        const len = @min(head.len, buffer.len);
+        @memcpy(buffer[0..len], head[0..len]);
+        const decoded = control.decodeEscapedOutput(buffer[0..len]);
+        const start = std.mem.indexOfScalar(u8, decoded, 0x1b) orelse return &.{};
+        if (start + 1 >= decoded.len) return &.{};
+        out.* = .{ 0x1b, decoded[start + 1] };
+        return out;
     }
 
     fn receivedCommandFailure(
@@ -4680,6 +4698,7 @@ test "direct viewer history reply too large asks for half the rows tmux has" {
     const actions = viewer.next(.{ .tmux = .{ .block_overflow = .{
         .meta = testClientBlock("").meta,
         .is_error = false,
+        .head = "\\033[38;2;0;0;0",
     } } });
     try testing.expectEqual(0, actions.len);
     try testing.expectEqual(State.command_queue, viewer.state);

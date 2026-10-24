@@ -34,6 +34,14 @@ pub const Parser = struct {
     /// while `state` is `.block` or `.block_overflow`.
     block_meta: Notification.Block.Meta = undefined,
 
+    /// The start of an overflowed block's data. Valid only while `state` is
+    /// `.block_overflow`.
+    block_head: [block_head_capacity]u8 = undefined,
+    block_head_len: usize = 0,
+
+    /// Bytes kept from the start of a block whose data is dropped.
+    pub const block_head_capacity = 16;
+
     const State = enum {
         /// Outside of any active notifications. This should drop any output
         /// unless it is '%' on the first byte of a line. The buffer will be
@@ -190,6 +198,10 @@ pub const Parser = struct {
         assert(self.state == .block);
         log.warn("tmux control mode block exceeded max_bytes={}", .{self.max_bytes});
         const written = self.buffer.written();
+        const head = written[0..@min(written.len, block_head_capacity)];
+        @memcpy(self.block_head[0..head.len], head);
+        self.block_head_len = head.len;
+
         const line_start = if (std.mem.lastIndexOfScalar(
             u8,
             written,
@@ -224,6 +236,7 @@ pub const Parser = struct {
         return .{ .block_overflow = .{
             .meta = guard.meta,
             .is_error = guard.kind == .err,
+            .head = self.block_head[0..self.block_head_len],
         } };
     }
 
@@ -825,6 +838,11 @@ pub const Notification = union(enum) {
 
         /// The block ended with `%error` rather than `%end`.
         is_error: bool,
+
+        /// The start of the dropped data, at most
+        /// `Parser.block_head_capacity` bytes. Borrows parser storage until
+        /// the next input byte.
+        head: []const u8,
     };
 
     pub const Block = struct {
@@ -980,6 +998,7 @@ test "tmux block exceeding max_bytes is dropped up to its guard" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_overflow);
     try testing.expect(!n.block_overflow.is_error);
+    try testing.expectEqualStrings("a line longer th", n.block_overflow.head);
     try testing.expectEqualDeep(
         Notification.Block.Meta{ .time = 1578922740, .number = 269, .flags = 1 },
         n.block_overflow.meta,
