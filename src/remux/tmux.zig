@@ -19,5 +19,6 @@ pub const Viewer = @import("tmux/viewer.zig").Viewer;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("tmux/c.zig");
+    _ = @import("tmux/pending.zig");
     _ = @import("tmux/resize.zig");
 }

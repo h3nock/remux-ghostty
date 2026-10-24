@@ -16,6 +16,7 @@ const RGB = @import("../../terminal/color.zig").RGB;
 const Layout = @import("../../terminal/tmux/layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
+const PendingRemainder = @import("pending.zig").Remainder;
 const resize = @import("resize.zig");
 
 const log = std.log.scoped(.terminal_tmux_viewer);
@@ -168,8 +169,9 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// A capture whose reply is too large for the control parser is taken again
 /// with less once the pane is live: half the history rows tmux has, or the
 /// screens without styles. Pending output too large to keep is the start of
-/// an escape sequence the program hasn't finished; the pane's parser is put
-/// inside it, so the rest is read as part of it.
+/// an escape sequence the program hasn't finished; the rest of it, arriving
+/// as output, is read past by tmux's rules and never reaches the pane's
+/// parser.
 ///
 /// ## Session Changes
 ///
@@ -426,6 +428,11 @@ pub const Viewer = struct {
         saved_primary_cursor: ?CursorPosition = null,
         utf8_carry: Utf8Carry = .{},
 
+        /// The rest of an escape sequence whose pending capture was too
+        /// large to keep. The program's output is read past it before the
+        /// pane's parser gets any.
+        pending_remainder: ?PendingRemainder = null,
+
         /// Output that arrived after tmux paused this pane for a recapture.
         /// It postdates the snapshot and is applied after it.
         replay: std.ArrayList(u8) = .empty,
@@ -563,6 +570,21 @@ pub const Viewer = struct {
             const stream: *TerminalStream = @fieldParentPtr("handler", handler);
             const pane: *Pane = @fieldParentPtr("stream", stream);
             pane.render_hold_generation +%= 1;
+        }
+
+        /// Feed the program's output to the pane's parser, past the rest of
+        /// a dropped pending sequence. The caller holds the pane's terminal
+        /// lock.
+        fn nextOutput(self: *Pane, data: []const u8) void {
+            const remainder = if (self.pending_remainder) |*r| r else return self.stream.nextSlice(data);
+            const rest = for (data, 0..) |c, i| switch (remainder.next(c)) {
+                .skip => {},
+                .execute => self.stream.nextSlice(data[i..][0..1]),
+                .end => break data[i + 1 ..],
+                .escape => break data[i..],
+            } else return;
+            self.pending_remainder = null;
+            self.stream.nextSlice(rest);
         }
 
         /// The pane's report for a `pane_changed` action. The caller holds
@@ -1907,7 +1929,6 @@ pub const Viewer = struct {
         self.sent_command_count -= 1;
         defer command.deinit(self.alloc);
 
-        var sequence_start: [2]u8 = undefined;
         const content = switch (completion) {
             .success => |body| body,
             .failure => return self.receivedCommandFailure(
@@ -1918,7 +1939,7 @@ pub const Viewer = struct {
 
             // A capture's reply depends on the pane's contents, so the pane
             // is captured again with less once it's live.
-            .too_large => |head| switch (command) {
+            .too_large => switch (command) {
                 .pane_history => |capture| {
                     if (self.panes.get(capture.id)) |pane| {
                         const rows = @min(
@@ -1944,16 +1965,12 @@ pub const Viewer = struct {
                 },
 
                 // The start of an escape sequence the program hasn't
-                // finished; the rest arrives as output. Its introducer puts
-                // the parser inside the sequence, so the rest is read as part
-                // of it and not as text. What the sequence does is lost, and
-                // a capture can't restore it, so the pane isn't captured
-                // again: until the program ends the sequence, that capture
-                // would be this one again.
-                .pane_pending => |id| pending: {
-                    if (self.panes.get(id)) |pane| pane.utf8_carry.clear();
-                    break :pending escapeSequenceIntroducer(head, &sequence_start);
-                },
+                // finished; its rest arrives as output, and the start the
+                // parser kept tells how it ends. What the sequence does is
+                // lost, and a capture can't restore it, so the pane isn't
+                // captured again: until the program ends the sequence, that
+                // capture would be this one again.
+                .pane_pending => "",
                 else => return self.receivedCommandFailure(
                     actions,
                     command,
@@ -2003,10 +2020,16 @@ pub const Viewer = struct {
                 };
             },
 
-            .pane_pending => |id| if (try self.receivedPanePending(id, content)) {
-                try actions.append(arena_alloc, .{ .pane_changed = self.panes.get(id).?.change(id) });
-                try self.recaptureStaleShownPanes();
-                try self.flushPendingResize();
+            .pane_pending => |id| {
+                const reply: PendingReply = switch (completion) {
+                    .too_large => |head| droppedPendingReply(head),
+                    else => .{ .captured = content },
+                };
+                if (try self.receivedPanePending(id, reply)) {
+                    try actions.append(arena_alloc, .{ .pane_changed = self.panes.get(id).?.change(id) });
+                    try self.recaptureStaleShownPanes();
+                    try self.flushPendingResize();
+                }
             },
 
             .pane_pause => |id| try self.receivedPanePaused(id),
@@ -2037,18 +2060,29 @@ pub const Viewer = struct {
         return null;
     }
 
-    /// The introducer of the escape sequence that starts a pending capture,
-    /// from the capture's octal-escaped start: ESC and the byte naming the
-    /// sequence. Empty if the start holds neither.
-    fn escapeSequenceIntroducer(head: []const u8, out: *[2]u8) []const u8 {
+    /// A pane's pending capture: the start of an escape sequence its program
+    /// hasn't finished.
+    const PendingReply = union(enum) {
+        /// The capture's octal-escaped reply.
+        captured: []const u8,
+
+        /// The reply was too large to keep, and the program's output carries
+        /// on the sequence it starts. Null if its start leaves none.
+        dropped: ?PendingRemainder,
+    };
+
+    /// The reply of a pending capture too large to keep, from its
+    /// octal-escaped start.
+    fn droppedPendingReply(head: []const u8) PendingReply {
+        // tmux escapes backslashes too, so every backslash starts an escape,
+        // and the last one may be cut off.
+        var end: usize = @min(head.len, control.Parser.block_head_capacity);
+        if (std.mem.lastIndexOfScalar(u8, head[0..end], '\\')) |i| {
+            if (end - i < 4) end = i;
+        }
         var buffer: [control.Parser.block_head_capacity]u8 = undefined;
-        const len = @min(head.len, buffer.len);
-        @memcpy(buffer[0..len], head[0..len]);
-        const decoded = control.decodeEscapedOutput(buffer[0..len]);
-        const start = std.mem.indexOfScalar(u8, decoded, 0x1b) orelse return &.{};
-        if (start + 1 >= decoded.len) return &.{};
-        out.* = .{ 0x1b, decoded[start + 1] };
-        return out;
+        @memcpy(buffer[0..end], head[0..end]);
+        return .{ .dropped = PendingRemainder.after(control.decodeEscapedOutput(buffer[0..end])) };
     }
 
     fn receivedCommandFailure(
@@ -2750,7 +2784,7 @@ pub const Viewer = struct {
     fn receivedPanePending(
         self: *Viewer,
         id: usize,
-        content: []const u8,
+        reply: PendingReply,
     ) !bool {
         const pane = self.panes.get(id) orelse {
             log.info("received pending pane content for untracked pane id={}", .{id});
@@ -2767,17 +2801,24 @@ pub const Viewer = struct {
         _ = try t.switchScreen(pane.active_screen);
         Pane.restoreCursor(t.screens.active, pane.cursor);
 
-        if (content.len > 0) {
-            const encoded = try self.alloc.dupe(u8, content);
-            defer self.alloc.free(encoded);
-            pane.stream.nextSlice(control.decodeEscapedOutput(encoded));
-        } else {
-            pane.stream.nextSlice(pane.utf8_carry.slice());
+        pane.pending_remainder = null;
+        switch (reply) {
+            .captured => |content| if (content.len > 0) {
+                const encoded = try self.alloc.dupe(u8, content);
+                defer self.alloc.free(encoded);
+                pane.stream.nextSlice(control.decodeEscapedOutput(encoded));
+            } else {
+                pane.stream.nextSlice(pane.utf8_carry.slice());
+            },
+
+            // Output the capture covers, and so its carry, is part of the
+            // dropped sequence.
+            .dropped => |remainder| pane.pending_remainder = remainder,
         }
 
         // Output tmux sent after pausing the pane postdates the snapshot.
         if (pane.replay_output) {
-            pane.stream.nextSlice(pane.replay.items);
+            pane.nextOutput(pane.replay.items);
             pane.replay.clearRetainingCapacity();
             pane.replay_output = false;
         }
@@ -2865,7 +2906,7 @@ pub const Viewer = struct {
                 const owner = pane.terminal_owner;
                 owner.mutex.lockUncancelable(owner.terminal.io());
                 defer owner.mutex.unlock(owner.terminal.io());
-                pane.stream.nextSlice(data);
+                pane.nextOutput(data);
                 const left_alternate = pane.primary_stale and
                     owner.terminal.screens.active_key == .primary;
                 if (left_alternate) {
@@ -3856,7 +3897,7 @@ test "pane refresh preserves parser-only mouse modes" {
     pane.stream.nextSlice("\x1b[?9h\x1b[?1015h");
     pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
-    _ = try viewer.receivedPanePending(1, "");
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.urxvt, terminal.flags.mouse_format);
@@ -3865,7 +3906,7 @@ test "pane refresh preserves parser-only mouse modes" {
     pane.stream.nextSlice("\x1b[?1016h");
     pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
-    _ = try viewer.receivedPanePending(1, "");
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.sgr_pixels, terminal.flags.mouse_format);
@@ -4584,7 +4625,7 @@ test "hydration seeds pending VT state before live output" {
         return err;
     };
 
-    try testing.expect(try viewer.receivedPanePending(1, "\\033[1"));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "\\033[1" }));
     var suffix = "mX".*;
     _ = viewer.next(.{ .tmux = .{ .output = .{
         .pane_id = 1,
@@ -4618,7 +4659,7 @@ test "hydration carries split UTF-8 past an empty pending capture" {
         .pane_id = 1,
         .data = &prefix,
     } } });
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
 
     var suffix = [_]u8{ 0x82, 0xAC };
     _ = viewer.next(.{ .tmux = .{ .output = .{
@@ -5434,7 +5475,7 @@ test "alternate pane hydration restores canonical screens" {
     try viewer.receivedPaneVisible(7, "alternate\nsecond");
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
-    try testing.expect(try viewer.receivedPanePending(7, ""));
+    try testing.expect(try viewer.receivedPanePending(7, .{ .captured = "" }));
 
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.alternate, pane.active_screen);
@@ -5475,7 +5516,7 @@ test "visible snapshot preserves styled trailing cells" {
     };
 
     try viewer.receivedPaneVisible(1, "\x1b[41mABC  ");
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
 
     const screen = pane.terminal_owner.terminal.screens.active;
     const first = screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
@@ -5647,7 +5688,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
     defer testing.allocator.free(kept_contents);
     try testing.expectEqualStrings("stale-one", kept_contents);
 
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
     try testing.expectEqual(12, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(3, pane_1.terminal_owner.terminal.rows);
     try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
@@ -5673,7 +5714,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
         2,
         "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;3;8;1;two",
     );
-    try testing.expect(try viewer.receivedPanePending(2, ""));
+    try testing.expect(try viewer.receivedPanePending(2, .{ .captured = "" }));
     try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
     try testing.expectEqual(4, pane_2.terminal_owner.terminal.rows);
 }

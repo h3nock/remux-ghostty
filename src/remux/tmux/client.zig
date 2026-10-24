@@ -1617,7 +1617,7 @@ test "control client recaptures plain screens after their styled reply is too la
     ));
 }
 
-test "control client reads the rest of a pending escape sequence too large to keep as part of it" {
+test "control client reads past the rest of a pending escape sequence too large to keep" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{
@@ -1665,6 +1665,171 @@ test "control client reads the rest of a pending escape sequence too large to ke
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("after", contents);
     try testing.expect(owner.terminal.getTitle() == null);
+}
+
+/// Start a client on a traced tmux 3.5a pane, 20x4 and showing BEFORE, whose
+/// program has written the start of an escape sequence and 300 bytes of
+/// filler. Its pending capture, `pending`, is too large to keep with a
+/// 256-byte limit.
+fn openDroppedPendingTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+    pending: []const u8,
+) !void {
+    const testing = std.testing;
+    client.channel.parser.max_bytes = 256;
+    try openTraceStartupTestClient(
+        client,
+        actions,
+        "%begin 1792883185 278 1\n3.5a\n%end 1792883185 278 1\n" ++
+            "%begin 1792883185 279 1\n$0 @0 1 %0 20 4 e95d,20x4,0,0,0 e95d,20x4,0,0,0 Python\n%end 1792883185 279 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
+            "%begin 1792883185 281 1\n\n%end 1792883185 281 1\n" ++
+            "%begin 1792883185 282 1\nBEFORE    \n\n\n\n%end 1792883185 282 1\n" ++
+            "%begin 1792883185 283 1\n",
+        actions,
+    );
+    try client.feed(pending, actions);
+    try client.feed("\n%end 1792883185 283 1\n", actions);
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+}
+
+/// Feed the pane's traced output, which ends the dropped sequence and writes
+/// AFTER, and expect the sequence did nothing: the pane shows only the text
+/// after it, and its title, colors and images are as before. No capture is
+/// sent.
+fn expectDroppedPendingRestSkipped(
+    client: *ControlClient,
+    actions: *TestActions,
+    output: []const u8,
+) !void {
+    const testing = std.testing;
+    try client.feed(output, actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const t = &owner.terminal;
+    const contents = try t.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("BEFORE    \nAFTER", contents);
+    try testing.expect(t.getTitle() == null);
+    try testing.expect(t.colors.background.override == null);
+    try testing.expect(t.colors.foreground.override == null);
+    try testing.expect(t.colors.cursor.override == null);
+    if (comptime @import("terminal_options").kitty_graphics) {
+        try testing.expectEqual(0, t.screens.active.kitty_images.images.count());
+    }
+}
+
+// The cases below are traced from tmux 3.5a: the program ends the sequence
+// 2 s after it began, before tmux's string timeout, and tmux's own pane then
+// shows BEFORE and AFTER.
+
+test "control client skips the rest of a dropped pending CSI" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // The parameters overflow tmux's buffer, so it ignores the CSI at its
+    // final byte. Read as a new CSI, its rest would clear the screen.
+    try openDroppedPendingTestClient(&client, &actions, "\\033[" ++ "1;" ** 150);
+    try expectDroppedPendingRestSkipped(&client, &actions, "%output %0 2JAFTER\\015\\015\\012\n");
+}
+
+test "control client skips the rest of a dropped pending OSC that would set a color" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // tmux reads the rest as more of the title.
+    try openDroppedPendingTestClient(&client, &actions, "\\033]2;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 11;rgb:ffff/0000/0000\\007AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending OSC that would set a title" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try openDroppedPendingTestClient(&client, &actions, "\\033]2;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 2;SUFFIX_TITLE\\007AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending DCS through its ST" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // A passthrough DCS, which tmux ignores by default. Its data holds an
+    // OSC title with a doubled ESC and an ESC [ 2 J; tmux reads both as data
+    // until ESC \.
+    try openDroppedPendingTestClient(&client, &actions, "\\033Ptmux;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 b\\033\\033]2;INNER\\007\\033[2Jc\\033\\134AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending APC that would draw an image" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Read as a new APC, the rest would be a kitty graphics command.
+    try openDroppedPendingTestClient(&client, &actions, "\\033_" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 Gf=24,s=1,v=1,a=T;AAAA\\033\\134AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending screen title through ESC" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // tmux reads the CR and LF in the title as nothing.
+    try openDroppedPendingTestClient(&client, &actions, "\\033k" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 b\\015\\015\\012c\\033\\134AFTER\\015\\015\\012\n",
+    );
 }
 
 test "control client reports a host command reply too large as an error" {
