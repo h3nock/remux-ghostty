@@ -1724,7 +1724,14 @@ pub const Viewer = struct {
             try self.setWindowLayout(window, sample.layout, visible);
             windows_changed = true;
         }
-        if (windows_changed) try actions.append(arena_alloc, .{ .windows = self.windows.items });
+        if (windows_changed) {
+            // A command read together with a split runs before tmux notifies
+            // the split, so the samples can hold a pane this viewer hasn't
+            // seen. Adopting the layouts as a layout change does keeps every
+            // published pane tracked, a new one behind its hydration.
+            try self.syncLayouts(self.windows.items);
+            try actions.append(arena_alloc, .{ .windows = self.windows.items });
+        }
 
         const reordered = inflight.output_panes.count() > 1;
         for (after_samples) |after| {
@@ -5787,6 +5794,46 @@ test "client resize keeps panes in place when tmux's layout notifications follow
         try testing.expect(!pane.stale);
         try testing.expectEqual(6, pane.terminal_owner.terminal.rows);
     }
+}
+
+fn expectLayoutPanesTracked(viewer: *const Viewer, layout: Layout) !void {
+    switch (layout.content) {
+        .pane => |id| try testing.expect(viewer.panes.contains(id)),
+        .horizontal, .vertical => |children| for (children) |child| {
+            try expectLayoutPanesTracked(viewer, child);
+        },
+    }
+}
+
+test "client resize tracks a pane its samples show before its layout change" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(0, "9edd,20x10,0,0,0", true));
+    _ = try testResizePane(&viewer, 0, 10, "");
+
+    // tmux 3.5a, `split-window -d` and the resize read in one write: tmux
+    // runs both before notifying the split, so both samples already hold
+    // the new pane %1 and its %layout-change follows the reply.
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%0;20;5;8;0;0;0;3962,20x10,0,0[20x5,0,0,0,20x4,0,6,1];\n" ++
+        "%1;20;4;0;0;0;0;;");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%0;20;3;8;0;0;0;77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1];\n" ++
+        "%1;20;2;0;0;0;0;;");
+
+    for (viewer.windows.items) |window| try expectLayoutPanesTracked(&viewer, window.layout);
+    try testing.expectEqual(Viewer.Pane.Phase.initial_hydrating, viewer.panes.get(1).?.phase);
+    try testing.expect(testCommandWith(actions, "capture-pane -p -P -C -t %1") != null);
+
+    const notified = viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = "77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1]",
+        .visible_layout = "77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1]",
+        .raw_flags = "*",
+    } } });
+    try testing.expect(testCommandWith(notified, "capture-pane -p -P -C -t %1") == null);
 }
 
 test "client resize follows panes whose sample line has no layout" {
