@@ -600,10 +600,18 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
-    // Draw. A requested frame draws now, even while hidden.
+    // Draw. A requested frame draws now, even while hidden. A hidden
+    // surface then releases the GPU resources the draw rebuilt, as hiding
+    // it did; the layer keeps the published frame, whose surface the
+    // present retained.
     if (requested) {
         t.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
+        if (!t.flags.visible) {
+            t.renderer.draw_mutex.lockUncancelable(global.io());
+            defer t.renderer.draw_mutex.unlock(global.io());
+            t.renderer.releaseGpuResources();
+        }
     } else t.drawFrame(false);
 
     // Schedule the next animation wake, if the renderer needs one.
