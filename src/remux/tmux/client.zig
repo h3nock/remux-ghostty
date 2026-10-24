@@ -521,6 +521,14 @@ pub const ControlClient = struct {
                             .failure,
                             .{ .skipped_after_error = cause },
                         ),
+                        // The host gets no reply to use, so for it the
+                        // command failed.
+                        .reply_too_large => try self.handleCommandCompletion(
+                            command.token,
+                            command.source,
+                            .too_large,
+                            .{ .error_block = "reply too large" },
+                        ),
                     },
                     .exited => |detail| try self.handleViewer(.{ .tmux = .{
                         .exit = detail,
@@ -1420,6 +1428,266 @@ test "control client refresh failure is pane local" {
     try testing.expect(client.panePhase(0) == null);
     try testing.expectEqual(1, actions.records.items.len);
     try testing.expect(actions.records.items[0] == .windows);
+}
+
+/// Start a client on a traced tmux's replies to the startup queries,
+/// leaving the hydration group they produce to be answered.
+fn openTraceStartupTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+    startup_replies: []const u8,
+) !void {
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $0 ov\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(startup_replies, actions);
+}
+
+test "control client recaptures fewer history rows after their reply is too large" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 2_000,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a 6x2 pane whose seven history rows give every
+    // cell its own 24-bit colors, as half-block image viewers print. With a
+    // 1 KiB limit the seven rows are too large and three aren't.
+    const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
+    const row1 = "\x1b[38;2;30;0;15m\x1b[48;2;0;30;0m▀\x1b[38;2;30;30;30m\x1b[48;2;25;30;10m▀\x1b[38;2;30;60;45m\x1b[48;2;50;30;20m▀\x1b[38;2;30;90;60m\x1b[48;2;75;30;30m▀\x1b[38;2;30;120;75m\x1b[48;2;100;30;40m▀\x1b[38;2;30;150;90m\x1b[48;2;125;30;50m▀";
+    const row2 = "\x1b[38;2;60;0;30m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;45m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;60m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;75m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;90m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;105m\x1b[48;2;125;60;50m▀";
+    const row3 = "\x1b[38;2;90;0;45m\x1b[48;2;0;90;0m▀\x1b[38;2;90;30;60m\x1b[48;2;25;90;10m▀\x1b[38;2;90;60;75m\x1b[48;2;50;90;20m▀\x1b[38;2;90;90;90m\x1b[48;2;75;90;30m▀\x1b[38;2;90;120;105m\x1b[48;2;100;90;40m▀\x1b[38;2;90;150;120m\x1b[48;2;125;90;50m▀";
+    const row4 = "\x1b[38;2;120;0;60m\x1b[48;2;0;120;0m▀\x1b[38;2;120;30;75m\x1b[48;2;25;120;10m▀\x1b[38;2;120;60;90m\x1b[48;2;50;120;20m▀\x1b[38;2;120;90;105m\x1b[48;2;75;120;30m▀\x1b[38;2;120;120;120m\x1b[48;2;100;120;40m▀\x1b[38;2;120;150;135m\x1b[48;2;125;120;50m▀";
+    const row5 = "\x1b[38;2;150;0;75m\x1b[48;2;0;150;0m▀\x1b[38;2;150;30;90m\x1b[48;2;25;150;10m▀\x1b[38;2;150;60;105m\x1b[48;2;50;150;20m▀\x1b[38;2;150;90;120m\x1b[48;2;75;150;30m▀\x1b[38;2;150;120;135m\x1b[48;2;100;150;40m▀\x1b[38;2;150;150;150m\x1b[48;2;125;150;50m▀";
+    const row6 = "\x1b[38;2;180;0;90m\x1b[48;2;0;180;0m▀\x1b[38;2;180;30;105m\x1b[48;2;25;180;10m▀\x1b[38;2;180;60;120m\x1b[48;2;50;180;20m▀\x1b[38;2;180;90;135m\x1b[48;2;75;180;30m▀\x1b[38;2;180;120;150m\x1b[48;2;100;180;40m▀\x1b[38;2;180;150;165m\x1b[48;2;125;180;50m▀";
+    const row7 = "\x1b[38;2;210;0;105m\x1b[48;2;0;210;0m▀\x1b[38;2;210;30;120m\x1b[48;2;25;210;10m▀\x1b[38;2;210;60;135m\x1b[48;2;50;210;20m▀\x1b[38;2;210;90;150m\x1b[48;2;75;210;30m▀\x1b[38;2;210;120;165m\x1b[48;2;100;210;40m▀\x1b[38;2;210;150;180m\x1b[48;2;125;210;50m▀";
+    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;7;0;1;;sleep;/private/tmp";
+    client.channel.parser.max_bytes = 1024;
+
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792870512 278 1\n3.5a\n%end 1792870512 278 1\n" ++
+            "%begin 1792870513 279 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 sleep\n%end 1792870513 279 1\n",
+    );
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -q -S -2000 -E -1 -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792870513 280 1\n" ++ state ++ "\n%end 1792870513 280 1\n" ++
+            "%begin 1792870513 281 1\n" ++
+            row0 ++ "\n" ++ row1 ++ "\n" ++ row2 ++ "\n" ++ row3 ++ "\n" ++
+            row4 ++ "\n" ++ row5 ++ "\n" ++ row6 ++ "\n" ++
+            "%end 1792870513 281 1\n" ++
+            "%begin 1792870513 282 1\n\n%end 1792870513 282 1\n" ++
+            "%begin 1792870513 283 1\n" ++ row7 ++ "\n\n%end 1792870513 283 1\n" ++
+            "%begin 1792870513 284 1\n\n%end 1792870513 284 1\n",
+        &actions,
+    );
+
+    // The pane goes live without its history, and is captured again with
+    // half the rows tmux has.
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870514 285 1\n%pause %0\n%end 1792870514 285 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -q -S -3 -E -1 -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 1792870514 286 1\n" ++ state ++ "\n%end 1792870514 286 1\n" ++
+            "%begin 1792870514 287 1\n" ++
+            row4 ++ "\n" ++ row5 ++ "\n" ++ row6 ++ "\n" ++
+            "%end 1792870514 287 1\n" ++
+            "%begin 1792870514 288 1\n\n%end 1792870514 288 1\n" ++
+            "%begin 1792870514 289 1\n" ++ row7 ++ "\n\n%end 1792870514 289 1\n" ++
+            "%begin 1792870514 290 1\n\n%end 1792870514 290 1\n" ++
+            "%begin 1792870514 291 1\n%continue %0\n%end 1792870514 291 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[0].pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const screen = owner.terminal.screens.active;
+    const history = try screen.dumpStringAlloc(testing.allocator, .{ .history = .{} });
+    defer testing.allocator.free(history);
+    try testing.expectEqualStrings("▀▀▀▀▀▀\n▀▀▀▀▀▀\n▀▀▀▀▀▀", history);
+    const fg = screen.pages.getCell(.{ .history = .{ .x = 0, .y = 0 } }).?.style().fg_color;
+    try testing.expect(fg == .rgb);
+    try testing.expectEqual(120, fg.rgb.r);
+}
+
+test "control client recaptures plain screens after their styled reply is too large" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a 6x2 pane both of whose rows give every cell
+    // its own 24-bit colors. With a 256-byte limit the styled screen is too
+    // large and the plain one isn't.
+    const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
+    const row1 = "\x1b[38;2;60;0;15m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;30m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;45m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;60m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;75m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;90m\x1b[48;2;125;60;50m▀";
+    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;sleep;/private/tmp";
+    client.channel.parser.max_bytes = 256;
+
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792870564 278 1\n3.5a\n%end 1792870564 278 1\n" ++
+            "%begin 1792870564 279 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 sleep\n%end 1792870564 279 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792870565 280 1\n" ++ state ++ "\n%end 1792870565 280 1\n" ++
+            "%begin 1792870565 281 1\n\n%end 1792870565 281 1\n" ++
+            "%begin 1792870565 282 1\n" ++ row0 ++ "\n" ++ row1 ++ "\n%end 1792870565 282 1\n" ++
+            "%begin 1792870565 283 1\n\n%end 1792870565 283 1\n",
+        &actions,
+    );
+
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870565 284 1\n%pause %0\n%end 1792870565 284 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -N -a -q -t %0 ; capture-pane -p -N -q -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 1792870566 285 1\n" ++ state ++ "\n%end 1792870566 285 1\n" ++
+            "%begin 1792870566 286 1\n\n%end 1792870566 286 1\n" ++
+            "%begin 1792870566 287 1\n▀▀▀▀▀▀\n▀▀▀▀▀▀\n%end 1792870566 287 1\n" ++
+            "%begin 1792870566 288 1\n\n%end 1792870566 288 1\n" ++
+            "%begin 1792870566 289 1\n%continue %0\n%end 1792870566 289 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[0].pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    {
+        const owner = client.retainPaneTerminal(0).?;
+        defer owner.release();
+        owner.mutex.lockUncancelable(owner.terminal.io());
+        defer owner.mutex.unlock(owner.terminal.io());
+        const contents = try owner.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(contents);
+        try testing.expectEqualStrings("▀▀▀▀▀▀\n▀▀▀▀▀▀", contents);
+    }
+
+    // The screen may have changed by the next capture, which has its
+    // styles again.
+    try client.refreshPane(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870567 290 1\n%pause %0\n%end 1792870567 290 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -a -q -t %0 ; capture-pane -p -e -N -q -t %0 ; ",
+    ));
+}
+
+test "control client recaptures a pane whose pending reply is too large" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a program has written the start of an OSC title
+    // sequence, then finishes it after the pane's capture. With a 256-byte
+    // limit the unfinished sequence is too large.
+    const state = "%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;";
+    client.channel.parser.max_bytes = 256;
+
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792870726 277 1\n3.5a\n%end 1792870726 277 1\n" ++
+            "%begin 1792870727 278 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 zsh\n%end 1792870727 278 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792870727 279 1\n" ++ state ++ "zsh;/private/tmp\n%end 1792870727 279 1\n" ++
+            "%begin 1792870727 280 1\n\n%end 1792870727 280 1\n" ++
+            "%begin 1792870727 281 1\n\n\n%end 1792870727 281 1\n" ++
+            "%begin 1792870727 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792870727 282 1\n" ++
+            "%output %0 \\007\n",
+        &actions,
+    );
+
+    // The rest of the sequence can't be told from text, so the pane is
+    // captured again once tmux has it.
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870730 284 1\n%pause %0\n%end 1792870730 284 1\n", &actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 1792870730 285 1\n" ++ state ++ "sleep;/private/tmp\n%end 1792870730 285 1\n" ++
+            "%begin 1792870730 286 1\n\n%end 1792870730 286 1\n" ++
+            "%begin 1792870730 287 1\n\n\n%end 1792870730 287 1\n" ++
+            "%begin 1792870730 288 1\n\n%end 1792870730 288 1\n" ++
+            "%begin 1792870730 289 1\n%continue %0\n%end 1792870730 289 1\n",
+        &actions,
+    );
+    try testing.expectEqual(2, actions.records.items.len);
+    try testing.expect(actions.records.items[0] == .windows);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[1].pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+}
+
+test "control client reports a host command reply too large as an error" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openReadyTestClient(&client, &actions);
+    client.channel.parser.max_bytes = 16;
+
+    const token = try client.enqueueCommand("show-buffer");
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 9 9 1\nmore than sixteen bytes\n%end 9 9 1\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_error);
+    try testing.expectEqual(channel_pkg.Channel.State.running, client.channel.state);
 }
 
 test "control client serializes exact binary pane input" {

@@ -24,13 +24,14 @@ pub const Parser = struct {
     buffer: std.Io.Writer.Allocating,
 
     /// The maximum size in bytes of the buffer. This is used to limit
-    /// memory usage. If the buffer exceeds this size, the client will
+    /// memory usage. If a notification exceeds this size, the client will
     /// enter a broken state (the control mode session will be forcibly
-    /// exited and future data dropped).
+    /// exited and future data dropped). A block's data that exceeds it is
+    /// dropped instead, and the block reported as `block_overflow`.
     max_bytes: usize = 1024 * 1024,
 
     /// Metadata from the `%begin` guard for the active block. Valid only
-    /// while `state == .block`.
+    /// while `state` is `.block` or `.block_overflow`.
     block_meta: Notification.Block.Meta = undefined,
 
     const State = enum {
@@ -50,7 +51,16 @@ pub const Parser = struct {
 
         /// Inside a begin/end block.
         block,
+
+        /// Inside a begin/end block whose data exceeded `max_bytes`. The
+        /// buffer holds only the start of the current line, enough to
+        /// recognize the block's guard.
+        block_overflow,
     };
+
+    /// The longest `%end` or `%error` guard line tmux prints: two u64
+    /// fields, a u32 field and a CR.
+    const max_guard_len = "%error ".len + 20 + 1 + 20 + 1 + 10 + 1;
 
     pub fn deinit(self: *Parser) void {
         // If we're in a broken state, we already deinited
@@ -69,9 +79,9 @@ pub const Parser = struct {
 
     // Handle a byte of input.
     //
-    // If we reach our byte limit this will return OutOfMemory. It only
-    // does this on the first time we exceed the limit; subsequent calls
-    // will return null as we drop all input in a broken state.
+    // If a notification reaches our byte limit this will return OutOfMemory.
+    // It only does this on the first time we exceed the limit; subsequent
+    // calls will return null as we drop all input in a broken state.
     pub fn put(self: *Parser, byte: u8) Allocator.Error!?Notification {
         // If we're in a broken state, just do nothing.
         //
@@ -150,11 +160,18 @@ pub const Parser = struct {
 
                 // Didn't end the block, continue accumulating.
             },
+
+            .block_overflow => return self.putBlockOverflow(byte),
         }
 
         // Only enforce the limit on bytes we actually store, so a line
         // filling the buffer exactly can still be terminated.
         if (self.buffer.written().len >= self.max_bytes) {
+            if (self.state == .block) {
+                self.overflowBlock();
+                return self.putBlockOverflow(byte);
+            }
+
             self.broken();
             return error.OutOfMemory;
         }
@@ -164,6 +181,50 @@ pub const Parser = struct {
         };
 
         return null;
+    }
+
+    /// Drop the active block's data. A block is framed by its guard lines,
+    /// so the stream can still be followed. The current line is kept, as it
+    /// may be the start of the guard.
+    fn overflowBlock(self: *Parser) void {
+        assert(self.state == .block);
+        log.warn("tmux control mode block exceeded max_bytes={}", .{self.max_bytes});
+        const written = self.buffer.written();
+        const line_start = if (std.mem.lastIndexOfScalar(
+            u8,
+            written,
+            '\n',
+        )) |v| v + 1 else 0;
+        const line = written[line_start..];
+        const kept = line[0..@min(line.len, max_guard_len + 1)];
+        std.mem.copyForwards(u8, written[0..kept.len], kept);
+        self.buffer.shrinkRetainingCapacity(kept.len);
+        self.state = .block_overflow;
+    }
+
+    /// Drop a byte of an overflowed block's data until the block's guard.
+    fn putBlockOverflow(self: *Parser, byte: u8) Allocator.Error!?Notification {
+        assert(self.state == .block_overflow);
+        const line = self.buffer.written();
+        if (byte != '\n') {
+            // A longer line can't be the guard, so only its start is kept.
+            if (line.len <= max_guard_len) {
+                self.buffer.writer.writeByte(byte) catch |err| switch (err) {
+                    error.WriteFailed => return error.OutOfMemory,
+                };
+            }
+            return null;
+        }
+
+        defer self.buffer.clearRetainingCapacity();
+        if (line.len > max_guard_len) return null;
+        const guard = parseBlockGuard(line) orelse return null;
+        if (guard.kind == .begin or !std.meta.eql(guard.meta, self.block_meta)) return null;
+        self.state = .idle;
+        return .{ .block_overflow = .{
+            .meta = guard.meta,
+            .is_error = guard.kind == .err,
+        } };
     }
 
     const ParseError = error{RegexError};
@@ -674,6 +735,10 @@ pub const Notification = union(enum) {
     block_end: Block,
     block_err: Block,
 
+    /// A begin/end block whose data exceeded the parser's `max_bytes`. The
+    /// data was dropped; parsing continues after the block's guard.
+    block_overflow: BlockOverflow,
+
     /// Raw tmux-escaped output from a pane. Consumers that feed a terminal
     /// must decode `data` exactly once with `decodeEscapedOutput`.
     output: Output,
@@ -753,6 +818,13 @@ pub const Notification = union(enum) {
     pub const Output = struct {
         pane_id: usize,
         data: []u8,
+    };
+
+    pub const BlockOverflow = struct {
+        meta: Block.Meta,
+
+        /// The block ended with `%error` rather than `%end`.
+        is_error: bool,
     };
 
     pub const Block = struct {
@@ -891,6 +963,51 @@ test "tmux exceeding max_bytes" {
     for (line[0 .. line.len - 1]) |byte| try testing.expect(try c.put(byte) == null);
     try testing.expectError(error.OutOfMemory, c.put(line[line.len - 1]));
     try testing.expect(try c.put('\n') == null);
+}
+
+test "tmux block exceeding max_bytes is dropped up to its guard" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc), .max_bytes = 32 };
+    defer c.deinit();
+    for ("%begin 1578922740 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("a line longer than the limit of 32\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1578922740 268 1 a payload line, not the guard\n") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_overflow);
+    try testing.expect(!n.block_overflow.is_error);
+    try testing.expectEqualDeep(
+        Notification.Block.Meta{ .time = 1578922740, .number = 269, .flags = 1 },
+        n.block_overflow.meta,
+    );
+
+    // The stream is followed past the dropped block.
+    for ("%sessions-changed") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect((try c.put('\n')).? == .sessions_changed);
+    for ("%begin 1578922740 270 1\nfits\n%end 1578922740 270 1") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const next = (try c.put('\n')).?;
+    try testing.expect(next == .block_end);
+    try testing.expectEqualStrings("fits", next.block_end.data);
+}
+
+test "tmux block exceeding max_bytes within its guard keeps the guard" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const data = "hello, more data\n";
+    var c: Parser = .{ .buffer = .init(alloc), .max_bytes = data.len + 4 };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for (data ++ "%error 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_overflow);
+    try testing.expect(n.block_overflow.is_error);
 }
 
 test "tmux begin/end data" {

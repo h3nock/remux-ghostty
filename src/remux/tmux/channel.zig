@@ -21,8 +21,13 @@ pub const CommandSource = enum {
 };
 
 pub const CommandFailure = union(enum) {
-    /// Tmux executed the command and returned `%error`.
+    /// Tmux executed the command and returned `%error`. The body is empty
+    /// when it exceeded the parser's limit.
     error_block: []const u8,
+
+    /// Tmux executed the command, but its reply exceeded the parser's limit
+    /// and was dropped.
+    reply_too_large,
 
     /// Tmux skipped this command after an earlier member of the same
     /// semicolon-joined command group failed.
@@ -354,8 +359,27 @@ pub const Channel = struct {
         handler: anytype,
     ) void {
         switch (notification) {
-            .block_end => |block| self.dispatchBlock(block, false, notification, handler),
-            .block_err => |block| self.dispatchBlock(block, true, notification, handler),
+            .block_end => |block| self.dispatchBlock(
+                block.meta,
+                false,
+                block.data,
+                notification,
+                handler,
+            ),
+            .block_err => |block| self.dispatchBlock(
+                block.meta,
+                true,
+                block.data,
+                notification,
+                handler,
+            ),
+            .block_overflow => |block| self.dispatchBlock(
+                block.meta,
+                block.is_error,
+                null,
+                notification,
+                handler,
+            ),
             .exit => |detail| if (self.parser.isBroken())
                 self.abort(.protocol_error, handler)
             else
@@ -368,30 +392,36 @@ pub const Channel = struct {
         }
     }
 
+    /// `data` is null when the block's data exceeded the parser's limit.
     fn dispatchBlock(
         self: *Channel,
-        block: control.Notification.Block,
+        meta: control.Notification.Block.Meta,
         is_error: bool,
+        data: ?[]const u8,
         notification: control.Notification,
         handler: anytype,
     ) void {
         switch (self.state) {
             .handshake => {
-                if (block.meta.flags != 0) {
+                if (meta.flags != 0) {
                     self.abort(.unexpected_block, handler);
                     return;
                 }
                 if (is_error) {
-                    self.abort(.{ .handshake_failed = block.data }, handler);
+                    self.abort(.{ .handshake_failed = data orelse "" }, handler);
                     return;
                 }
+                const body = data orelse {
+                    self.abort(.buffer_overflow, handler);
+                    return;
+                };
 
                 self.state = .running;
-                handler.channelEvent(.{ .handshake_ok = block.data });
+                handler.channelEvent(.{ .handshake_ok = body });
             },
 
             .running => {
-                if (!block.meta.isClient()) {
+                if (!meta.isClient()) {
                     handler.channelEvent(.{ .notification = notification });
                     return;
                 }
@@ -402,10 +432,18 @@ pub const Channel = struct {
                 };
 
                 if (!is_error) {
+                    const body = data orelse {
+                        handler.channelEvent(.{ .command_failed = .{
+                            .token = pending.token,
+                            .source = pending.source,
+                            .failure = .reply_too_large,
+                        } });
+                        return;
+                    };
                     handler.channelEvent(.{ .command_ok = .{
                         .token = pending.token,
                         .source = pending.source,
-                        .body = block.data,
+                        .body = body,
                     } });
                     return;
                 }
@@ -413,7 +451,7 @@ pub const Channel = struct {
                 handler.channelEvent(.{ .command_failed = .{
                     .token = pending.token,
                     .source = pending.source,
-                    .failure = .{ .error_block = block.data },
+                    .failure = .{ .error_block = data orelse "" },
                 } });
 
                 var member = pending;
@@ -483,6 +521,7 @@ const TestEvents = struct {
         notification: std.meta.Tag(control.Notification),
         command_ok: CommandToken,
         command_error: CommandToken,
+        command_too_large: CommandToken,
         command_skipped: struct {
             token: CommandToken,
             cause: CommandToken,
@@ -505,6 +544,7 @@ const TestEvents = struct {
             .command_ok => |command| .{ .command_ok = command.token },
             .command_failed => |command| switch (command.failure) {
                 .error_block => .{ .command_error = command.token },
+                .reply_too_large => .{ .command_too_large = command.token },
                 .skipped_after_error => |cause| .{ .command_skipped = .{
                     .token = command.token,
                     .cause = cause,
@@ -583,6 +623,68 @@ test "tmux channel group failure skips only its remaining members" {
     try testing.expectEqual(group[1], events.items.items[3].command_skipped.cause);
     try testing.expectEqual(independent, events.items.items[4].command_ok);
     try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel reply too large fails only its command" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    openTestChannel(&channel, &events);
+    channel.parser.max_bytes = 16;
+
+    var group: [2]CommandToken = undefined;
+    try channel.enqueueCommandGroup(&.{ "command-a", "command-b" }, &group);
+    try channel.feed(
+        "%begin 2 2 1\nmore than sixteen bytes\n%end 2 2 1\n" ++
+            "%begin 3 3 1\nfits\n%end 3 3 1\n",
+        &events,
+    );
+
+    // tmux runs the rest of a group after a successful member.
+    try testing.expectEqual(group[0], events.items.items[1].command_too_large);
+    try testing.expectEqual(group[1], events.items.items[2].command_ok);
+    try testing.expectEqual(Channel.State.running, channel.state);
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel error too large still skips its group" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    openTestChannel(&channel, &events);
+    channel.parser.max_bytes = 16;
+
+    var group: [2]CommandToken = undefined;
+    try channel.enqueueCommandGroup(&.{ "command-a", "command-b" }, &group);
+    try channel.feed("%begin 2 2 1\nmore than sixteen bytes\n%error 2 2 1\n", &events);
+
+    try testing.expectEqual(group[0], events.items.items[1].command_error);
+    try testing.expectEqual(group[1], events.items.items[2].command_skipped.token);
+    try testing.expectEqual(Channel.State.running, channel.state);
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel handshake too large aborts" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    channel.parser.max_bytes = 16;
+
+    try channel.feed("%begin 1 1 0\nmore than sixteen bytes\n%end 1 1 0\n", &events);
+    try testing.expectEqual(Channel.State.aborted, channel.state);
+    try testing.expectEqual(
+        std.meta.Tag(AbortReason).buffer_overflow,
+        events.items.items[0].aborted,
+    );
 }
 
 test "tmux channel whole-line parse error skips the complete group" {
