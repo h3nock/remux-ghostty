@@ -16,6 +16,7 @@ const RGB = @import("../../terminal/color.zig").RGB;
 const Layout = @import("../../terminal/tmux/layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
+const PendingRemainder = @import("pending.zig").Remainder;
 const resize = @import("resize.zig");
 
 const log = std.log.scoped(.terminal_tmux_viewer);
@@ -168,6 +169,13 @@ const COMMAND_QUEUE_INITIAL = 8;
 ///
 /// At any point, if an unrecoverable error occurs or tmux sends `%exit`,
 /// the viewer transitions to the `defunct` state and emits an `.exit` action.
+///
+/// A capture whose reply is too large for the control parser is taken again
+/// with less once the pane is live: half the history rows tmux has, or the
+/// screens without styles. Pending output too large to keep is the start of
+/// an escape sequence the program hasn't finished; the rest of it, arriving
+/// as output, is read past by tmux's rules and never reaches the pane's
+/// parser.
 ///
 /// ## Session Changes
 ///
@@ -385,6 +393,10 @@ pub const Viewer = struct {
         /// Tmux didn't run the command: an earlier member of its group
         /// failed.
         skipped,
+
+        /// Tmux ran the command, but its reply exceeded the control parser's
+        /// limit and was dropped, save its start.
+        too_large: []const u8,
     };
 
     pub const Input = union(enum) {
@@ -429,6 +441,11 @@ pub const Viewer = struct {
         saved_primary_cursor: ?CursorPosition = null,
         utf8_carry: Utf8Carry = .{},
 
+        /// The rest of an escape sequence whose pending capture was too
+        /// large to keep. The program's output is read past it before the
+        /// pane's parser gets any.
+        pending_remainder: ?PendingRemainder = null,
+
         /// Output that arrived after tmux paused this pane for a recapture.
         /// It postdates the snapshot and is applied after it.
         replay: std.ArrayList(u8) = .empty,
@@ -461,6 +478,17 @@ pub const Viewer = struct {
         /// alternate screen was active: the height tmux keeps it at until
         /// the program leaves.
         saved_primary_rows: usize = 0,
+
+        /// tmux's history rows in the pane's latest state reply.
+        history_size: usize = 0,
+
+        /// History rows captured in place of `Options.history_line_limit`,
+        /// fewer than a capture whose reply was too large to keep.
+        history_line_limit: ?usize = null,
+
+        /// The last styled screen capture's reply was too large to keep, so
+        /// the next capture is plain.
+        plain_screens: bool = false,
 
         /// The pane's size in tmux's latest layout. A live mirror of another
         /// size was resized by something other than a resize this Viewer
@@ -566,6 +594,21 @@ pub const Viewer = struct {
             const stream: *TerminalStream = @fieldParentPtr("handler", handler);
             const pane: *Pane = @fieldParentPtr("stream", stream);
             pane.render_hold_generation +%= 1;
+        }
+
+        /// Feed the program's output to the pane's parser, past the rest of
+        /// a dropped pending sequence. The caller holds the pane's terminal
+        /// lock.
+        fn nextOutput(self: *Pane, data: []const u8) void {
+            const remainder = if (self.pending_remainder) |*r| r else return self.stream.nextSlice(data);
+            const rest = for (data, 0..) |c, i| switch (remainder.next(c)) {
+                .skip => {},
+                .execute => self.stream.nextSlice(data[i..][0..1]),
+                .end => break data[i + 1 ..],
+                .escape => break data[i..],
+            } else return;
+            self.pending_remainder = null;
+            self.stream.nextSlice(rest);
         }
 
         /// The pane's report for a `pane_changed` action. The caller holds
@@ -698,7 +741,7 @@ pub const Viewer = struct {
         }
 
         var command_storage: [recapture_command_capacity]Command = undefined;
-        const commands = self.recaptureCommands(pane_id, &command_storage);
+        const commands = self.recaptureCommands(pane_id, pane, &command_storage);
 
         // The formatted members live only through the synchronous submit.
         // The arena is independent of the action arena because refresh is
@@ -828,7 +871,7 @@ pub const Viewer = struct {
     }
 
     /// A refresh state query, the hydration captures and a continue.
-    const recapture_command_capacity = 6;
+    const recapture_command_capacity = hydration_command_capacity + 2;
 
     /// The commands that start a recapture: a pause, whose reply sends the
     /// snapshot, or on tmux 3.1, which can't pause a pane, the snapshot
@@ -836,6 +879,7 @@ pub const Viewer = struct {
     fn recaptureCommands(
         self: *const Viewer,
         pane_id: usize,
+        pane: *const Pane,
         storage: *[recapture_command_capacity]Command,
     ) []const Command {
         if (self.supportsPanePause()) {
@@ -843,7 +887,7 @@ pub const Viewer = struct {
             return storage[0..1];
         }
         storage[0] = .{ .pane_refresh_state = pane_id };
-        const hydration = self.paneHydrationCommands(pane_id, storage[1..]);
+        const hydration = self.paneHydrationCommands(pane_id, pane, storage[1..]);
         return storage[0 .. hydration.len + 1];
     }
 
@@ -858,7 +902,7 @@ pub const Viewer = struct {
 
     fn queueRecapture(self: *Viewer, pane_id: usize, pane: *Pane) Allocator.Error!void {
         var storage: [recapture_command_capacity]Command = undefined;
-        const commands = self.recaptureCommands(pane_id, &storage);
+        const commands = self.recaptureCommands(pane_id, pane, &storage);
         try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
         self.beginRecapture(pane);
         for (commands, 0..) |command, i| {
@@ -878,7 +922,7 @@ pub const Viewer = struct {
 
         var storage: [recapture_command_capacity]Command = undefined;
         storage[0] = .{ .pane_refresh_state = pane_id };
-        const hydration = self.paneHydrationCommands(pane_id, storage[1..]);
+        const hydration = self.paneHydrationCommands(pane_id, pane, storage[1..]);
         storage[hydration.len + 1] = .{ .pane_continue = pane_id };
         const commands = storage[0 .. hydration.len + 2];
 
@@ -976,6 +1020,12 @@ pub const Viewer = struct {
                     self.nextDirectCommandError()
                 else
                     &.{},
+                .block_overflow => |block| if (!block.meta.isClient())
+                    &.{}
+                else if (block.is_error)
+                    self.nextDirectCommandError()
+                else
+                    self.nextCommandCompletion(.{ .too_large = block.head }),
                 else => self.nextCommandNotification(n),
             },
         };
@@ -1005,7 +1055,7 @@ pub const Viewer = struct {
                 self.nextHandshakeOk()
             else
                 self.defunct(),
-            .block_err => return self.defunct(),
+            .block_err, .block_overflow => return self.defunct(),
 
             // I don't like catch-all else branches but startup is such
             // a special case of looking for very specific things that
@@ -1149,7 +1199,7 @@ pub const Viewer = struct {
                 .server_exit = detail,
             }),
 
-            .block_end, .block_err => unreachable,
+            .block_end, .block_err, .block_overflow => unreachable,
 
             .output,
             .window_pane_changed,
@@ -1543,7 +1593,7 @@ pub const Viewer = struct {
                 if (!self.panes.contains(kv.key_ptr.*)) try added.append(self.alloc, kv.key_ptr.*);
             }
         }
-        try self.queueHydrationGroup(added.items);
+        try self.queueHydrationGroup(&panes, added.items);
 
         // Transfer only the bounded UTF-8 suffixes that belong to newly
         // discovered panes in this topology snapshot.
@@ -1885,37 +1935,54 @@ pub const Viewer = struct {
 
         const content = switch (completion) {
             .success => |body| body,
-            .failure, .skipped => {
-                // A refresh targets an already-published pane. A capture can
-                // fail if that pane disappears while the group is in flight;
-                // keep the rest of the client alive and leave the pane behind
-                // the hydration barrier until authoritative topology removes
-                // it. Channel supplies a completion for every skipped member,
-                // so FIFO correlation remains intact without emitting a false
-                // pane-changed completion.
-                if (refresh_pane_id != null) return null;
-                if (command.hydrationPane()) |pane_id| {
-                    try self.hydrationNotRun(pane_id, completion == .failure);
-                    return null;
-                }
-                if (command.isHydration()) return error.HydrationFailed;
-                switch (command) {
-                    .pane_metadata, .user => return null,
+            .failure, .skipped => return self.receivedCommandFailure(
+                actions,
+                command,
+                refresh_pane_id,
+                completion,
+            ),
 
-                    // tmux skips the rest of a group after a failed member,
-                    // so the after sample always reports the outcome.
-                    .resize_sample_before, .resize_client => {
-                        if (self.resize_inflight) |*inflight| inflight.failed = true;
-                        return null;
-                    },
-                    .resize_sample_after => {
-                        var arena = self.action_arena.promote(self.alloc);
-                        defer self.action_arena = arena.state;
-                        try self.finishResize(arena.allocator(), actions, null);
-                        return null;
-                    },
-                    else => return error.CommandFailed,
-                }
+            // A capture's reply depends on the pane's contents, so the pane
+            // is captured again with less once it's live.
+            .too_large => switch (command) {
+                .pane_history => |capture| {
+                    if (self.panes.get(capture.id)) |pane| {
+                        const rows = @min(
+                            capture.line_limit orelse pane.history_size,
+                            pane.history_size,
+                        );
+                        pane.history_line_limit = rows / 2;
+                        pane.stale = true;
+                    }
+                    return null;
+                },
+                .pane_saved_visible, .pane_visible => |capture| {
+                    if (!capture.styled) return self.receivedCommandFailure(
+                        actions,
+                        command,
+                        refresh_pane_id,
+                        completion,
+                    );
+                    if (self.panes.get(capture.id)) |pane| {
+                        pane.plain_screens = true;
+                        pane.stale = true;
+                    }
+                    return null;
+                },
+
+                // The start of an escape sequence the program hasn't
+                // finished; its rest arrives as output, and the start the
+                // parser kept tells how it ends. What the sequence does is
+                // lost, and a capture can't restore it, so the pane isn't
+                // captured again: until the program ends the sequence, that
+                // capture would be this one again.
+                .pane_pending => "",
+                else => return self.receivedCommandFailure(
+                    actions,
+                    command,
+                    refresh_pane_id,
+                    completion,
+                ),
             },
         };
 
@@ -1949,14 +2016,27 @@ pub const Viewer = struct {
 
             .pane_history => |capture| try self.receivedPaneHistory(capture.id, content),
 
-            .pane_saved_visible => |id| try self.receivedPaneSavedVisible(id, content),
+            .pane_saved_visible => |capture| try self.receivedPaneSavedVisible(capture.id, content),
 
-            .pane_visible => |id| try self.receivedPaneVisible(id, content),
+            .pane_visible => |capture| {
+                try self.receivedPaneVisible(capture.id, content);
 
-            .pane_pending => |id| if (try self.receivedPanePending(id, content)) {
-                try actions.append(arena_alloc, .{ .pane_changed = self.panes.get(id).?.change(id) });
-                try self.recaptureStaleShownPanes();
-                try self.flushPendingResize();
+                // The screen may fit with its styles by the next capture.
+                if (!capture.styled) if (self.panes.get(capture.id)) |pane| {
+                    pane.plain_screens = false;
+                };
+            },
+
+            .pane_pending => |id| {
+                const reply: PendingReply = switch (completion) {
+                    .too_large => |head| droppedPendingReply(head),
+                    else => .{ .captured = content },
+                };
+                if (try self.receivedPanePending(id, reply)) {
+                    try actions.append(arena_alloc, .{ .pane_changed = self.panes.get(id).?.change(id) });
+                    try self.recaptureStaleShownPanes();
+                    try self.flushPendingResize();
+                }
             },
 
             .pane_pause => |id| try self.receivedPanePaused(id),
@@ -1987,6 +2067,75 @@ pub const Viewer = struct {
             .resize_sample_after => try self.finishResize(arena_alloc, actions, content),
         }
         return null;
+    }
+
+    /// A pane's pending capture: the start of an escape sequence its program
+    /// hasn't finished.
+    const PendingReply = union(enum) {
+        /// The capture's octal-escaped reply.
+        captured: []const u8,
+
+        /// The reply was too large to keep, and the program's output carries
+        /// on the sequence it starts. Null if its start leaves none.
+        dropped: ?PendingRemainder,
+    };
+
+    /// The reply of a pending capture too large to keep, from its
+    /// octal-escaped start.
+    fn droppedPendingReply(head: []const u8) PendingReply {
+        // tmux escapes backslashes too, so every backslash starts an escape,
+        // and the last one may be cut off.
+        var end: usize = @min(head.len, control.Parser.block_head_capacity);
+        if (std.mem.lastIndexOfScalar(u8, head[0..end], '\\')) |i| {
+            if (end - i < 4) end = i;
+        }
+        var buffer: [control.Parser.block_head_capacity]u8 = undefined;
+        @memcpy(buffer[0..end], head[0..end]);
+        return .{ .dropped = PendingRemainder.after(control.decodeEscapedOutput(buffer[0..end])) };
+    }
+
+    /// The command left no reply to apply: tmux refused it, skipped it, or
+    /// its reply was too large to keep.
+    fn receivedCommandFailure(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
+        command: Command,
+        refresh_pane_id: ?usize,
+        completion: CommandCompletion,
+    ) !?ExitReason {
+        // A refresh targets an already-published pane. A capture can fail if
+        // that pane disappears while the group is in flight; keep the rest of
+        // the client alive and leave the pane behind the hydration barrier
+        // until authoritative topology removes it. Channel supplies a
+        // completion for every skipped member, so FIFO correlation remains
+        // intact without emitting a false pane-changed completion.
+        if (refresh_pane_id != null) return null;
+
+        // tmux ran a capture whose reply was too large, so its pane exists
+        // and the rest of its group ran; listing the session's panes can't
+        // help it.
+        if (completion != .too_large) if (command.hydrationPane()) |pane_id| {
+            try self.hydrationNotRun(pane_id, completion == .failure);
+            return null;
+        };
+        if (command.isHydration()) return error.HydrationFailed;
+        switch (command) {
+            .pane_metadata, .user => return null,
+
+            // tmux skips the rest of a group after a failed member, so the
+            // after sample always reports the outcome.
+            .resize_sample_before, .resize_client => {
+                if (self.resize_inflight) |*inflight| inflight.failed = true;
+                return null;
+            },
+            .resize_sample_after => {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                try self.finishResize(arena.allocator(), actions, null);
+                return null;
+            },
+            else => return error.CommandFailed,
+        }
     }
 
     fn receivedTmuxVersion(
@@ -2272,6 +2421,7 @@ pub const Viewer = struct {
                 data.pane_current_command,
                 data.pane_current_path,
             ) or metadata_changed;
+            pane.history_size = data.history_size;
 
             if (!hydrate_terminal) continue;
             if (pane.phase == .refreshing) {
@@ -2654,7 +2804,7 @@ pub const Viewer = struct {
     fn receivedPanePending(
         self: *Viewer,
         id: usize,
-        content: []const u8,
+        reply: PendingReply,
     ) !bool {
         const pane = self.panes.get(id) orelse {
             log.info("received pending pane content for untracked pane id={}", .{id});
@@ -2671,17 +2821,24 @@ pub const Viewer = struct {
         _ = try t.switchScreen(pane.active_screen);
         Pane.restoreCursor(t.screens.active, pane.cursor);
 
-        if (content.len > 0) {
-            const encoded = try self.alloc.dupe(u8, content);
-            defer self.alloc.free(encoded);
-            pane.stream.nextSlice(control.decodeEscapedOutput(encoded));
-        } else {
-            pane.stream.nextSlice(pane.utf8_carry.slice());
+        pane.pending_remainder = null;
+        switch (reply) {
+            .captured => |content| if (content.len > 0) {
+                const encoded = try self.alloc.dupe(u8, content);
+                defer self.alloc.free(encoded);
+                pane.stream.nextSlice(control.decodeEscapedOutput(encoded));
+            } else {
+                pane.stream.nextSlice(pane.utf8_carry.slice());
+            },
+
+            // Output the capture covers, and so its carry, is part of the
+            // dropped sequence.
+            .dropped => |remainder| pane.pending_remainder = remainder,
         }
 
         // Output tmux sent after pausing the pane postdates the snapshot.
         if (pane.replay_output) {
-            pane.stream.nextSlice(pane.replay.items);
+            pane.nextOutput(pane.replay.items);
             pane.replay.clearRetainingCapacity();
             pane.replay_output = false;
         }
@@ -2769,7 +2926,7 @@ pub const Viewer = struct {
                 const owner = pane.terminal_owner;
                 owner.mutex.lockUncancelable(owner.terminal.io());
                 defer owner.mutex.unlock(owner.terminal.io());
-                pane.stream.nextSlice(data);
+                pane.nextOutput(data);
                 const left_alternate = pane.primary_stale and
                     owner.terminal.screens.active_key == .primary;
                 if (left_alternate) {
@@ -2880,51 +3037,66 @@ pub const Viewer = struct {
         }
     }
 
+    /// History, saved and current screens, and pending output.
+    const hydration_command_capacity = 4;
+
     /// Build the canonical snapshot sequence used by both first hydration and
     /// in-place refresh. The pane-state command is shared across new panes and
     /// is prepended separately by each caller.
     fn paneHydrationCommands(
         self: *const Viewer,
         pane_id: usize,
+        pane: *const Pane,
         storage: []Command,
     ) []const Command {
-        assert(storage.len >= 4);
+        assert(storage.len >= hydration_command_capacity);
         var len: usize = 0;
-        if (self.options.history_line_limit == null or
-            self.options.history_line_limit.? > 0)
-        {
+        const history_line_limit = pane.history_line_limit orelse
+            self.options.history_line_limit;
+        if (history_line_limit == null or history_line_limit.? > 0) {
             storage[len] = .{ .pane_history = .{
                 .id = pane_id,
-                .line_limit = self.options.history_line_limit,
+                .line_limit = history_line_limit,
             } };
             len += 1;
         }
-        storage[len] = .{ .pane_saved_visible = pane_id };
+        const screen: Command.CaptureScreen = .{
+            .id = pane_id,
+            .styled = !pane.plain_screens,
+        };
+        storage[len] = .{ .pane_saved_visible = screen };
         len += 1;
-        storage[len] = .{ .pane_visible = pane_id };
+        storage[len] = .{ .pane_visible = screen };
         len += 1;
         storage[len] = .{ .pane_pending = pane_id };
         len += 1;
         return storage[0..len];
     }
 
-    /// Queue one command group hydrating `pane_ids`: the shared pane state,
-    /// then each pane's captures. Nothing is queued if allocation fails.
-    fn queueHydrationGroup(self: *Viewer, pane_ids: []const usize) Allocator.Error!void {
+    /// Queue one command group hydrating `pane_ids`, each held in `panes`:
+    /// the shared pane state, then each pane's captures. Nothing is queued if
+    /// allocation fails.
+    fn queueHydrationGroup(
+        self: *Viewer,
+        panes: *const PanesMap,
+        pane_ids: []const usize,
+    ) Allocator.Error!void {
         if (pane_ids.len == 0) return;
-        var count_storage: [4]Command = undefined;
-        const commands_per_pane = self.paneHydrationCommands(0, &count_storage).len;
         try self.command_queue.ensureUnusedCapacity(
             self.alloc,
-            1 + commands_per_pane * pane_ids.len,
+            1 + hydration_command_capacity * pane_ids.len,
         );
         self.command_queue.appendAssumeCapacity(.{
             .command = .pane_state,
             .group_end = false,
         });
         for (pane_ids, 0..) |pane_id, pane_index| {
-            var storage: [4]Command = undefined;
-            const hydration = self.paneHydrationCommands(pane_id, &storage);
+            var storage: [hydration_command_capacity]Command = undefined;
+            const hydration = self.paneHydrationCommands(
+                pane_id,
+                panes.get(pane_id).?,
+                &storage,
+            );
             for (hydration, 0..) |command, command_index| {
                 self.command_queue.appendAssumeCapacity(.{
                     .command = command,
@@ -2975,7 +3147,7 @@ pub const Viewer = struct {
             if (pane.hydration_refusals >= 2) return error.HydrationFailed;
             try retry.append(self.alloc, kv.key_ptr.*);
         }
-        try self.queueHydrationGroup(retry.items);
+        try self.queueHydrationGroup(&self.panes, retry.items);
         for (retry.items) |id| self.panes.get(id).?.awaiting_recheck = false;
     }
 
@@ -3131,10 +3303,10 @@ const Command = union(enum) {
     pane_history: CaptureHistory,
 
     /// Capture the primary screen saved behind an active alternate screen.
-    pane_saved_visible: usize,
+    pane_saved_visible: CaptureScreen,
 
     /// Capture the current visible area for the given pane ID.
-    pane_visible: usize,
+    pane_visible: CaptureScreen,
 
     /// Capture output queued while the pane snapshots were taken.
     pane_pending: usize,
@@ -3182,6 +3354,14 @@ const Command = union(enum) {
         line_limit: ?usize,
     };
 
+    const CaptureScreen = struct {
+        id: usize,
+
+        /// With the cells' styles. A screen whose styled reply was too
+        /// large is captured again without them.
+        styled: bool,
+    };
+
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
@@ -3209,7 +3389,8 @@ const Command = union(enum) {
     fn hydrationPane(self: Command) ?usize {
         return switch (self) {
             .pane_history => |capture| capture.id,
-            .pane_saved_visible, .pane_visible, .pane_pending => |id| id,
+            .pane_saved_visible, .pane_visible => |capture| capture.id,
+            .pane_pending => |id| id,
             else => null,
         };
     }
@@ -3266,20 +3447,20 @@ const Command = union(enum) {
                 }
             },
 
-            .pane_saved_visible => |id| try writer.print(
+            .pane_saved_visible => |capture| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
                 // -N = preserve trailing cells and their styles
                 // -a = capture the saved primary screen behind alternate
                 // -q = return empty if no saved screen exists
-                "capture-pane -p -e -N -a -q -t %{d}",
-                .{id},
+                "capture-pane -p{s} -N -a -q -t %{d}",
+                .{ if (capture.styled) " -e" else "", capture.id },
             ),
 
-            .pane_visible => |id| try writer.print(
+            .pane_visible => |capture| try writer.print(
                 // -N preserves styled trailing cells in the current grid.
-                "capture-pane -p -e -N -q -t %{d}",
-                .{id},
+                "capture-pane -p{s} -N -q -t %{d}",
+                .{ if (capture.styled) " -e" else "", capture.id },
             ),
 
             .pane_pending => |id| try writer.print(
@@ -3832,7 +4013,7 @@ test "pane refresh preserves parser-only mouse modes" {
     pane.stream.nextSlice("\x1b[?9h\x1b[?1015h");
     pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
-    _ = try viewer.receivedPanePending(1, "");
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.urxvt, terminal.flags.mouse_format);
@@ -3841,7 +4022,7 @@ test "pane refresh preserves parser-only mouse modes" {
     pane.stream.nextSlice("\x1b[?1016h");
     pane.phase = .refreshing;
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
-    _ = try viewer.receivedPanePending(1, "");
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expectEqual(.x10, terminal.flags.mouse_event);
     try testing.expect(terminal.modes.get(.mouse_event_x10));
     try testing.expectEqual(.sgr_pixels, terminal.flags.mouse_format);
@@ -4560,7 +4741,7 @@ test "hydration seeds pending VT state before live output" {
         return err;
     };
 
-    try testing.expect(try viewer.receivedPanePending(1, "\\033[1"));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "\\033[1" }));
     var suffix = "mX".*;
     _ = viewer.next(.{ .tmux = .{ .output = .{
         .pane_id = 1,
@@ -4594,7 +4775,7 @@ test "hydration carries split UTF-8 past an empty pending capture" {
         .pane_id = 1,
         .data = &prefix,
     } } });
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
 
     var suffix = [_]u8{ 0x82, 0xAC };
     _ = viewer.next(.{ .tmux = .{ .output = .{
@@ -4643,6 +4824,50 @@ test "hydration command errors do not become terminal content" {
     const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("", actual);
+}
+
+test "direct viewer history reply too large asks for half the rows tmux has" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .history_line_limit = 2_000,
+    });
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    pane.history_size = 7;
+    viewer.panes.put(testing.allocator, 1, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+
+    try viewer.queueCommands(&.{.{ .pane_history = .{
+        .id = 1,
+        .line_limit = 2_000,
+    } }});
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var queued_actions: std.ArrayList(Viewer.Action) = .empty;
+    try viewer.appendQueuedCommandActionsWithAllocator(
+        &queued_actions,
+        arena.allocator(),
+    );
+
+    const actions = viewer.next(.{ .tmux = .{ .block_overflow = .{
+        .meta = testClientBlock("").meta,
+        .is_error = false,
+        .head = "\\033[38;2;0;0;0",
+    } } });
+    try testing.expectEqual(0, actions.len);
+    try testing.expectEqual(State.command_queue, viewer.state);
+    try testing.expectEqual(3, pane.history_line_limit.?);
+    try testing.expect(pane.stale);
+
+    var storage: [Viewer.hydration_command_capacity]Command = undefined;
+    const commands = viewer.paneHydrationCommands(1, pane, &storage);
+    try testing.expectEqual(3, commands[0].pane_history.line_limit.?);
 }
 
 test "direct viewer server block does not consume a command" {
@@ -5369,7 +5594,7 @@ test "alternate pane hydration restores canonical screens" {
     try viewer.receivedPaneVisible(7, "alternate\nsecond");
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
-    try testing.expect(try viewer.receivedPanePending(7, ""));
+    try testing.expect(try viewer.receivedPanePending(7, .{ .captured = "" }));
 
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     try testing.expectEqual(ScreenSet.Key.alternate, pane.active_screen);
@@ -5410,7 +5635,7 @@ test "visible snapshot preserves styled trailing cells" {
     };
 
     try viewer.receivedPaneVisible(1, "\x1b[41mABC  ");
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
 
     const screen = pane.terminal_owner.terminal.screens.active;
     const first = screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
@@ -5582,7 +5807,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
     defer testing.allocator.free(kept_contents);
     try testing.expectEqualStrings("stale-one", kept_contents);
 
-    try testing.expect(try viewer.receivedPanePending(1, ""));
+    try testing.expect(try viewer.receivedPanePending(1, .{ .captured = "" }));
     try testing.expectEqual(12, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(3, pane_1.terminal_owner.terminal.rows);
     try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
@@ -5608,7 +5833,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
         2,
         "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;3;8;1;two",
     );
-    try testing.expect(try viewer.receivedPanePending(2, ""));
+    try testing.expect(try viewer.receivedPanePending(2, .{ .captured = "" }));
     try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
     try testing.expectEqual(4, pane_2.terminal_owner.terminal.rows);
 }

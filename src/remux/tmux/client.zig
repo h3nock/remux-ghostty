@@ -521,6 +521,14 @@ pub const ControlClient = struct {
                             .skipped,
                             .{ .skipped_after_error = cause },
                         ),
+                        // The host gets no reply to use, so for it the
+                        // command failed.
+                        .reply_too_large => |head| try self.handleCommandCompletion(
+                            command.token,
+                            command.source,
+                            .{ .too_large = head },
+                            .{ .error_block = "reply too large" },
+                        ),
                     },
                     .exited => |detail| try self.handleViewer(.{ .tmux = .{
                         .exit = detail,
@@ -1664,6 +1672,426 @@ test "control client refresh failure is pane local" {
     try testing.expect(client.panePhase(0) == null);
     try testing.expectEqual(1, actions.records.items.len);
     try testing.expect(actions.records.items[0] == .windows);
+}
+
+/// Start a client on a traced tmux's replies to the startup queries,
+/// leaving the hydration group they produce to be answered.
+fn openTraceStartupTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+    startup_replies: []const u8,
+) !void {
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $0 ov\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(startup_replies, actions);
+}
+
+test "control client recaptures fewer history rows after their reply is too large" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 2_000,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a 6x2 pane whose seven history rows give every
+    // cell its own 24-bit colors, as half-block image viewers print. With a
+    // 1 KiB limit the seven rows are too large and three aren't.
+    const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
+    const row1 = "\x1b[38;2;30;0;15m\x1b[48;2;0;30;0m▀\x1b[38;2;30;30;30m\x1b[48;2;25;30;10m▀\x1b[38;2;30;60;45m\x1b[48;2;50;30;20m▀\x1b[38;2;30;90;60m\x1b[48;2;75;30;30m▀\x1b[38;2;30;120;75m\x1b[48;2;100;30;40m▀\x1b[38;2;30;150;90m\x1b[48;2;125;30;50m▀";
+    const row2 = "\x1b[38;2;60;0;30m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;45m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;60m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;75m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;90m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;105m\x1b[48;2;125;60;50m▀";
+    const row3 = "\x1b[38;2;90;0;45m\x1b[48;2;0;90;0m▀\x1b[38;2;90;30;60m\x1b[48;2;25;90;10m▀\x1b[38;2;90;60;75m\x1b[48;2;50;90;20m▀\x1b[38;2;90;90;90m\x1b[48;2;75;90;30m▀\x1b[38;2;90;120;105m\x1b[48;2;100;90;40m▀\x1b[38;2;90;150;120m\x1b[48;2;125;90;50m▀";
+    const row4 = "\x1b[38;2;120;0;60m\x1b[48;2;0;120;0m▀\x1b[38;2;120;30;75m\x1b[48;2;25;120;10m▀\x1b[38;2;120;60;90m\x1b[48;2;50;120;20m▀\x1b[38;2;120;90;105m\x1b[48;2;75;120;30m▀\x1b[38;2;120;120;120m\x1b[48;2;100;120;40m▀\x1b[38;2;120;150;135m\x1b[48;2;125;120;50m▀";
+    const row5 = "\x1b[38;2;150;0;75m\x1b[48;2;0;150;0m▀\x1b[38;2;150;30;90m\x1b[48;2;25;150;10m▀\x1b[38;2;150;60;105m\x1b[48;2;50;150;20m▀\x1b[38;2;150;90;120m\x1b[48;2;75;150;30m▀\x1b[38;2;150;120;135m\x1b[48;2;100;150;40m▀\x1b[38;2;150;150;150m\x1b[48;2;125;150;50m▀";
+    const row6 = "\x1b[38;2;180;0;90m\x1b[48;2;0;180;0m▀\x1b[38;2;180;30;105m\x1b[48;2;25;180;10m▀\x1b[38;2;180;60;120m\x1b[48;2;50;180;20m▀\x1b[38;2;180;90;135m\x1b[48;2;75;180;30m▀\x1b[38;2;180;120;150m\x1b[48;2;100;180;40m▀\x1b[38;2;180;150;165m\x1b[48;2;125;180;50m▀";
+    const row7 = "\x1b[38;2;210;0;105m\x1b[48;2;0;210;0m▀\x1b[38;2;210;30;120m\x1b[48;2;25;210;10m▀\x1b[38;2;210;60;135m\x1b[48;2;50;210;20m▀\x1b[38;2;210;90;150m\x1b[48;2;75;210;30m▀\x1b[38;2;210;120;165m\x1b[48;2;100;210;40m▀\x1b[38;2;210;150;180m\x1b[48;2;125;210;50m▀";
+    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;7;0;1;;sleep;/private/tmp";
+    client.channel.parser.max_bytes = 1024;
+
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792870512 278 1\n3.5a\n%end 1792870512 278 1\n" ++
+            "%begin 1792870513 279 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 sleep\n%end 1792870513 279 1\n",
+    );
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -q -S -2000 -E -1 -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792870513 280 1\n" ++ state ++ "\n%end 1792870513 280 1\n" ++
+            "%begin 1792870513 281 1\n" ++
+            row0 ++ "\n" ++ row1 ++ "\n" ++ row2 ++ "\n" ++ row3 ++ "\n" ++
+            row4 ++ "\n" ++ row5 ++ "\n" ++ row6 ++ "\n" ++
+            "%end 1792870513 281 1\n" ++
+            "%begin 1792870513 282 1\n\n%end 1792870513 282 1\n" ++
+            "%begin 1792870513 283 1\n" ++ row7 ++ "\n\n%end 1792870513 283 1\n" ++
+            "%begin 1792870513 284 1\n\n%end 1792870513 284 1\n",
+        &actions,
+    );
+
+    // The pane goes live without its history, and is captured again with
+    // half the rows tmux has.
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870514 285 1\n%pause %0\n%end 1792870514 285 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -q -S -3 -E -1 -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 1792870514 286 1\n" ++ state ++ "\n%end 1792870514 286 1\n" ++
+            "%begin 1792870514 287 1\n" ++
+            row4 ++ "\n" ++ row5 ++ "\n" ++ row6 ++ "\n" ++
+            "%end 1792870514 287 1\n" ++
+            "%begin 1792870514 288 1\n\n%end 1792870514 288 1\n" ++
+            "%begin 1792870514 289 1\n" ++ row7 ++ "\n\n%end 1792870514 289 1\n" ++
+            "%begin 1792870514 290 1\n\n%end 1792870514 290 1\n" ++
+            "%begin 1792870514 291 1\n%continue %0\n%end 1792870514 291 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[0].pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const screen = owner.terminal.screens.active;
+    const history = try screen.dumpStringAlloc(testing.allocator, .{ .history = .{} });
+    defer testing.allocator.free(history);
+    try testing.expectEqualStrings("▀▀▀▀▀▀\n▀▀▀▀▀▀\n▀▀▀▀▀▀", history);
+    const fg = screen.pages.getCell(.{ .history = .{ .x = 0, .y = 0 } }).?.style().fg_color;
+    try testing.expect(fg == .rgb);
+    try testing.expectEqual(120, fg.rgb.r);
+}
+
+test "control client recaptures plain screens after their styled reply is too large" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a 6x2 pane both of whose rows give every cell
+    // its own 24-bit colors. With a 256-byte limit the styled screen is too
+    // large and the plain one isn't.
+    const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
+    const row1 = "\x1b[38;2;60;0;15m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;30m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;45m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;60m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;75m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;90m\x1b[48;2;125;60;50m▀";
+    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;sleep;/private/tmp";
+    client.channel.parser.max_bytes = 256;
+
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792870564 278 1\n3.5a\n%end 1792870564 278 1\n" ++
+            "%begin 1792870564 279 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 sleep\n%end 1792870564 279 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792870565 280 1\n" ++ state ++ "\n%end 1792870565 280 1\n" ++
+            "%begin 1792870565 281 1\n\n%end 1792870565 281 1\n" ++
+            "%begin 1792870565 282 1\n" ++ row0 ++ "\n" ++ row1 ++ "\n%end 1792870565 282 1\n" ++
+            "%begin 1792870565 283 1\n\n%end 1792870565 283 1\n",
+        &actions,
+    );
+
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqualStrings("refresh-client -A '%0:pause'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870565 284 1\n%pause %0\n%end 1792870565 284 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -N -a -q -t %0 ; capture-pane -p -N -q -t %0 ; ",
+    ));
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 1792870566 285 1\n" ++ state ++ "\n%end 1792870566 285 1\n" ++
+            "%begin 1792870566 286 1\n\n%end 1792870566 286 1\n" ++
+            "%begin 1792870566 287 1\n▀▀▀▀▀▀\n▀▀▀▀▀▀\n%end 1792870566 287 1\n" ++
+            "%begin 1792870566 288 1\n\n%end 1792870566 288 1\n" ++
+            "%begin 1792870566 289 1\n%continue %0\n%end 1792870566 289 1\n",
+        &actions,
+    );
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(@as(usize, 0), actions.records.items[0].pane_changed);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    {
+        const owner = client.retainPaneTerminal(0).?;
+        defer owner.release();
+        owner.mutex.lockUncancelable(owner.terminal.io());
+        defer owner.mutex.unlock(owner.terminal.io());
+        const contents = try owner.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(contents);
+        try testing.expectEqualStrings("▀▀▀▀▀▀\n▀▀▀▀▀▀", contents);
+    }
+
+    // The screen may have changed by the next capture, which has its
+    // styles again.
+    try client.refreshPane(0);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792870567 290 1\n%pause %0\n%end 1792870567 290 1\n", &actions);
+    try testing.expect(std.mem.containsAtLeast(
+        u8,
+        client.outboundBytes(),
+        1,
+        " ; capture-pane -p -e -N -a -q -t %0 ; capture-pane -p -e -N -q -t %0 ; ",
+    ));
+}
+
+test "control client reads past the rest of a pending escape sequence too large to keep" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Traced from tmux 3.5a: a program has written the start of an OSC title
+    // sequence, writes more of it after the pane's capture, and only later the
+    // BEL that ends it and a line of text. With a 256-byte limit the
+    // unfinished sequence is too large.
+    client.channel.parser.max_bytes = 256;
+    try openTraceStartupTestClient(
+        &client,
+        &actions,
+        "%begin 1792879996 277 1\n3.5a\n%end 1792879996 277 1\n" ++
+            "%begin 1792879996 278 1\n$0 @0 1 %0 6 2 ce5d,6x2,0,0,0 ce5d,6x2,0,0,0 zsh\n%end 1792879996 278 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
+            "%begin 1792879997 280 1\n\n%end 1792879997 280 1\n" ++
+            "%begin 1792879997 281 1\n\n\n%end 1792879997 281 1\n" ++
+            "%begin 1792879997 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792879997 282 1\n",
+        &actions,
+    );
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+
+    // Until the program ends the sequence, a capture of the pane gets the
+    // same unfinished sequence again.
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try client.feed("%output %0 " ++ "a" ** 200 ++ "\n", &actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try client.feed("%output %0 \\007after\\015\\015\\012\n", &actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const contents = try owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("after", contents);
+    try testing.expect(owner.terminal.getTitle() == null);
+}
+
+/// Start a client on a traced tmux 3.5a pane, 20x4 and showing BEFORE, whose
+/// program has written the start of an escape sequence and 300 bytes of
+/// filler. Its pending capture, `pending`, is too large to keep with a
+/// 256-byte limit.
+fn openDroppedPendingTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+    pending: []const u8,
+) !void {
+    const testing = std.testing;
+    client.channel.parser.max_bytes = 256;
+    try openTraceStartupTestClient(
+        client,
+        actions,
+        "%begin 1792883185 278 1\n3.5a\n%end 1792883185 278 1\n" ++
+            "%begin 1792883185 279 1\n$0 @0 1 %0 20 4 e95d,20x4,0,0,0 e95d,20x4,0,0,0 Python\n%end 1792883185 279 1\n",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
+            "%begin 1792883185 281 1\n\n%end 1792883185 281 1\n" ++
+            "%begin 1792883185 282 1\nBEFORE    \n\n\n\n%end 1792883185 282 1\n" ++
+            "%begin 1792883185 283 1\n",
+        actions,
+    );
+    try client.feed(pending, actions);
+    try client.feed("\n%end 1792883185 283 1\n", actions);
+    for (actions.records.items) |action| try testing.expect(action != .exit);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+}
+
+/// Feed the pane's traced output, which ends the dropped sequence and writes
+/// AFTER, and expect the sequence did nothing: the pane shows only the text
+/// after it, and its title, colors and images are as before. No capture is
+/// sent.
+fn expectDroppedPendingRestSkipped(
+    client: *ControlClient,
+    actions: *TestActions,
+    output: []const u8,
+) !void {
+    const testing = std.testing;
+    try client.feed(output, actions);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    const owner = client.retainPaneTerminal(0).?;
+    defer owner.release();
+    owner.mutex.lockUncancelable(owner.terminal.io());
+    defer owner.mutex.unlock(owner.terminal.io());
+    const t = &owner.terminal;
+    const contents = try t.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expectEqualStrings("BEFORE    \nAFTER", contents);
+    try testing.expect(t.getTitle() == null);
+    try testing.expect(t.colors.background.override == null);
+    try testing.expect(t.colors.foreground.override == null);
+    try testing.expect(t.colors.cursor.override == null);
+    if (comptime @import("terminal_options").kitty_graphics) {
+        try testing.expectEqual(0, t.screens.active.kitty_images.images.count());
+    }
+}
+
+// The cases below are traced from tmux 3.5a: the program ends the sequence
+// 2 s after it began, before tmux's string timeout, and tmux's own pane then
+// shows BEFORE and AFTER.
+
+test "control client skips the rest of a dropped pending CSI" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // The parameters overflow tmux's buffer, so it ignores the CSI at its
+    // final byte. Read as a new CSI, its rest would clear the screen.
+    try openDroppedPendingTestClient(&client, &actions, "\\033[" ++ "1;" ** 150);
+    try expectDroppedPendingRestSkipped(&client, &actions, "%output %0 2JAFTER\\015\\015\\012\n");
+}
+
+test "control client skips the rest of a dropped pending OSC that would set a color" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // tmux reads the rest as more of the title.
+    try openDroppedPendingTestClient(&client, &actions, "\\033]2;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 11;rgb:ffff/0000/0000\\007AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending OSC that would set a title" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    try openDroppedPendingTestClient(&client, &actions, "\\033]2;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 2;SUFFIX_TITLE\\007AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending DCS through its ST" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // A passthrough DCS, which tmux ignores by default. Its data holds an
+    // OSC title with a doubled ESC and an ESC [ 2 J; tmux reads both as data
+    // until ESC \.
+    try openDroppedPendingTestClient(&client, &actions, "\\033Ptmux;" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 b\\033\\033]2;INNER\\007\\033[2Jc\\033\\134AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending APC that would draw an image" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // Read as a new APC, the rest would be a kitty graphics command.
+    try openDroppedPendingTestClient(&client, &actions, "\\033_" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 Gf=24,s=1,v=1,a=T;AAAA\\033\\134AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client skips the rest of a dropped pending screen title through ESC" {
+    var client = try ControlClient.init(std.testing.io, std.testing.allocator, .{
+        .history_line_limit = 0,
+    });
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+
+    // tmux reads the CR and LF in the title as nothing.
+    try openDroppedPendingTestClient(&client, &actions, "\\033k" ++ "a" ** 300);
+    try expectDroppedPendingRestSkipped(
+        &client,
+        &actions,
+        "%output %0 b\\015\\015\\012c\\033\\134AFTER\\015\\015\\012\n",
+    );
+}
+
+test "control client reports a host command reply too large as an error" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openReadyTestClient(&client, &actions);
+    client.channel.parser.max_bytes = 16;
+
+    const token = try client.enqueueCommand("show-buffer");
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 9 9 1\nmore than sixteen bytes\n%end 9 9 1\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_error);
+    try testing.expectEqual(channel_pkg.Channel.State.running, client.channel.state);
 }
 
 test "control client serializes exact binary pane input" {
