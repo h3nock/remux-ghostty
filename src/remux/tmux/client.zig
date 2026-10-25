@@ -518,7 +518,7 @@ pub const ControlClient = struct {
                         .skipped_after_error => |cause| try self.handleCommandCompletion(
                             command.token,
                             command.source,
-                            .failure,
+                            .skipped,
                             .{ .skipped_after_error = cause },
                         ),
                         // The host gets no reply to use, so for it the
@@ -927,40 +927,284 @@ test "control client hydration error skips only its group" {
             "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
             "%begin 3 3 1\n" ++
             "$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 b7dd,83x44,0,0,0 shell\n" ++
-            "%end 3 3 1\n" ++
-            "%window-add @1\n",
+            "%end 3 3 1\n",
         &actions,
     );
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
     var pending_host: [1]channel_pkg.CommandToken = undefined;
     try client.enqueueCommandGroup(&.{"display-message -p pending-host"}, &pending_host);
+    try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
         "%begin 4 4 1\n" ++
-            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;43;8,16\n" ++
+            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;43;8,16;sh;/tmp\n" ++
             "%end 4 4 1\n" ++
             "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
-            "%begin 6 6 1\n%end 6 6 1\n" ++
-            "%begin 7 7 1\npending-host\n%end 7 7 1\n",
+            "%begin 6 6 1\npending-host\n%end 6 6 1\n",
         &actions,
     );
+
+    try expectNoExit(&actions);
+    const last = actions.records.items[actions.records.items.len - 1];
+    try testing.expectEqual(pending_host[0], last.command_success);
+    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(0).?);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+}
+
+/// A client attached to tmux 3.5a whose window @0 holds live pane %0 at
+/// 100x30, the geometry of the hydration traces below.
+fn openTracePaneTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+) !void {
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 2 2 1\n3.5a\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 100 30 a87d,100x30,0,0,0 a87d,100x30,0,0,0 shell\n" ++
+            "%end 3 3 1\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 4 4 1\n%end 4 4 1\n" ++
+            "%begin 5 5 1\n%end 5 5 1\n" ++
+            "%begin 6 6 1\n%end 6 6 1\n" ++
+            "%begin 7 7 1\n%end 7 7 1\n" ++
+            "%begin 8 8 1\n%end 8 8 1\n",
+        actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+}
+
+fn expectNoExit(actions: *const TestActions) !void {
+    for (actions.records.items) |action| try std.testing.expect(action != .exit);
+}
+
+/// Replies to the recapture the viewer starts for %0 when a layout change
+/// resizes it: the pause, then the paused pane's snapshot group.
+fn feedTraceRecapture(client: *ControlClient, actions: *TestActions, first: usize) !void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    for (first..first + 7) |n| try writer.print("%begin {d} {d} 1\n%end {d} {d} 1\n", .{ n, n, n, n });
+    try client.feed(writer.buffered(), actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+}
+
+test "control client survives a pane that closes before its hydration runs" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openTracePaneTestClient(&client, &actions);
+
+    // tmux 3.5a, `split-window 'sleep 0.2'` hydrated 300 ms after the pane
+    // appeared: both layout changes arrive first, the pane state lists only
+    // %0, the capture of %2 is refused and tmux skips the rest of the group.
+    try client.feed(
+        "%layout-change @0 408b,100x30,0,0[100x15,0,0,0,100x14,0,16,2] 408b,100x30,0,0[100x15,0,0,0,100x14,0,16,2] *\n" ++
+            "%layout-change @0 a87d,100x30,0,0,0 a87d,100x30,0,0,0 *\n",
+        &actions,
+    );
+    try testing.expect(std.mem.indexOf(u8, client.outboundBytes(), "-t %2") != null);
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 9 9 1\n%end 9 9 1\n" ++
+            "%begin 10 10 1\ncan't find pane: %2\n%error 10 10 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expect(client.panePhase(2) == null);
+    try testing.expectEqualStrings("", client.outboundBytes());
+
+    try feedTraceRecapture(&client, &actions, 11);
+    try expectNoExit(&actions);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+
+    const token = try client.enqueueCommand("display-message -p still-alive");
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed("%begin 18 18 1\nstill-alive\n%end 18 18 1\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+}
+
+test "control client hydrates again a pane tmux still lists after refusing its group" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openTracePaneTestClient(&client, &actions);
+
+    // %1 and %2 appear in one layout change and %1 closes before their group
+    // runs: tmux refuses %1 and skips every capture of %2.
+    try client.feed(
+        "%layout-change @0 d258,100x30,0,0[100x15,0,0,0,100x7,0,16,1,100x6,0,24,2] d258,100x30,0,0[100x15,0,0,0,100x7,0,16,1,100x6,0,24,2] *\n" ++
+            "%layout-change @0 9d88,100x30,0,0[100x23,0,0,0,100x6,0,24,2] 9d88,100x30,0,0[100x23,0,0,0,100x6,0,24,2] *\n",
+        &actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+    try client.feed(
+        "%begin 9 9 1\n%end 9 9 1\n" ++
+            "%begin 10 10 1\ncan't find pane: %1\n%error 10 10 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expect(client.panePhase(1) == null);
+    try testing.expectEqual(ControlClient.PanePhase.hydrating, client.panePhase(2).?);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    // The recapture of %0 was sent before the recheck; its pause reply comes
+    // first.
+    try client.feed("%begin 11 11 1\n%end 11 11 1\n", &actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 12 12 1\n%0\n%2\n%end 12 12 1\n", &actions);
+    try expectNoExit(&actions);
+    try testing.expect(std.mem.startsWith(u8, client.outboundBytes(), "list-panes -s -F '#{pane_id};"));
+    try testing.expect(std.mem.indexOf(u8, client.outboundBytes(), "capture-pane -p -P -C -t %2") != null);
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    for (13..24) |n| try writer.print("%begin {d} {d} 1\n%end {d} {d} 1\n", .{ n, n, n, n });
+    try client.feed(writer.buffered(), &actions);
+    try expectNoExit(&actions);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(0).?);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(2).?);
+}
+
+test "control client ends when tmux keeps listing a pane it refuses" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openTracePaneTestClient(&client, &actions);
+
+    try client.feed(
+        "%layout-change @0 408b,100x30,0,0[100x15,0,0,0,100x14,0,16,2] 408b,100x30,0,0[100x15,0,0,0,100x14,0,16,2] *\n",
+        &actions,
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+    actions.records.clearRetainingCapacity();
+
+    // Refused, listed, hydrated again and refused again: listed after that,
+    // the refusal isn't a closed pane.
+    try client.feed("%begin 9 9 1\n%end 9 9 1\n%begin 10 10 1\nrefused\n%error 10 10 1\n", &actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 11 11 1\n%end 11 11 1\n", &actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 12 12 1\n%0\n%2\n%end 12 12 1\n", &actions);
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    for (13..19) |n| try writer.print("%begin {d} {d} 1\n%end {d} {d} 1\n", .{ n, n, n, n });
+    try client.feed(writer.buffered(), &actions);
+    try client.feed("%begin 19 19 1\n%end 19 19 1\n%begin 20 20 1\nrefused\n%error 20 20 1\n", &actions);
+    try expectNoExit(&actions);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 21 21 1\n%0\n%2\n%end 21 21 1\n", &actions);
 
     var exits: usize = 0;
     for (actions.records.items) |action| if (action == .exit) {
         exits += 1;
     };
     try testing.expectEqual(1, exits);
-    var host_completions: usize = 0;
-    for (actions.records.items) |action| switch (action) {
-        .command_success, .command_error, .command_skipped => host_completions += 1,
-        else => {},
-    };
-    try testing.expectEqual(0, host_completions);
-    try testing.expectEqualStrings("", client.outboundBytes());
-    try testing.expectEqual(channel_pkg.Channel.State.running, client.channel.state);
-    var token: [1]channel_pkg.CommandToken = undefined;
-    try testing.expectError(
-        error.ChannelClosed,
-        client.enqueueCommandGroup(&.{"must-not-run-after-exit"}, &token),
+    try testing.expectEqual(.client_failure, actions.exit_reason.?);
+}
+
+test "control client hydrates a pane tmux only skipped after other panes closed twice" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openTracePaneTestClient(&client, &actions);
+
+    // tmux 3.5a: a new window brings %1, %2 and %3, top to bottom, hydrated
+    // in one group. %1 closes before that group runs and %2 before the retry
+    // of %2 and %3, so tmux skips every capture of %3 twice without ever
+    // refusing one.
+    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
+    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
+    try client.feed(
+        "%window-renamed @0 bash\n%window-add @1\n" ++
+            "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
+            "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
+            "%window-renamed @1 zsh\n",
+        &actions,
     );
+    try testing.expect(std.mem.startsWith(u8, client.outboundBytes(), "list-windows "));
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792879758 286 1\n" ++
+            "$42 @0 1 %0 100 30 a87d,100x30,0,0,0 a87d,100x30,0,0,0 bash\n" ++
+            "$42 @1 0 %1 100 30 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] zsh\n" ++
+            "%end 1792879758 286 1\n",
+        &actions,
+    );
+    const first = client.outboundBytes();
+    try testing.expect(std.mem.indexOf(u8, first, "-t %1 ;").? < std.mem.indexOf(u8, first, "-t %2 ;").?);
+    try testing.expect(std.mem.indexOf(u8, first, "-t %2 ;").? < std.mem.indexOf(u8, first, "-t %3 ;").?);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%layout-change @1 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] \n" ++
+            "%window-pane-changed @1 %2\n%window-renamed @1 sleep\n" ++
+            "%begin 1792879759 292 1\n" ++ state_0 ++ "\n" ++
+            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%end 1792879759 292 1\n" ++
+            "%begin 1792879759 293 1\ncan't find pane: %1\n%error 1792879759 293 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed("%begin 1792879759 294 1\n%0\n%2\n%3\n%end 1792879759 294 1\n", &actions);
+    const retry = client.outboundBytes();
+    try testing.expect(std.mem.indexOf(u8, retry, "-t %2 ;").? < std.mem.indexOf(u8, retry, "-t %3 ;").?);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%layout-change @1 a880,100x30,0,0,3 a880,100x30,0,0,3 \n%window-pane-changed @1 %3\n" ++
+            "%begin 1792879760 299 1\n" ++ state_0 ++ "\n" ++ state_3 ++ "\n%end 1792879760 299 1\n" ++
+            "%begin 1792879760 300 1\ncan't find pane: %2\n%error 1792879760 300 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'\n", client.outboundBytes());
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    // tmux still lists %3. It never refused it, so it's hydrated again.
+    try client.feed("%begin 1792879761 301 1\n%0\n%3\n%end 1792879761 301 1\n", &actions);
+    try expectNoExit(&actions);
+    try testing.expect(std.mem.indexOf(u8, client.outboundBytes(), "capture-pane -p -P -C -t %3\n") != null);
+    try client.consumeOutbound(client.outboundBytes().len);
+    try client.feed(
+        "%begin 1792879761 302 1\n" ++ state_0 ++ "\n" ++ state_3 ++ "\n%end 1792879761 302 1\n" ++
+            "%begin 1792879761 303 1\n\n%end 1792879761 303 1\n" ++
+            "%begin 1792879761 304 1\n\n%end 1792879761 304 1\n" ++
+            "%begin 1792879761 305 1\n" ++ "\n" ** 30 ++ "%end 1792879761 305 1\n" ++
+            "%begin 1792879761 306 1\n\n%end 1792879761 306 1\n",
+        &actions,
+    );
+    try expectNoExit(&actions);
+    try testing.expectEqual(ControlClient.PanePhase.live, client.panePhase(3).?);
 }
 
 test "control client server block cannot consume a Viewer command" {

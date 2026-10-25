@@ -161,6 +161,10 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// not rendered independently. The pane becomes live only after its canonical
 /// screen, cursors, modes, and retained VT parser state are restored.
 ///
+/// tmux refuses a capture for a pane that closed before its group ran and
+/// skips the rest of the group. The panes of that group it still lists
+/// afterwards are hydrated again by a new group.
+///
 /// ## Error Handling
 ///
 /// At any point, if an unrecoverable error occurs or tmux sends `%exit`,
@@ -227,6 +231,9 @@ pub const Viewer = struct {
     /// one tmux resize.
     resize_inflight: ?ResizeInflight = null,
     resize_pending: ?ClientSize = null,
+
+    /// A `hydration_recheck` is queued and hasn't been answered.
+    hydration_recheck_queued: bool = false,
 
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
@@ -379,7 +386,13 @@ pub const Viewer = struct {
 
     pub const CommandCompletion = union(enum) {
         success: []const u8,
+
+        /// Tmux ran the command and returned `%error`.
         failure,
+
+        /// Tmux didn't run the command: an earlier member of its group
+        /// failed.
+        skipped,
 
         /// Tmux ran the command, but its reply exceeded the control parser's
         /// limit and was dropped, save its start.
@@ -485,6 +498,17 @@ pub const Viewer = struct {
 
         /// See `PaneChange.render_hold_generation`.
         render_hold_generation: u64 = 0,
+
+        /// Times tmux refused one of this pane's own first-hydration
+        /// captures. A pane it refuses has closed and isn't listed again, so
+        /// one it lists after refusing it twice is a real failure. A capture
+        /// tmux skipped after refusing another pane says nothing about this
+        /// one and isn't counted.
+        hydration_refusals: u2 = 0,
+
+        /// tmux refused or skipped one of this pane's first-hydration
+        /// captures, and the pane waits for tmux to list the session's panes.
+        awaiting_recheck: bool = false,
 
         pub const Phase = enum {
             initial_hydrating,
@@ -1343,8 +1367,8 @@ pub const Viewer = struct {
     }
 
     /// Raw tmux emits only one `%error` block for a failed command group.
-    /// Consume the failed member and the remaining members of that same group
-    /// as failures. The canonical ControlClient path receives those as
+    /// Consume the failed member, then the remaining members of that same
+    /// group as skipped. The canonical ControlClient path receives those as
     /// separate correlated completion events from Channel instead.
     fn nextDirectCommandError(self: *Viewer) []const Action {
         if (self.sent_command_count == 0 or self.command_queue.empty()) {
@@ -1355,9 +1379,10 @@ pub const Viewer = struct {
         self.resetActionArena();
         var actions: std.ArrayList(Action) = .empty;
         var terminal_failure = false;
+        var completion: CommandCompletion = .failure;
         while (true) {
             const ends_group = self.command_queue.first().?.group_end;
-            _ = self.receivedCommandCompletion(&actions, .failure) catch |err| switch (err) {
+            _ = self.receivedCommandCompletion(&actions, completion) catch |err| switch (err) {
                 error.CommandFailed, error.HydrationFailed => terminal_failure = true,
                 else => {
                     log.warn("failed to process command error, becoming defunct: {}", .{err});
@@ -1365,6 +1390,7 @@ pub const Viewer = struct {
                 },
             };
             if (ends_group) break;
+            completion = .skipped;
         }
 
         if (terminal_failure) return self.defunct();
@@ -1559,44 +1585,15 @@ pub const Viewer = struct {
         try self.windows.ensureTotalCapacity(self.alloc, windows.len);
 
         // Hydrate all newly discovered panes in one explicit command group.
-        // Reserve exactly once before changing the queue.
-        var added_count: usize = 0;
+        var added: std.ArrayList(usize) = .empty;
+        defer added.deinit(self.alloc);
         {
             var panes_it = panes.iterator();
             while (panes_it.next()) |kv| {
-                if (!self.panes.contains(kv.key_ptr.*)) added_count += 1;
+                if (!self.panes.contains(kv.key_ptr.*)) try added.append(self.alloc, kv.key_ptr.*);
             }
         }
-        if (added_count > 0) {
-            const command_count = 1 + hydration_command_capacity * added_count;
-            try self.command_queue.ensureUnusedCapacity(self.alloc, command_count);
-            self.command_queue.appendAssumeCapacity(.{
-                .command = .pane_state,
-                .group_end = false,
-            });
-
-            var added_index: usize = 0;
-            var panes_it = panes.iterator();
-            while (panes_it.next()) |kv| {
-                const pane_id = kv.key_ptr.*;
-                if (self.panes.contains(pane_id)) continue;
-                added_index += 1;
-
-                var hydration_storage: [hydration_command_capacity]Command = undefined;
-                const hydration = self.paneHydrationCommands(
-                    pane_id,
-                    kv.value_ptr.*,
-                    &hydration_storage,
-                );
-                for (hydration, 0..) |command, command_index| {
-                    self.command_queue.appendAssumeCapacity(.{
-                        .command = command,
-                        .group_end = added_index == added_count and
-                            command_index + 1 == hydration.len,
-                    });
-                }
-            }
-        }
+        try self.queueHydrationGroup(&panes, added.items);
 
         // Transfer only the bounded UTF-8 suffixes that belong to newly
         // discovered panes in this topology snapshot.
@@ -1770,7 +1767,14 @@ pub const Viewer = struct {
             try self.setWindowLayout(window, sample.layout, visible);
             windows_changed = true;
         }
-        if (windows_changed) try actions.append(arena_alloc, .{ .windows = self.windows.items });
+        if (windows_changed) {
+            // A command read together with a split runs before tmux notifies
+            // the split, so the samples can hold a pane this viewer hasn't
+            // seen. Adopting the layouts as a layout change does keeps every
+            // published pane tracked, a new one behind its hydration.
+            try self.syncLayouts(self.windows.items);
+            try actions.append(arena_alloc, .{ .windows = self.windows.items });
+        }
 
         const reordered = inflight.output_panes.count() > 1;
         for (after_samples) |after| {
@@ -1931,10 +1935,11 @@ pub const Viewer = struct {
 
         const content = switch (completion) {
             .success => |body| body,
-            .failure => return self.receivedCommandFailure(
+            .failure, .skipped => return self.receivedCommandFailure(
                 actions,
                 command,
                 refresh_pane_id,
+                completion,
             ),
 
             // A capture's reply depends on the pane's contents, so the pane
@@ -1956,6 +1961,7 @@ pub const Viewer = struct {
                         actions,
                         command,
                         refresh_pane_id,
+                        completion,
                     );
                     if (self.panes.get(capture.id)) |pane| {
                         pane.plain_screens = true;
@@ -1975,6 +1981,7 @@ pub const Viewer = struct {
                     actions,
                     command,
                     refresh_pane_id,
+                    completion,
                 ),
             },
         };
@@ -2036,6 +2043,8 @@ pub const Viewer = struct {
 
             .pane_continue => {},
 
+            .hydration_recheck => try self.receivedHydrationRecheck(content),
+
             .tmux_version => if (try self.receivedTmuxVersion(content)) |reason| {
                 return reason;
             },
@@ -2085,19 +2094,30 @@ pub const Viewer = struct {
         return .{ .dropped = PendingRemainder.after(control.decodeEscapedOutput(buffer[0..end])) };
     }
 
+    /// The command left no reply to apply: tmux refused it, skipped it, or
+    /// its reply was too large to keep.
     fn receivedCommandFailure(
         self: *Viewer,
         actions: *std.ArrayList(Action),
         command: Command,
         refresh_pane_id: ?usize,
+        completion: CommandCompletion,
     ) !?ExitReason {
         // A refresh targets an already-published pane. A capture can fail if
         // that pane disappears while the group is in flight; keep the rest of
         // the client alive and leave the pane behind the hydration barrier
-        // until authoritative topology removes it. Channel supplies failures
-        // for every skipped member, so FIFO correlation remains intact without
-        // emitting a false pane-changed completion.
+        // until authoritative topology removes it. Channel supplies a
+        // completion for every skipped member, so FIFO correlation remains
+        // intact without emitting a false pane-changed completion.
         if (refresh_pane_id != null) return null;
+
+        // tmux ran a capture whose reply was too large, so its pane exists
+        // and the rest of its group ran; listing the session's panes can't
+        // help it.
+        if (completion != .too_large) if (command.hydrationPane()) |pane_id| {
+            try self.hydrationNotRun(pane_id, completion == .failure);
+            return null;
+        };
         if (command.isHydration()) return error.HydrationFailed;
         switch (command) {
             .pane_metadata, .user => return null,
@@ -3053,6 +3073,84 @@ pub const Viewer = struct {
         return storage[0..len];
     }
 
+    /// Queue one command group hydrating `pane_ids`, each held in `panes`:
+    /// the shared pane state, then each pane's captures. Nothing is queued if
+    /// allocation fails.
+    fn queueHydrationGroup(
+        self: *Viewer,
+        panes: *const PanesMap,
+        pane_ids: []const usize,
+    ) Allocator.Error!void {
+        if (pane_ids.len == 0) return;
+        try self.command_queue.ensureUnusedCapacity(
+            self.alloc,
+            1 + hydration_command_capacity * pane_ids.len,
+        );
+        self.command_queue.appendAssumeCapacity(.{
+            .command = .pane_state,
+            .group_end = false,
+        });
+        for (pane_ids, 0..) |pane_id, pane_index| {
+            var storage: [hydration_command_capacity]Command = undefined;
+            const hydration = self.paneHydrationCommands(
+                pane_id,
+                panes.get(pane_id).?,
+                &storage,
+            );
+            for (hydration, 0..) |command, command_index| {
+                self.command_queue.appendAssumeCapacity(.{
+                    .command = command,
+                    .group_end = pane_index + 1 == pane_ids.len and
+                        command_index + 1 == hydration.len,
+                });
+            }
+        }
+    }
+
+    /// tmux refused one of a pane's first-hydration captures, or skipped it
+    /// after refusing an earlier command of the group. A pane topology
+    /// already removed needs nothing; the others wait for tmux to list the
+    /// session's panes.
+    fn hydrationNotRun(self: *Viewer, pane_id: usize, refused: bool) Allocator.Error!void {
+        const pane = self.panes.get(pane_id) orelse return;
+        if (refused) pane.hydration_refusals +|= 1;
+        pane.awaiting_recheck = true;
+        if (self.hydration_recheck_queued) return;
+        try self.queueCommands(&.{.hydration_recheck});
+        self.hydration_recheck_queued = true;
+    }
+
+    /// Hydrate again the panes of a refused group that tmux still lists. A
+    /// pane it doesn't list closed, and topology removes it.
+    fn receivedHydrationRecheck(self: *Viewer, content: []const u8) !void {
+        self.hydration_recheck_queued = false;
+
+        var listed: std.AutoArrayHashMapUnmanaged(usize, void) = .empty;
+        defer listed.deinit(self.alloc);
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trimEnd(u8, line_raw, "\r");
+            if (line.len == 0) continue;
+            if (line[0] != '%') return error.InvalidPaneId;
+            const id = std.fmt.parseInt(usize, line[1..], 10) catch
+                return error.InvalidPaneId;
+            try listed.put(self.alloc, id, {});
+        }
+
+        var retry: std.ArrayList(usize) = .empty;
+        defer retry.deinit(self.alloc);
+        var it = self.panes.iterator();
+        while (it.next()) |kv| {
+            const pane = kv.value_ptr.*;
+            if (!pane.awaiting_recheck) continue;
+            if (!listed.contains(kv.key_ptr.*)) continue;
+            if (pane.hydration_refusals >= 2) return error.HydrationFailed;
+            try retry.append(self.alloc, kv.key_ptr.*);
+        }
+        try self.queueHydrationGroup(&self.panes, retry.items);
+        for (retry.items) |id| self.panes.get(id).?.awaiting_recheck = false;
+    }
+
     /// Enters the command queue state from any other state, queueing and
     /// emitting every complete command group.
     fn enterCommandQueue(
@@ -3243,6 +3341,10 @@ const Command = union(enum) {
     pane_pause: usize,
     pane_continue: usize,
 
+    /// List the session's panes after tmux refused a hydration, to tell the
+    /// refused panes that still exist from the ones that closed.
+    hydration_recheck,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -3277,8 +3379,19 @@ const Command = union(enum) {
             .resize_sample_after,
             .pane_pause,
             .pane_continue,
+            .hydration_recheck,
             => {},
             .user => |v| alloc.free(v),
+        };
+    }
+
+    /// The pane whose first hydration this capture is part of.
+    fn hydrationPane(self: Command) ?usize {
+        return switch (self) {
+            .pane_history => |capture| capture.id,
+            .pane_saved_visible, .pane_visible => |capture| capture.id,
+            .pane_pending => |id| id,
+            else => null,
         };
     }
 
@@ -3300,6 +3413,7 @@ const Command = union(enum) {
             .resize_sample_before,
             .resize_client,
             .resize_sample_after,
+            .hydration_recheck,
             .user,
             => false,
         };
@@ -3389,6 +3503,8 @@ const Command = union(enum) {
             .pane_pause => |id| try writer.print("refresh-client -A '%{d}:pause'", .{id}),
 
             .pane_continue => |id| try writer.print("refresh-client -A '%{d}:continue'", .{id}),
+
+            .hydration_recheck => try writer.writeAll("list-panes -s -F '#{pane_id}'"),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -4700,8 +4816,11 @@ test "hydration command errors do not become terminal content" {
 
     const actions = viewer.next(.{ .tmux = .{ .block_err = testClientBlock("no such pane") } });
     try testing.expectEqual(1, actions.len);
-    try testing.expect(actions[0] == .exit);
+    try testing.expectEqual(1, actions[0].command.members.len);
+    try testing.expectEqualStrings("list-panes -s -F '#{pane_id}'", actions[0].command.members[0]);
     try testing.expectEqual(Viewer.Pane.Phase.initial_hydrating, pane.phase);
+    try testing.expectEqual(1, pane.hydration_refusals);
+    try testing.expect(pane.awaiting_recheck);
     const actual = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("", actual);
@@ -5990,6 +6109,46 @@ test "client resize keeps panes in place when tmux's layout notifications follow
         try testing.expect(!pane.stale);
         try testing.expectEqual(6, pane.terminal_owner.terminal.rows);
     }
+}
+
+fn expectLayoutPanesTracked(viewer: *const Viewer, layout: Layout) !void {
+    switch (layout.content) {
+        .pane => |id| try testing.expect(viewer.panes.contains(id)),
+        .horizontal, .vertical => |children| for (children) |child| {
+            try expectLayoutPanesTracked(viewer, child);
+        },
+    }
+}
+
+test "client resize tracks a pane its samples show before its layout change" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(0, "9edd,20x10,0,0,0", true));
+    _ = try testResizePane(&viewer, 0, 10, "");
+
+    // tmux 3.5a, `split-window -d` and the resize read in one write: tmux
+    // runs both before notifying the split, so both samples already hold
+    // the new pane %1 and its %layout-change follows the reply.
+    try viewer.setClientSize(.{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testComplete(&viewer, "%0;20;5;8;0;0;0;3962,20x10,0,0[20x5,0,0,0,20x4,0,6,1];\n" ++
+        "%1;20;4;0;0;0;0;;");
+    _ = testComplete(&viewer, "");
+    const actions = testComplete(&viewer, "%0;20;3;8;0;0;0;77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1];\n" ++
+        "%1;20;2;0;0;0;0;;");
+
+    for (viewer.windows.items) |window| try expectLayoutPanesTracked(&viewer, window.layout);
+    try testing.expectEqual(Viewer.Pane.Phase.initial_hydrating, viewer.panes.get(1).?.phase);
+    try testing.expect(testCommandWith(actions, "capture-pane -p -P -C -t %1") != null);
+
+    const notified = viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = "77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1]",
+        .visible_layout = "77f5,20x6,0,0[20x3,0,0,0,20x2,0,4,1]",
+        .raw_flags = "*",
+    } } });
+    try testing.expect(testCommandWith(notified, "capture-pane -p -P -C -t %1") == null);
 }
 
 test "client resize follows panes whose sample line has no layout" {
