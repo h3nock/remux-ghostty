@@ -16,6 +16,7 @@ const sizepkg = @import("../renderer/size.zig");
 const SurfaceMouse = @import("../surface_mouse.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_config = @import("terminal_config.zig");
+const unicode = @import("../unicode/main.zig");
 
 const log = std.log.scoped(.terminal_surface);
 
@@ -391,6 +392,50 @@ pub fn cursorGeometry(self: *TerminalSurface) CellGeometry {
     self.shared.mutex.lockUncancelable(global.io());
     defer self.shared.mutex.unlock(global.io());
     return self.cursorGeometryLocked();
+}
+
+/// Replace the composition text drawn over the cursor, as
+/// `Surface.preeditCallback` does for a process-owning surface. Null or empty
+/// text clears it. This is presentation only: nothing is written to the write
+/// sink, terminal contents are unchanged, and the selection is left to the
+/// host, which owns the composition. Invalid UTF-8 is invalid input and keeps
+/// the previous text. The new text is published before a wake can fail.
+pub fn setPreedit(self: *TerminalSurface, text: ?[]const u8) !void {
+    const next = try preeditFromUtf8(self.alloc, text orelse "");
+    const previous = previous: {
+        self.shared.mutex.lockUncancelable(global.io());
+        defer self.shared.mutex.unlock(global.io());
+        const previous = self.runtime.state.preedit;
+        if (previous == null and next == null) return;
+        self.runtime.state.preedit = next;
+        self.shared.terminal.flags.dirty.preedit = true;
+        break :previous previous;
+    };
+    if (previous) |preedit| preedit.deinit(self.alloc);
+    try self.terminalChanged();
+}
+
+/// The renderer's preedit for UTF-8 text, built as `Surface.preeditCallback`
+/// builds it: one entry per codepoint with a cell width, and null when no
+/// codepoint has one.
+fn preeditFromUtf8(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+) !?rendererpkg.State.Preedit {
+    const view = std.unicode.Utf8View.init(text) catch
+        return error.InvalidInput;
+    var codepoints: std.ArrayList(rendererpkg.State.Preedit.Codepoint) = .empty;
+    defer codepoints.deinit(alloc);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        const width: usize = @intCast(unicode.table.get(cp).width);
+        // The renderer draws preedit one cell run per codepoint, so a
+        // zero-width codepoint has nowhere to go.
+        if (width <= 0) continue;
+        try codepoints.append(alloc, .{ .codepoint = cp, .wide = width >= 2 });
+    }
+    if (codepoints.items.len == 0) return null;
+    return .{ .codepoints = try codepoints.toOwnedSlice(alloc) };
 }
 
 /// Select the canonical Ghostty word at a presentation point. An unwritten
@@ -2520,6 +2565,92 @@ test "terminal surface cursor geometry follows viewport and active screen" {
     try testing.expect(geometry.visible);
     try testing.expectEqual(@as(f64, 22), geometry.x_px);
     try testing.expectEqual(@as(f64, 22), geometry.y_px);
+}
+
+test "terminal surface preedit is presentation only" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+    defer if (surface.runtime.state.preedit) |preedit|
+        preedit.deinit(testing.allocator);
+
+    // A wide codepoint takes two cells; a combining mark has no cell.
+    try surface.setPreedit("n\u{4f60}\u{0301}");
+    var preedit = surface.runtime.state.preedit.?;
+    try testing.expectEqual(@as(usize, 2), preedit.codepoints.len);
+    try testing.expectEqual(@as(u21, 'n'), preedit.codepoints[0].codepoint);
+    try testing.expect(!preedit.codepoints[0].wide);
+    try testing.expectEqual(@as(u21, 0x4f60), preedit.codepoints[1].codepoint);
+    try testing.expect(preedit.codepoints[1].wide);
+    try testing.expectEqual(@as(usize, 3), preedit.width());
+    try testing.expect(shared.terminal.flags.dirty.preedit);
+
+    shared.terminal.flags.dirty.preedit = false;
+    try testing.expectError(error.InvalidInput, surface.setPreedit("\xff"));
+    preedit = surface.runtime.state.preedit.?;
+    try testing.expectEqual(@as(usize, 2), preedit.codepoints.len);
+    try testing.expect(!shared.terminal.flags.dirty.preedit);
+
+    try surface.setPreedit("");
+    try testing.expect(surface.runtime.state.preedit == null);
+    try testing.expect(shared.terminal.flags.dirty.preedit);
+
+    // Clearing nothing, or text with nothing to draw, changes nothing.
+    shared.terminal.flags.dirty.preedit = false;
+    try surface.setPreedit(null);
+    try surface.setPreedit("\u{0301}");
+    try testing.expect(surface.runtime.state.preedit == null);
+    try testing.expect(!shared.terminal.flags.dirty.preedit);
+
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    try testing.expectEqual(@as(u16, 0), shared.terminal.screens.active.cursor.x);
+}
+
+test "terminal surface preedit conversion matches upstream's" {
+    // preeditFromUtf8 copies the conversion in Surface.preeditCallback, which
+    // belongs to a process-owning surface. If this check fails, upstream's
+    // conversion changed: update preeditFromUtf8 to match, then copy
+    // upstream's new text here.
+    const upstream = @embedFile("../Surface.zig");
+    const conversion =
+        \\    // We convert the UTF-8 text to codepoints.
+        \\    const view = try std.unicode.Utf8View.init(text);
+        \\    var it = view.iterator();
+        \\
+        \\    // Allocate the codepoints slice
+        \\    const Codepoint = rendererpkg.State.Preedit.Codepoint;
+        \\    var codepoints: std.ArrayList(Codepoint) = .empty;
+        \\    defer codepoints.deinit(self.alloc);
+        \\    while (it.nextCodepoint()) |cp| {
+        \\        const width: usize = @intCast(unicode.table.get(cp).width);
+        \\
+        \\        // I've never seen a preedit text with a zero-width character. In
+        \\        // theory its possible but we can't really handle it right now.
+        \\        // Let's just ignore it.
+        \\        if (width <= 0) continue;
+        \\
+        \\        try codepoints.append(
+        \\            self.alloc,
+        \\            .{ .codepoint = cp, .wide = width >= 2 },
+        \\        );
+        \\    }
+        \\
+        \\    // If we have no codepoints, then we're done.
+        \\    if (codepoints.items.len == 0) {
+        \\        try self.queueRender();
+        \\        return;
+        \\    }
+        \\
+        \\    self.renderer_state.preedit = .{
+        \\        .codepoints = try codepoints.toOwnedSlice(self.alloc),
+        \\    };
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, upstream, conversion) != null);
 }
 
 test "terminal surface word selection is local and refreshes after reflow" {
