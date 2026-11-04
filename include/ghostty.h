@@ -1904,6 +1904,17 @@ ghostty_terminal_surface_cursor_geometry(
     ghostty_terminal_surface_t,
     ghostty_terminal_surface_cell_geometry_s*);
 
+// Sets the composition text drawn over the cursor, as ghostty_surface_preedit
+// does for a surface. The text is UTF-8; a length of 0 clears it. This is
+// presentation only: it never invokes write_cb, never changes terminal
+// contents and leaves the selection to the caller. Invalid UTF-8 is invalid
+// input and keeps the previous text. If renderer notification fails, the new
+// text remains published; retry only ghostty_terminal_surface_terminal_changed.
+GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_preedit(
+    ghostty_terminal_surface_t,
+    const char*,
+    uintptr_t);
+
 // The following local selection operations never route through terminal mouse
 // reporting and never invoke write_cb. Points are finite backing-pixel surface
 // coordinates. Points outside [0, width) x [0, height) are invalid; points in

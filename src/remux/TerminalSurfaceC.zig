@@ -619,6 +619,18 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .ok;
     }
 
+    export fn ghostty_terminal_surface_preedit(
+        surface: ?*Surface,
+        text_ptr: ?[*]const u8,
+        len: usize,
+    ) Result {
+        const value = surface orelse return .invalid_input;
+        const text = inputSlice(text_ptr, len) orelse return .invalid_input;
+        value.core.setPreedit(text) catch |err|
+            return operationError("preedit", err);
+        return .ok;
+    }
+
     export fn ghostty_terminal_surface_select_word(
         surface: ?*Surface,
         x: f64,
@@ -849,6 +861,7 @@ test "terminal surface C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_update_config"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_selection_snapshot"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_cursor_geometry"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_surface_preedit"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_word"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_select_link"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_surface_set_selection_endpoint"));
@@ -1003,6 +1016,19 @@ test "terminal surface C frame request rejects a null surface" {
     try std.testing.expectEqual(
         Result.invalid_input,
         CAPI.ghostty_terminal_surface_request_frame(null),
+    );
+}
+
+test "terminal surface C preedit rejects a null surface or text" {
+    if (apprt.runtime != apprt.embedded) return error.SkipZigTest;
+    try std.testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_preedit(null, "a", 1),
+    );
+    const fake_surface: *CAPI.Surface = @ptrFromInt(@alignOf(CAPI.Surface));
+    try std.testing.expectEqual(
+        Result.invalid_input,
+        CAPI.ghostty_terminal_surface_preedit(fake_surface, null, 1),
     );
 }
 
