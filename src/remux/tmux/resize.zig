@@ -7,12 +7,20 @@
 //! history and pulled back, and `apply` repeats those moves on the mirror.
 //! Anything that can't be reproduced exactly returns null so the caller
 //! recaptures the pane from tmux instead.
+//!
+//! A zoomed pane in a cell narrower than its window is narrowed and widened
+//! again, which no row moves reproduce. Its history afterwards is still the
+//! mirror's: `detour` and `applyDetour` keep it, and the caller draws tmux's
+//! screen, captured in the same command line.
 
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Terminal = @import("../../terminal/Terminal.zig");
+const Screen = @import("../../terminal/Screen.zig");
 const Selection = @import("../../terminal/Selection.zig");
+const formatter_pkg = @import("../../terminal/formatter.zig");
+const point = @import("../../terminal/point.zig");
 const size = @import("../../terminal/size.zig");
 const Layout = @import("../../terminal/tmux/layout.zig").Layout;
 
@@ -147,6 +155,50 @@ fn simulate(
     return result;
 }
 
+/// tmux's resize of a zoomed pane whose layout cell is narrower or wider
+/// than its window: its width goes to the cell's and back, and its rows
+/// reflow twice. Its history afterwards is, as drawn, the first rows of its
+/// history and screen before (measured on tmux 3.1 and 3.5a), so the mirror
+/// keeps its own rows and takes only the screen from tmux.
+pub const Detour = struct {
+    /// Rows tmux moved from the top of the screen into history, or back out
+    /// of history when negative.
+    history: isize,
+
+    /// A step changed the height, which resets tmux's scroll region.
+    rows_changed: bool,
+};
+
+/// The detour tmux's resize took with this pane, or null if it wasn't one.
+pub fn detour(
+    alloc: Allocator,
+    before: Sample,
+    after: Sample,
+) Allocator.Error!?Detour {
+    assert(before.pane_id == after.pane_id);
+    if (after.width != before.width or after.alternate != before.alternate) return null;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var steps_storage: [max_steps]Size = undefined;
+    const steps = try resizeSteps(arena.allocator(), before, after, &steps_storage) orelse
+        return null;
+
+    // Only the pane zoomed before and after takes more than one step.
+    if (steps.len != max_steps) return null;
+    var narrowed = false;
+    var rows_changed = false;
+    var rows = before.height;
+    for (steps) |step| {
+        narrowed = narrowed or step.cols != before.width;
+        rows_changed = rows_changed or step.rows != rows;
+        rows = step.rows;
+    }
+    if (!narrowed) return null;
+    const history_before = std.math.cast(isize, before.history) orelse return null;
+    const history_after = std.math.cast(isize, after.history) orelse return null;
+    return .{ .history = history_after - history_before, .rows_changed = rows_changed };
+}
+
 /// The sizes tmux gives the pane during this resize, in order.
 fn resizeSteps(
     alloc: Allocator,
@@ -186,7 +238,8 @@ fn cellSize(alloc: Allocator, layout_str: []const u8, pane_id: usize) !?Size {
     return findCell(layout, pane_id);
 }
 
-fn findCell(layout: Layout, pane_id: usize) ?Size {
+/// The size of the pane's cell in the layout, or null if it has none.
+pub fn findCell(layout: Layout, pane_id: usize) ?Size {
     return switch (layout.content) {
         .pane => |id| if (id == pane_id)
             .{ .cols = layout.width, .rows = layout.height }
@@ -232,25 +285,42 @@ pub fn canApply(t: *const Terminal, p: *const Plan) bool {
     return true;
 }
 
+/// Terminal state Ghostty's resize would change but tmux's keeps.
+const KeptState = struct {
+    screen: *Screen,
+    saved_cursor: ?Screen.SavedCursor,
+    redraw: @FieldType(@FieldType(Terminal, "flags"), "shell_redraws_prompt"),
+    pull_scrollback: bool,
+
+    /// tmux keeps the saved cursor's coordinates through a resize, while
+    /// Ghostty moves it with its row. tmux also never clears a prompt for
+    /// the shell to redraw; the shell's redraw reaches both as output.
+    fn begin(t: *Terminal) KeptState {
+        const screen = t.screens.active;
+        const kept: KeptState = .{
+            .screen = screen,
+            .saved_cursor = screen.saved_cursor,
+            .redraw = t.flags.shell_redraws_prompt,
+            .pull_scrollback = t.flags.resize_pull_scrollback,
+        };
+        screen.saved_cursor = null;
+        t.flags.shell_redraws_prompt = .false;
+        return kept;
+    }
+
+    fn restore(self: KeptState, t: *Terminal) void {
+        self.screen.saved_cursor = self.saved_cursor;
+        t.flags.shell_redraws_prompt = self.redraw;
+        t.flags.resize_pull_scrollback = self.pull_scrollback;
+    }
+};
+
 /// Repeat the plan's moves with Ghostty's own resize, set up so it moves the
 /// same rows as tmux. Returns false when it couldn't, and the pane must be
 /// recaptured.
 pub fn apply(alloc: Allocator, t: *Terminal, p: *const Plan) Terminal.ResizeError!bool {
-    const screen = t.screens.active;
-
-    // tmux keeps the saved cursor's coordinates through a resize, while
-    // Ghostty moves it with its row. tmux also never clears a prompt for
-    // the shell to redraw; the shell's redraw reaches both as output.
-    const saved_cursor = screen.saved_cursor;
-    const redraw = t.flags.shell_redraws_prompt;
-    const pull_scrollback = t.flags.resize_pull_scrollback;
-    screen.saved_cursor = null;
-    t.flags.shell_redraws_prompt = .false;
-    defer {
-        screen.saved_cursor = saved_cursor;
-        t.flags.shell_redraws_prompt = redraw;
-        t.flags.resize_pull_scrollback = pull_scrollback;
-    }
+    const kept: KeptState = .begin(t);
+    defer kept.restore(t);
 
     for (p.slice()) |move| {
         if (move.rows < t.rows) {
@@ -313,6 +383,96 @@ fn applyGrow(
         t.flags.resize_pull_scrollback = false;
         try t.resize(alloc, .{ .cols = cols, .rows = move.rows });
     }
+}
+
+/// Whether the mirror can repeat the detour with its own rows: the rows tmux
+/// took back out of history must be in its history, and a row must stay on
+/// the screen below the ones moved into history. The alternate screen has
+/// no history to move.
+pub fn canApplyDetour(t: *const Terminal, d: Detour) bool {
+    if (t.screens.active_key == .alternate) return d.history == 0;
+    if (d.history < 0) return @abs(d.history) <= @min(
+        localHistory(t),
+        std.math.maxInt(size.CellCountInt) - t.rows,
+    );
+    return @abs(d.history) < t.rows;
+}
+
+/// Repeat a detour on the mirror with its own rows: move the history
+/// boundary by the rows tmux moved, then blank the screen and give it
+/// `rows`, for the caller to draw tmux's screen. Tab stops and the scroll
+/// region end as tmux leaves them. Returns false when another row crossed
+/// the boundary, and the pane must be recaptured.
+pub fn applyDetour(
+    alloc: Allocator,
+    t: *Terminal,
+    d: Detour,
+    rows: size.CellCountInt,
+) Terminal.ResizeError!bool {
+    assert(canApplyDetour(t, d));
+    const kept: KeptState = .begin(t);
+    defer kept.restore(t);
+
+    // tmux resets the tab stops when a pane's width changes, and the scroll
+    // region when its height does.
+    const region = t.scrolling_region;
+    defer {
+        t.tabReset();
+        t.scrolling_region = if (d.rows_changed) .{
+            .top = 0,
+            .bottom = t.rows - 1,
+            .left = 0,
+            .right = t.cols - 1,
+        } else region;
+    }
+
+    if (t.screens.active_key == .alternate) {
+        try t.resize(alloc, .{ .cols = t.cols, .rows = rows });
+        return true;
+    }
+
+    // The row that is the screen's first once the boundary has moved. It
+    // must still be after the resize, whatever old history Ghostty prunes.
+    // A tracked pin keeps Ghostty from trimming its row, but the moves
+    // below never trim at or above the cursor's row, where it is.
+    const screen = t.screens.active;
+    const moved: size.CellCountInt = @intCast(@abs(d.history));
+    const first = if (d.history < 0)
+        screen.pages.pin(.{ .history = .{ .y = @intCast(localHistory(t) - moved) } }).?
+    else
+        screen.pages.pin(.{ .active = .{ .y = moved } }).?;
+    const tracked = try screen.pages.trackPin(first);
+    defer screen.pages.untrackPin(tracked);
+
+    if (moved > 0) {
+        // Ghostty never trims the cursor's row, so with the cursor on the
+        // last row a shrink pushes exactly the top rows into history, and a
+        // grow pulls exactly the rows back.
+        screen.cursorAbsolute(0, t.rows - 1);
+        t.flags.resize_pull_scrollback = true;
+        try t.resize(alloc, .{
+            .cols = t.cols,
+            .rows = if (d.history > 0) t.rows - moved else t.rows + moved,
+        });
+    }
+
+    // The screen's rows are replaced, so a selection on them can't stay.
+    if (screen.selection) |sel| {
+        if (screen.pages.pointFromPin(.active, sel.bottomRight(screen)) != null) {
+            screen.clearSelection();
+        }
+    }
+
+    // A blank screen with the cursor on its first row takes its new height
+    // without pushing or pulling a row.
+    screen.clearRows(.{ .active = .{} }, null, false);
+    screen.cursorAbsolute(0, 0);
+    t.flags.resize_pull_scrollback = false;
+    try t.resize(alloc, .{ .cols = t.cols, .rows = rows });
+
+    if (tracked.garbage) return false;
+    const top = screen.pages.pointFromPin(.active, tracked.*) orelse return false;
+    return top.active.y == 0;
 }
 
 const assert = std.debug.assert;
@@ -518,4 +678,223 @@ test "apply: the mirror needs the rows tmux pulled back" {
     defer t.deinit(testing.allocator);
     const p = (try plan(testing.allocator, testSample(4, 1, 2), testSample(6, 3, 0))).?;
     try testing.expect(!canApply(&t, &p));
+}
+
+/// Pane 0 zoomed in a 20-column window split left/right (its cell is 10
+/// columns wide).
+fn testZoomedSample(height: usize, cursor_y: usize, history: usize) Sample {
+    var sample = testSample(height, cursor_y, history);
+    sample.layout = switch (height) {
+        10 => "f436,20x10,0,0{10x10,0,0,0,9x10,11,0,1}",
+        6 => "23d6,20x6,0,0{10x6,0,0,0,9x6,11,0,1}",
+        else => unreachable,
+    };
+    sample.visible_layout = switch (height) {
+        10 => "9edd,20x10,0,0,0",
+        6 => "f15d,20x6,0,0,0",
+        else => unreachable,
+    };
+    return sample;
+}
+
+test "detour: a zoomed pane in a narrower cell is narrowed and widened" {
+    // tmux 3.5a, the cursor on the last row: shrinking the cell to 6 rows
+    // pushes four rows into history.
+    const before = testZoomedSample(10, 9, 3);
+    const after = testZoomedSample(6, 5, 7);
+    try testing.expect(try plan(testing.allocator, before, after) == null);
+    try testing.expectEqual(
+        Detour{ .history = 4, .rows_changed = true },
+        (try detour(testing.allocator, before, after)).?,
+    );
+
+    // A same-size refresh changes no height, so tmux keeps its scroll
+    // region.
+    try testing.expectEqual(
+        Detour{ .history = 0, .rows_changed = false },
+        (try detour(testing.allocator, before, before)).?,
+    );
+}
+
+test "detour: a resize that keeps the width at every step isn't one" {
+    // Zoomed in a full-width cell.
+    var top = testSample(10, 1, 0);
+    top.layout = "9762,20x10,0,0[20x6,0,0,0,20x3,0,7,1]";
+    top.visible_layout = "9edd,20x10,0,0,0";
+    try testing.expect(try detour(testing.allocator, top, top) == null);
+
+    // Not zoomed.
+    try testing.expect(try detour(testing.allocator, testSample(10, 1, 0), testSample(6, 1, 0)) == null);
+
+    // Unzoomed between the samples.
+    var unzoomed = testZoomedSample(10, 9, 3);
+    unzoomed.visible_layout = unzoomed.layout;
+    try testing.expect(try detour(testing.allocator, testZoomedSample(10, 9, 3), unzoomed) == null);
+
+    // A width change, and a change of screen.
+    var wider = testZoomedSample(10, 9, 3);
+    wider.width = 21;
+    try testing.expect(try detour(testing.allocator, testZoomedSample(10, 9, 3), wider) == null);
+    var alternate = testZoomedSample(10, 9, 3);
+    alternate.alternate = true;
+    try testing.expect(try detour(testing.allocator, testZoomedSample(10, 9, 3), alternate) == null);
+}
+
+/// The rows from `tl` to `br`, inclusive, with their styles.
+fn testVtRows(t: *const Terminal, tl: point.Point, br: point.Point) ![]u8 {
+    const pages = &t.screens.active.pages;
+    var formatter: formatter_pkg.PageListFormatter = .init(pages, .vt);
+    formatter.top_left = pages.pin(tl).?;
+    formatter.bottom_right = pages.pin(br).?;
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer builder.deinit();
+    try formatter.format(&builder.writer);
+    return builder.toOwnedSlice();
+}
+
+/// Every history row with its styles.
+fn testVtHistory(t: *const Terminal) ![]u8 {
+    return testVtRows(
+        t,
+        .{ .history = .{} },
+        .{ .history = .{ .x = t.cols - 1, .y = @intCast(localHistory(t) - 1) } },
+    );
+}
+
+/// L00 (red) to L14, a row each, then a scroll region on rows 2-5 and no
+/// tab stops: history L00-L05, the screen L06-L14 and a blank row with the
+/// cursor.
+const test_detour_rows = "\x1b[31mL00\x1b[0m\r\nL01\r\nL02\r\nL03\r\nL04\r\nL05\r\nL06\r\nL07\r\n" ++
+    "L08\r\nL09\r\nL10\r\nL11\r\nL12\r\nL13\r\nL14\r\n\x1b[3g\x1b7\x1b[2;5r\x1b8";
+
+test "applyDetour: rows tmux moved into history are the mirror's own" {
+    var t = try testTerminal(10, test_detour_rows);
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(6, localHistory(&t));
+    const expected = try testVtRows(&t, .{ .history = .{} }, .{ .active = .{ .x = 19, .y = 2 } });
+    defer testing.allocator.free(expected);
+
+    const d: Detour = .{ .history = 3, .rows_changed = true };
+    try testing.expect(canApplyDetour(&t, d));
+    try testing.expect(try applyDetour(testing.allocator, &t, d, 6));
+    try testing.expectEqual(6, t.rows);
+    try expectDump(&t, "L00\nL01\nL02\nL03\nL04\nL05\nL06\nL07\nL08", "");
+    const history = try testVtHistory(&t);
+    defer testing.allocator.free(history);
+    try testing.expectEqualStrings(expected, history);
+
+    // tmux's height changed, so its scroll region is reset; its width
+    // changed, so its tab stops are.
+    try testing.expectEqual(0, t.scrolling_region.top);
+    try testing.expectEqual(5, t.scrolling_region.bottom);
+    try testing.expect(t.tabstops.get(8));
+}
+
+test "applyDetour: a detour that moves no row keeps history and the scroll region" {
+    var t = try testTerminal(10, test_detour_rows);
+    defer t.deinit(testing.allocator);
+    const expected = try testVtHistory(&t);
+    defer testing.allocator.free(expected);
+
+    const d: Detour = .{ .history = 0, .rows_changed = false };
+    try testing.expect(try applyDetour(testing.allocator, &t, d, 10));
+    try expectDump(&t, "L00\nL01\nL02\nL03\nL04\nL05", "");
+    const history = try testVtHistory(&t);
+    defer testing.allocator.free(history);
+    try testing.expectEqualStrings(expected, history);
+    try testing.expectEqual(1, t.scrolling_region.top);
+    try testing.expectEqual(4, t.scrolling_region.bottom);
+    try testing.expect(t.tabstops.get(8));
+}
+
+test "applyDetour: rows tmux took back out of history come from the mirror's history" {
+    var t = try testTerminal(10, test_detour_rows);
+    defer t.deinit(testing.allocator);
+    const expected = try testVtRows(&t, .{ .history = .{} }, .{ .history = .{ .x = 19, .y = 1 } });
+    defer testing.allocator.free(expected);
+
+    const d: Detour = .{ .history = -4, .rows_changed = true };
+    try testing.expect(canApplyDetour(&t, d));
+    try testing.expect(!canApplyDetour(&t, .{ .history = -7, .rows_changed = true }));
+    try testing.expect(try applyDetour(testing.allocator, &t, d, 10));
+    try expectDump(&t, "L00\nL01", "");
+    const history = try testVtHistory(&t);
+    defer testing.allocator.free(history);
+    try testing.expectEqualStrings(expected, history);
+}
+
+test "applyDetour: a selection keeps its history rows and leaves the redrawn screen" {
+    var t = try testTerminal(10, test_detour_rows);
+    defer t.deinit(testing.allocator);
+    const screen = t.screens.active;
+
+    // L01 to L02, in history.
+    try screen.select(Selection.init(
+        screen.pages.pin(.{ .history = .{ .y = 1 } }).?,
+        screen.pages.pin(.{ .history = .{ .x = 2, .y = 2 } }).?,
+        false,
+    ));
+    try testing.expect(try applyDetour(testing.allocator, &t, .{ .history = 3, .rows_changed = true }, 6));
+    try testing.expect(screen.selection != null);
+
+    // From L05 in history to the screen's first row, which the detour
+    // redraws.
+    try screen.select(Selection.init(
+        screen.pages.pin(.{ .history = .{ .y = 5 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expect(try applyDetour(testing.allocator, &t, .{ .history = 0, .rows_changed = false }, 6));
+    try testing.expect(screen.selection == null);
+}
+
+test "applyDetour: a row Ghostty won't trim crosses into history and recaptures" {
+    var t = try testTerminal(10, test_detour_rows);
+    defer t.deinit(testing.allocator);
+
+    // A tracked pin, such as a search match's, on the last row.
+    const pages = &t.screens.active.pages;
+    const pin = try pages.trackPin(pages.pin(.{ .active = .{ .y = 9 } }).?);
+    defer pages.untrackPin(pin);
+    try testing.expect(!try applyDetour(testing.allocator, &t, .{ .history = 0, .rows_changed = true }, 6));
+}
+
+test "applyDetour: history at the scrollback limit stays whole near the boundary" {
+    // The app's limit, Ghostty's two-page minimum at this size.
+    var t: Terminal = try .init(testing.io, testing.allocator, .{
+        .cols = 50,
+        .rows = 41,
+        .max_scrollback_bytes = 10_000,
+    });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    // Fill both pages until the last can't take the ten rows the resize
+    // grows by: it allocates a page, which drops the oldest.
+    const pages = &t.screens.active.pages;
+    var line: usize = 0;
+    while (line < 100_000) : (line += 1) {
+        var buffer: [32]u8 = undefined;
+        stream.nextSlice(try std.fmt.bufPrint(&buffer, "\x1b[3{d}mline {d}\x1b[0m\r\n", .{ line % 8, line }));
+        const last = pages.pages.last.?;
+        if (pages.pages.first != last and last.capacity().rows - last.rows() < 10) break;
+    }
+    const history_before = localHistory(&t);
+    const expected = try testVtRows(
+        &t,
+        .{ .history = .{ .y = @intCast(history_before - 20) } },
+        .{ .active = .{ .x = 49, .y = 9 } },
+    );
+    defer testing.allocator.free(expected);
+
+    try testing.expect(try applyDetour(testing.allocator, &t, .{ .history = 10, .rows_changed = true }, 41));
+    try testing.expect(localHistory(&t) < history_before + 10);
+    const kept = try testVtRows(
+        &t,
+        .{ .history = .{ .y = @intCast(localHistory(&t) - 30) } },
+        .{ .history = .{ .x = 49, .y = @intCast(localHistory(&t) - 1) } },
+    );
+    defer testing.allocator.free(kept);
+    try testing.expectEqualStrings(expected, kept);
 }
