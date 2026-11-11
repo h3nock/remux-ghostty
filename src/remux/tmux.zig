@@ -21,4 +21,5 @@ test {
     _ = @import("tmux/c.zig");
     _ = @import("tmux/pending.zig");
     _ = @import("tmux/resize.zig");
+    _ = @import("tmux/live_test.zig");
 }

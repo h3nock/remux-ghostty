@@ -6,8 +6,10 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const size = @import("../../terminal/size.zig");
 const CircBuf = @import("../../datastruct/main.zig").CircBuf;
 const CursorStyle = @import("../../terminal/cursor.zig").Style;
+const Hyperlink = @import("../../terminal/hyperlink.zig").Hyperlink;
 const Screen = @import("../../terminal/Screen.zig");
 const ScreenSet = @import("../../terminal/ScreenSet.zig");
+const Style = @import("../../terminal/style.zig").Style;
 const SharedTerminal = @import("../Shared.zig");
 const Terminal = @import("../../terminal/Terminal.zig");
 const TerminalStream = @import("../../terminal/stream_terminal.zig").Stream;
@@ -80,16 +82,45 @@ const Utf8Carry = struct {
     }
 };
 
-/// Terminal state that must not affect replay of a captured grid.
+/// Terminal state that must not affect replay of a captured grid. The pen,
+/// the character sets and an open hyperlink are the program's, and tmux
+/// reports none of them: the replay runs without them, and they're put back
+/// on the screen the program is on.
 const SnapshotReplayState = struct {
     modes: @FieldType(Terminal, "modes"),
     scrolling_region: Terminal.ScrollingRegion,
 
-    fn begin(terminal: *Terminal) SnapshotReplayState {
+    /// The screen active when the replay began, and the program's state on
+    /// it. Owns `hyperlink`.
+    screen_key: ScreenSet.Key,
+    pen: Style,
+    charset: Screen.CharsetState,
+    hyperlink: ?Hyperlink,
+
+    /// The pen of the replayed screen, when it isn't that one.
+    replayed_pen: ?Style,
+
+    /// Make `key`'s screen active for the replay of its grid.
+    fn begin(terminal: *Terminal, key: ScreenSet.Key) !SnapshotReplayState {
+        const screen = terminal.screens.active;
+        const hyperlink: ?Hyperlink = if (screen.cursor.hyperlink) |link| try link.dupe(screen.alloc) else null;
+        errdefer if (hyperlink) |link| link.deinit(screen.alloc);
+        const screen_key = terminal.screens.active_key;
+        screen.endHyperlink();
+        _ = try terminal.switchScreen(key);
+
+        const replayed = terminal.screens.active;
         const saved: SnapshotReplayState = .{
             .modes = terminal.modes,
             .scrolling_region = terminal.scrolling_region,
+            .screen_key = screen_key,
+            .pen = screen.cursor.style,
+            .charset = screen.charset,
+            .hyperlink = hyperlink,
+            .replayed_pen = if (replayed == screen) null else replayed.cursor.style,
         };
+        replayed.charset = .{};
+        try terminal.setAttribute(.unset);
         terminal.modes.set(.insert, false);
         terminal.modes.set(.origin, false);
         terminal.modes.set(.linefeed, true);
@@ -107,6 +138,44 @@ const SnapshotReplayState = struct {
     fn restore(self: SnapshotReplayState, terminal: *Terminal) void {
         terminal.modes = self.modes;
         terminal.scrolling_region = self.scrolling_region;
+        if (self.replayed_pen) |pen| restorePen(terminal.screens.active, pen);
+
+        // The screen exists, so switching back to it can't fail. The switch
+        // ends a hyperlink the replay left open and brings the replay's
+        // character sets along, so they're put back after it.
+        _ = terminal.switchScreen(self.screen_key) catch unreachable;
+        const screen = terminal.screens.active;
+        screen.charset = self.charset;
+        restorePen(screen, self.pen);
+        if (self.hyperlink) |link| {
+            defer link.deinit(screen.alloc);
+            reopenHyperlink(screen, link);
+        }
+    }
+
+    /// As DECRC does, a pen that can't be restored is lost, not the cells.
+    fn restorePen(screen: *Screen, pen: Style) void {
+        screen.cursor.style = pen;
+        screen.manualStyleUpdate() catch |err| {
+            log.warn("failed to restore the pen after a replay err={}", .{err});
+            screen.cursor.style = .{};
+            screen.manualStyleUpdate() catch unreachable;
+        };
+    }
+
+    /// Open the hyperlink again with its own id, so cells printed after the
+    /// replay belong to the same link as those before it.
+    fn reopenHyperlink(screen: *Screen, link: Hyperlink) void {
+        const result = switch (link.id) {
+            .explicit => |id| screen.startHyperlink(link.uri, id),
+            .implicit => |id| implicit: {
+                const next = screen.cursor.hyperlink_implicit_id;
+                screen.cursor.hyperlink_implicit_id = id;
+                defer screen.cursor.hyperlink_implicit_id = next;
+                break :implicit screen.startHyperlink(link.uri, null);
+            },
+        };
+        result catch |err| log.warn("failed to reopen a hyperlink after a replay err={}", .{err});
     }
 };
 
@@ -248,7 +317,7 @@ pub const Viewer = struct {
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     const ResizeInflight = struct {
-        /// Owns `before`.
+        /// Owns `before` and `after`.
         arena: ArenaAllocator,
         before: []const resize.Sample = &.{},
 
@@ -262,9 +331,35 @@ pub const Viewer = struct {
 
         failed: bool = false,
 
+        /// The panes whose screens the group captures after the after
+        /// sample, in the group's order (see `beginResize`), and the after
+        /// sample's reply, kept until the last capture's.
+        screens: []ScreenCapture = &.{},
+        after: ?[]const u8 = null,
+
+        const ScreenCapture = struct {
+            capture: Command.CaptureScreen,
+
+            /// Null until the capture succeeds.
+            reply: ?[]const u8 = null,
+        };
+
         fn deinit(self: *ResizeInflight, alloc: Allocator) void {
             self.output_panes.deinit(alloc);
             self.arena.deinit();
+        }
+
+        /// The pane's captured screen, if the group captured it.
+        fn screenReply(self: *const ResizeInflight, pane_id: usize) ?[]const u8 {
+            for (self.screens) |screen| {
+                if (screen.capture.id == pane_id) return screen.reply;
+            }
+            return null;
+        }
+
+        /// Whether this capture is the group's last member.
+        fn lastScreen(self: *const ResizeInflight, pane_id: usize) bool {
+            return self.screens.len > 0 and self.screens[self.screens.len - 1].capture.id == pane_id;
         }
     };
 
@@ -809,50 +904,100 @@ pub const Viewer = struct {
             return error.NotReady;
         }
 
-        const commands = resizeCommands(client_size);
+        var inflight = try self.beginResize();
+        errdefer inflight.deinit(self.alloc);
+        const count = resize_samples_len + inflight.screens.len;
         var arena = ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        var members: [commands.len][]const u8 = undefined;
-        for (commands, 0..) |command, i| {
+        const members = try arena.allocator().alloc([]const u8, count);
+        for (members, 0..) |*member, i| {
             var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-            command.formatCommand(&builder.writer) catch
+            resizeCommand(client_size, inflight.screens, i).formatCommand(&builder.writer) catch
                 return error.OutOfMemory;
-            members[i] = builder.writer.buffered();
+            member.* = builder.writer.buffered();
         }
 
-        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
-        try submitter.submitClientResize(&members);
-        for (commands, 0..) |command, i| {
-            self.command_queue.appendAssumeCapacity(.{
-                .command = command,
-                .group_end = i + 1 == commands.len,
-            });
-        }
-        self.sent_command_count += commands.len;
-        self.resize_inflight = .{ .arena = .init(self.alloc) };
+        try self.command_queue.ensureUnusedCapacity(self.alloc, count);
+        try submitter.submitClientResize(members);
+        self.appendResize(client_size, inflight);
+        self.sent_command_count += count;
         self.resize_pending = null;
     }
 
-    fn resizeCommands(client_size: ClientSize) [3]Command {
-        return .{
-            .resize_sample_before,
-            .{ .resize_client = client_size },
-            .resize_sample_after,
+    /// The samples and the resize between them.
+    const resize_samples_len = 3;
+
+    /// Member `index` of a client resize: every pane sampled before and
+    /// after it, then the screens the resize captures. In the same command
+    /// line each is tmux's screen at the after sample, and a capture that
+    /// fails can't make tmux skip the sample.
+    fn resizeCommand(
+        client_size: ClientSize,
+        screens: []const ResizeInflight.ScreenCapture,
+        index: usize,
+    ) Command {
+        return switch (index) {
+            0 => .resize_sample_before,
+            1 => .{ .resize_client = client_size },
+            2 => .resize_sample_after,
+            else => .{ .resize_screen = screens[index - resize_samples_len].capture },
         };
+    }
+
+    /// A client resize about to be sent. It captures the screen of the
+    /// current window's pane that tmux narrows to its layout cell and widens
+    /// again, which rows can't follow. A hidden window's pane is recaptured
+    /// when its window is shown instead: a hidden pane that prints during a
+    /// resize can't use its screen, and drawing it delays the shown window.
+    fn beginResize(self: *const Viewer) Allocator.Error!ResizeInflight {
+        var inflight: ResizeInflight = .{ .arena = .init(self.alloc) };
+        errdefer inflight.deinit(self.alloc);
+        const window = for (self.windows.items) |*window| {
+            if (window.is_active) break window;
+        } else return inflight;
+        const pane_id = self.detouredPane(window) orelse return inflight;
+
+        inflight.screens = try inflight.arena.allocator().alloc(ResizeInflight.ScreenCapture, 1);
+        inflight.screens[0] = .{ .capture = .{
+            .id = pane_id,
+            .styled = !self.panes.get(pane_id).?.plain_screens,
+        } };
+        return inflight;
+    }
+
+    /// Queue a client resize, with room for its commands reserved.
+    fn appendResize(self: *Viewer, client_size: ClientSize, inflight: ResizeInflight) void {
+        const count = resize_samples_len + inflight.screens.len;
+        for (0..count) |i| self.command_queue.appendAssumeCapacity(.{
+            .command = resizeCommand(client_size, inflight.screens, i),
+            .group_end = i + 1 == count,
+        });
+        self.resize_inflight = inflight;
+    }
+
+    /// The window's live zoomed pane, if its layout cell's width isn't the
+    /// window's: every client resize narrows it to the cell and widens it
+    /// again.
+    fn detouredPane(self: *const Viewer, window: *const Window) ?usize {
+        if (!window.is_zoomed) return null;
+        const pane_id = switch (window.visible_layout.content) {
+            .pane => |id| id,
+            .horizontal, .vertical => return null,
+        };
+        const cell = resize.findCell(window.layout, pane_id) orelse return null;
+        if (cell.cols == window.visible_layout.width) return null;
+        const pane = self.panes.get(pane_id) orelse return null;
+        if (pane.phase != .live or pane.stale) return null;
+        return pane_id;
     }
 
     /// Queue a client resize from inside an input. It's emitted with that
     /// input's other commands.
     fn queueResize(self: *Viewer, client_size: ClientSize) Allocator.Error!void {
-        const commands = resizeCommands(client_size);
-        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
-        for (commands, 0..) |command, i| {
-            self.command_queue.appendAssumeCapacity(.{
-                .command = command,
-                .group_end = i + 1 == commands.len,
-            });
-        }
-        self.resize_inflight = .{ .arena = .init(self.alloc) };
+        var inflight = try self.beginResize();
+        errdefer inflight.deinit(self.alloc);
+        try self.command_queue.ensureUnusedCapacity(self.alloc, resize_samples_len + inflight.screens.len);
+        self.appendResize(client_size, inflight);
     }
 
     fn flushPendingResize(self: *Viewer) Allocator.Error!void {
@@ -1438,7 +1583,7 @@ pub const Viewer = struct {
         try actions.append(arena_alloc, .{ .windows = self.windows.items });
 
         // Sync up our panes
-        try self.syncLayouts(self.windows.items);
+        try self.syncLayouts(self.windows.items, .{ .windows = &.{window_id} });
         try self.afterTopologyChange();
     }
 
@@ -1516,16 +1661,33 @@ pub const Viewer = struct {
 
         var removed = self.windows.orderedRemove(index);
         errdefer self.windows.insertAssumeCapacity(index, removed);
-        try self.syncLayouts(self.windows.items);
+        try self.syncLayouts(self.windows.items, .{ .windows = &.{} });
 
         removed.deinit(self.alloc);
         actions.appendAssumeCapacity(.{ .windows = self.windows.items });
         try self.afterTopologyChange();
     }
 
+    /// The windows whose layouts tmux just sent. Only their panes take their
+    /// layout's size: tmux notifies a window's layout after every reply it
+    /// is sending, so another window's stored layout can be older than its
+    /// panes' sizes from a pane-state reply or a resize sample.
+    const FreshLayouts = union(enum) {
+        all,
+        windows: []const usize,
+
+        fn contains(self: FreshLayouts, window_id: usize) bool {
+            return switch (self) {
+                .all => true,
+                .windows => |ids| std.mem.indexOfScalar(usize, ids, window_id) != null,
+            };
+        }
+    };
+
     fn syncLayouts(
         self: *Viewer,
         windows: []const Window,
+        fresh: FreshLayouts,
     ) !void {
         // Go through the window layout and setup all our panes. We move
         // this into a new panes map so that we can easily prune our old
@@ -1559,6 +1721,7 @@ pub const Viewer = struct {
                 &panes,
                 window.layout,
                 self.options.max_scrollback,
+                fresh.contains(window.id),
                 visible_pane,
                 &visible_found,
             );
@@ -1730,6 +1893,7 @@ pub const Viewer = struct {
         return samples.items;
     }
 
+    /// Apply the resize's after sample, with the screens it captured.
     fn finishResize(
         self: *Viewer,
         arena_alloc: Allocator,
@@ -1758,21 +1922,21 @@ pub const Viewer = struct {
         // tmux sends each window's %layout-change after this reply. Until
         // then a window would keep its old layout, and the notification for
         // another window would size this window's panes back to it.
-        var windows_changed = false;
+        var adopted: std.ArrayList(usize) = .empty;
         for (self.windows.items) |*window| {
             const sample = for (after_samples) |sample| {
                 if (sample.layout.len > 0 and layoutContains(window.layout, sample.pane_id)) break sample;
             } else continue;
             const visible = if (sample.visible_layout.len > 0) sample.visible_layout else sample.layout;
             try self.setWindowLayout(window, sample.layout, visible);
-            windows_changed = true;
+            try adopted.append(arena_alloc, window.id);
         }
-        if (windows_changed) {
+        if (adopted.items.len > 0) {
             // A command read together with a split runs before tmux notifies
             // the split, so the samples can hold a pane this viewer hasn't
             // seen. Adopting the layouts as a layout change does keeps every
             // published pane tracked, a new one behind its hydration.
-            try self.syncLayouts(self.windows.items);
+            try self.syncLayouts(self.windows.items, .{ .windows = adopted.items });
             try actions.append(arena_alloc, .{ .windows = self.windows.items });
         }
 
@@ -1797,6 +1961,7 @@ pub const Viewer = struct {
                     b,
                     after,
                     reordered and inflight.output_panes.contains(after.pane_id),
+                    inflight.screenReply(after.pane_id),
                 )
             else
                 .mismatch;
@@ -1824,15 +1989,20 @@ pub const Viewer = struct {
 
     const PaneResize = enum { unchanged, applied, mismatch };
 
-    /// Repeat tmux's resize of one pane on its mirror.
+    /// Repeat tmux's resize of one pane on its mirror. `screen` is the
+    /// pane's screen captured at the after sample, if it was.
     fn resizePane(
         self: *Viewer,
         pane: *Pane,
         before: resize.Sample,
         after: resize.Sample,
         reordered: bool,
+        screen: ?[]const u8,
     ) !PaneResize {
-        const p = try resize.plan(self.alloc, before, after) orelse return .mismatch;
+        const p = try resize.plan(self.alloc, before, after) orelse {
+            const content = screen orelse return .mismatch;
+            return self.resizeDetour(pane, before, after, reordered, content);
+        };
         if (p.len == 0) return .unchanged;
         if (pane.stale or reordered) return .mismatch;
 
@@ -1852,6 +2022,52 @@ pub const Viewer = struct {
 
         if (!try resize.apply(self.alloc, t, &p)) return .mismatch;
         if (!resize.cursorMatches(t, after.cursor_x, after.cursor_y)) return .mismatch;
+        if (before.alternate) pane.primary_stale = true;
+        return .applied;
+    }
+
+    /// Repeat tmux's detour of a zoomed pane on its mirror: keep the
+    /// mirror's history, moved by the rows tmux moved, and draw tmux's
+    /// screen captured at the after sample.
+    fn resizeDetour(
+        self: *Viewer,
+        pane: *Pane,
+        before: resize.Sample,
+        after: resize.Sample,
+        reordered: bool,
+        screen: []const u8,
+    ) !PaneResize {
+        const d = try resize.detour(self.alloc, before, after) orelse return .mismatch;
+        if (pane.stale or reordered) return .mismatch;
+
+        // tmux may move the cursor even when no row moves, so the after
+        // sample is the only source for it.
+        if (after.cursor_y >= after.height or after.cursor_x > after.width) return .mismatch;
+        const rows: size.CellCountInt = @intCast(after.height);
+
+        const owner = pane.terminal_owner;
+        owner.mutex.lockUncancelable(owner.terminal.io());
+        defer owner.mutex.unlock(owner.terminal.io());
+        const t = &owner.terminal;
+
+        // The mirror must be where tmux was when the resize ran.
+        if (t.cols != before.width or t.rows != before.height) return .mismatch;
+        if ((t.screens.active_key == .alternate) != before.alternate) return .mismatch;
+        if (!resize.cursorMatches(t, before.cursor_x, before.cursor_y)) return .mismatch;
+        if (d.history < 0 and t.region_rows_scrolled_out != pane.region_rows_baseline) {
+            return .mismatch;
+        }
+        if (!resize.canApplyDetour(t, d)) return .mismatch;
+
+        if (!try resize.applyDetour(self.alloc, t, d, rows)) return .mismatch;
+        try hydrateScreen(t, t.screens.active_key, screen);
+
+        const wrap = after.cursor_x == after.width;
+        Pane.restoreCursor(t.screens.active, .{
+            .x = @intCast(if (wrap) after.cursor_x - 1 else after.cursor_x),
+            .y = @intCast(after.cursor_y),
+            .pending_wrap = wrap,
+        });
         if (before.alternate) pane.primary_stale = true;
         return .applied;
     }
@@ -2064,7 +2280,25 @@ pub const Viewer = struct {
                 };
             },
 
-            .resize_sample_after => try self.finishResize(arena_alloc, actions, content),
+            // The group's last member finishes the resize.
+            .resize_sample_after => if (self.resize_inflight) |*inflight| {
+                if (inflight.screens.len == 0) {
+                    try self.finishResize(arena_alloc, actions, content);
+                } else {
+                    inflight.after = try inflight.arena.allocator().dupe(u8, content);
+                }
+            },
+
+            .resize_screen => |capture| if (self.resize_inflight) |*inflight| {
+                for (inflight.screens) |*screen| {
+                    if (screen.capture.id == capture.id) {
+                        screen.reply = try inflight.arena.allocator().dupe(u8, content);
+                    }
+                }
+                if (inflight.lastScreen(capture.id)) {
+                    try self.finishResize(arena_alloc, actions, inflight.after);
+                }
+            },
         }
         return null;
     }
@@ -2129,9 +2363,22 @@ pub const Viewer = struct {
                 return null;
             },
             .resize_sample_after => {
+                // tmux skips the screen captures after it, and the last
+                // finishes the resize.
+                if (self.resize_inflight) |inflight| if (inflight.screens.len > 0) return null;
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
                 try self.finishResize(arena.allocator(), actions, null);
+                return null;
+            },
+
+            // A pane without its screen resizes as if none was asked for.
+            .resize_screen => |capture| {
+                const inflight = self.resize_inflight orelse return null;
+                if (!inflight.lastScreen(capture.id)) return null;
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                try self.finishResize(arena.allocator(), actions, inflight.after);
                 return null;
             },
             else => return error.CommandFailed,
@@ -2314,7 +2561,7 @@ pub const Viewer = struct {
         try self.appendWindowListRecord(&windows, final, &pending_name);
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
-        try self.syncLayouts(windows.items);
+        try self.syncLayouts(windows.items, .all);
         owns_windows = false;
 
         // A complete list-windows response is the authoritative topology cut.
@@ -2710,9 +2957,8 @@ pub const Viewer = struct {
 
     fn hydratePaneHistory(pane: *const Pane, t: *Terminal, content: []const u8) !void {
         if (!pane.has_history) return;
-        const replay_state = SnapshotReplayState.begin(t);
+        const replay_state = try SnapshotReplayState.begin(t, .primary);
         defer replay_state.restore(t);
-        _ = try t.switchScreen(.primary);
         const screen: *Screen = t.screens.active;
 
         // Get a VT stream from the terminal so we can send data as-is into
@@ -2785,11 +3031,8 @@ pub const Viewer = struct {
         screen_key: ScreenSet.Key,
         content: []const u8,
     ) !void {
-        const replay_state = SnapshotReplayState.begin(t);
+        const replay_state = try SnapshotReplayState.begin(t, screen_key);
         defer replay_state.restore(t);
-        _ = try t.switchScreen(screen_key);
-
-        try t.setAttribute(.unset);
 
         // Erase the active area and reset the cursor to the top-left
         // before writing the visible content.
@@ -2954,6 +3197,7 @@ pub const Viewer = struct {
         panes_new: *PanesMap,
         layout: Layout,
         max_scrollback: usize,
+        fresh: bool,
         visible_pane: ?PaneGeometry,
         visible_found: *bool,
     ) !void {
@@ -2968,6 +3212,7 @@ pub const Viewer = struct {
                         panes_new,
                         l,
                         max_scrollback,
+                        fresh,
                         visible_pane,
                         visible_found,
                     );
@@ -3006,12 +3251,15 @@ pub const Viewer = struct {
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
                 // If we already have this pane, it is already initialized
-                // so just copy it over. A live mirror keeps its size: either
-                // a resize this Viewer sent has already applied tmux's rows,
-                // or `reconcileGeometry` handles a resize from elsewhere. A
+                // so just copy it over. Only a layout tmux just sent changes
+                // its size. A live mirror keeps its size: either a resize
+                // this Viewer sent has already applied tmux's rows, or
+                // `reconcileGeometry` handles a resize from elsewhere. A
                 // snapshot in progress replaces the contents anyway.
                 if (panes_old.getEntry(id)) |entry| {
                     const pane = entry.value_ptr.*;
+                    gop.value_ptr.* = pane;
+                    if (!fresh) break :pane;
                     pane.layout_cols = cols;
                     pane.layout_rows = rows;
                     if (pane.phase != .live) {
@@ -3021,7 +3269,6 @@ pub const Viewer = struct {
                         try terminal_owner.terminal.resize(gpa_alloc, .{ .cols = cols, .rows = rows });
                         if (pane.active_screen == .alternate) pane.primary_stale = true;
                     }
-                    gop.value_ptr.* = pane;
                     break :pane;
                 }
 
@@ -3336,6 +3583,10 @@ const Command = union(enum) {
     resize_client: Viewer.ClientSize,
     resize_sample_after,
 
+    /// The screen of a pane that a client resize narrows and widens again,
+    /// captured after its after sample.
+    resize_screen: CaptureScreen,
+
     /// Stop and resume tmux's output for one pane around a recapture, so
     /// output the snapshot already contains is never applied again.
     pane_pause: usize,
@@ -3377,6 +3628,7 @@ const Command = union(enum) {
             .resize_sample_before,
             .resize_client,
             .resize_sample_after,
+            .resize_screen,
             .pane_pause,
             .pane_continue,
             .hydration_recheck,
@@ -3413,6 +3665,7 @@ const Command = union(enum) {
             .resize_sample_before,
             .resize_client,
             .resize_sample_after,
+            .resize_screen,
             .hydration_recheck,
             .user,
             => false,
@@ -3457,7 +3710,7 @@ const Command = union(enum) {
                 .{ if (capture.styled) " -e" else "", capture.id },
             ),
 
-            .pane_visible => |capture| try writer.print(
+            .pane_visible, .resize_screen => |capture| try writer.print(
                 // -N preserves styled trailing cells in the current grid.
                 "capture-pane -p{s} -N -q -t %{d}",
                 .{ if (capture.styled) " -e" else "", capture.id },
@@ -3830,7 +4083,7 @@ test "retained terminal outlives concurrent pane removal" {
     }
 
     try context.locked.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
-    try viewer.syncLayouts(&.{});
+    try viewer.syncLayouts(&.{}, .all);
     try testing.expectEqual(0, viewer.panes.count());
     context.proceed.set(testing.io);
     try context.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
@@ -6356,4 +6609,814 @@ test "pane state restores a cursor waiting to wrap" {
     const contents = try pane.terminal_owner.terminal.plainString(testing.allocator);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("XXXXXXXXXXXXXXXXXXXX\nY", contents);
+}
+
+/// Attach and hydrate every pane from tmux's list-windows and list-panes
+/// replies; every capture reply is empty.
+fn testAttach(
+    viewer: *Viewer,
+    version: []const u8,
+    list_windows: []const u8,
+    pane_state: []const u8,
+) !void {
+    _ = viewer.next(.handshake_ok);
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 1, .name = "s" } } });
+    _ = testComplete(viewer, version);
+    _ = testComplete(viewer, list_windows);
+    _ = testComplete(viewer, pane_state);
+    for (0..viewer.panes.count() * 4) |_| _ = testComplete(viewer, "");
+    try testing.expect(viewer.command_queue.empty());
+    for (viewer.panes.values()) |pane| try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+}
+
+/// A pane's list-panes line with its cursor at the top left and no history.
+inline fn testStateLine(comptime pane_id: usize, comptime cols: usize, comptime rows: usize) []const u8 {
+    return comptime std.fmt.comptimePrint(
+        "%{d};{d};{d};0;0;1;block;;0;0;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;{d};;zsh;/tmp",
+        .{ pane_id, cols, rows, rows - 1 },
+    );
+}
+
+/// 50x41 windows split left/right: panes 2i (25 columns) and 2i+1.
+const test_split_layouts = [_][]const u8{
+    "c74c,50x41,0,0{25x41,0,0,0,24x41,26,0,1}",
+    "c755,50x41,0,0{25x41,0,0,2,24x41,26,0,3}",
+    "c75e,50x41,0,0{25x41,0,0,4,24x41,26,0,5}",
+};
+const test_zoomed_layouts = [_][]const u8{
+    "a99d,50x41,0,0,0",
+    "a99f,50x41,0,0,2",
+    "a9a1,50x41,0,0,4",
+};
+
+fn testLayoutChange(viewer: *Viewer, window_id: usize, visible: []const u8) []const Viewer.Action {
+    return viewer.next(.{ .tmux = .{ .layout_change = .{
+        .window_id = window_id,
+        .layout = test_split_layouts[window_id],
+        .visible_layout = visible,
+        .raw_flags = "*Z",
+    } } });
+}
+
+fn testSelectWindow(viewer: *Viewer, window_id: usize) []const Viewer.Action {
+    return viewer.next(.{ .tmux = .{ .session_window_changed = .{
+        .session_id = viewer.session_id,
+        .window_id = window_id,
+    } } });
+}
+
+fn expectNoCommand(actions: []const Viewer.Action) !void {
+    for (actions) |action| try testing.expect(action != .command);
+}
+
+/// Panes 0.. are live, not stale, and at these sizes.
+fn expectPanesInPlace(viewer: *const Viewer, sizes: []const [2]size.CellCountInt) !void {
+    for (sizes, 0..) |expected, id| {
+        const pane = viewer.panes.get(id).?;
+        try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+        try testing.expect(!pane.stale);
+        try testing.expectEqual(expected[0], pane.terminal_owner.terminal.cols);
+        try testing.expectEqual(expected[1], pane.terminal_owner.terminal.rows);
+    }
+}
+
+test "zooming every split window in one batch leaves each window's panes to its own notification" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // tmux's order for the app's attach: list-windows ran before the zooms,
+    // the pane states after them, and the windows' notifications follow
+    // every reply.
+    try testAttach(
+        &viewer,
+        "3.5a",
+        "$1 @0 1 %0 50 41 " ++ test_split_layouts[0] ++ " " ++ test_split_layouts[0] ++ " zero\n" ++
+            "$1 @1 0 %2 50 41 " ++ test_split_layouts[1] ++ " " ++ test_split_layouts[1] ++ " one",
+        testStateLine(0, 50, 41) ++ "\n" ++ testStateLine(1, 24, 41) ++ "\n" ++
+            testStateLine(2, 50, 41) ++ "\n" ++ testStateLine(3, 24, 41),
+    );
+    const zoomed = [_][2]size.CellCountInt{ .{ 50, 41 }, .{ 24, 41 }, .{ 50, 41 }, .{ 24, 41 } };
+    try expectPanesInPlace(&viewer, &zoomed);
+
+    try expectNoCommand(testLayoutChange(&viewer, 0, test_zoomed_layouts[0]));
+    try expectPanesInPlace(&viewer, &zoomed);
+    try expectNoCommand(testLayoutChange(&viewer, 1, test_zoomed_layouts[1]));
+    try expectPanesInPlace(&viewer, &zoomed);
+
+    try expectNoCommand(testSelectWindow(&viewer, 1));
+    try expectNoCommand(testSelectWindow(&viewer, 0));
+    try expectPanesInPlace(&viewer, &zoomed);
+}
+
+test "zooming three split windows in one batch leaves the current window's panes in place" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testAttach(
+        &viewer,
+        "3.1",
+        "$1 @0 0 %0 50 41 " ++ test_split_layouts[0] ++ " " ++ test_split_layouts[0] ++ " zero\n" ++
+            "$1 @1 1 %2 50 41 " ++ test_split_layouts[1] ++ " " ++ test_split_layouts[1] ++ " one\n" ++
+            "$1 @2 0 %4 50 41 " ++ test_split_layouts[2] ++ " " ++ test_split_layouts[2] ++ " two",
+        testStateLine(0, 50, 41) ++ "\n" ++ testStateLine(1, 24, 41) ++ "\n" ++
+            testStateLine(2, 50, 41) ++ "\n" ++ testStateLine(3, 24, 41) ++ "\n" ++
+            testStateLine(4, 50, 41) ++ "\n" ++ testStateLine(5, 24, 41),
+    );
+    const zoomed = [_][2]size.CellCountInt{
+        .{ 50, 41 }, .{ 24, 41 }, .{ 50, 41 }, .{ 24, 41 }, .{ 50, 41 }, .{ 24, 41 },
+    };
+    try expectPanesInPlace(&viewer, &zoomed);
+
+    // The current window's notification comes between the others.
+    for ([_]usize{ 0, 1, 2 }) |window_id| {
+        try expectNoCommand(testLayoutChange(&viewer, window_id, test_zoomed_layouts[window_id]));
+        try expectPanesInPlace(&viewer, &zoomed);
+    }
+    for ([_]usize{ 0, 2, 1 }) |window_id| try expectNoCommand(testSelectWindow(&viewer, window_id));
+    try expectPanesInPlace(&viewer, &zoomed);
+}
+
+test "a layout change of one window alone still resizes its panes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testAttach(
+        &viewer,
+        "3.5a",
+        "$1 @0 1 %0 50 41 " ++ test_split_layouts[0] ++ " " ++ test_zoomed_layouts[0] ++ " zero\n" ++
+            "$1 @1 0 %2 50 41 " ++ test_split_layouts[1] ++ " " ++ test_zoomed_layouts[1] ++ " one",
+        testStateLine(0, 50, 41) ++ "\n" ++ testStateLine(1, 24, 41) ++ "\n" ++
+            testStateLine(2, 50, 41) ++ "\n" ++ testStateLine(3, 24, 41),
+    );
+
+    // Another client unzooms the hidden window.
+    try expectNoCommand(testLayoutChange(&viewer, 1, test_split_layouts[1]));
+    const unzoomed = viewer.panes.get(2).?;
+    try testing.expect(unzoomed.stale);
+    try testing.expectEqual(25, unzoomed.terminal_owner.terminal.cols);
+    try testing.expectEqual(41, unzoomed.terminal_owner.terminal.rows);
+    try expectPanesInPlace(&viewer, &.{ .{ 50, 41 }, .{ 24, 41 } });
+    try testing.expect(!viewer.panes.get(3).?.stale);
+
+    const selected = testSelectWindow(&viewer, 1);
+    try testing.expect(testCommandWith(selected, "refresh-client -A '%2:pause'") != null);
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, unzoomed.phase);
+}
+
+/// Rows R`first` to R`last`, each followed by `sep`.
+inline fn testRows(comptime first: usize, comptime last: usize, comptime sep: []const u8) []const u8 {
+    return comptime rows: {
+        @setEvalBranchQuota(100_000);
+        var bytes: []const u8 = "";
+        for (first..last + 1) |i| bytes = bytes ++ std.fmt.comptimePrint("R{d:0>2}", .{i}) ++ sep;
+        break :rows bytes;
+    };
+}
+
+fn testZoomedWindow(id: usize, layout_str: []const u8, visible_str: []const u8, active: bool) !Viewer.Window {
+    var arena = ArenaAllocator.init(testing.allocator);
+    errdefer arena.deinit();
+    const layout = try Layout.parseWithChecksum(arena.allocator(), layout_str);
+    const visible = try Layout.parseWithChecksum(arena.allocator(), visible_str);
+    return .{
+        .id = id,
+        .name = "",
+        .width = layout.width,
+        .height = layout.height,
+        .is_zoomed = true,
+        .is_active = active,
+        .active_pane_id = visible.content.pane,
+        .layout_arena = arena.state,
+        .layout = layout,
+        .visible_layout = visible,
+    };
+}
+
+fn testLivePane(
+    viewer: *Viewer,
+    id: usize,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    bytes: []const u8,
+) !*Viewer.Pane {
+    const pane = try Viewer.Pane.init(testing.io, testing.allocator, .{
+        .cols = cols,
+        .rows = rows,
+        .max_scrollback_bytes = 1_000_000,
+    });
+    pane.phase = .live;
+    pane.layout_cols = cols;
+    pane.layout_rows = rows;
+    viewer.panes.put(testing.allocator, id, pane) catch |err| {
+        pane.deinit(testing.allocator);
+        return err;
+    };
+    pane.stream.nextSlice(bytes);
+    return pane;
+}
+
+/// The current window, 50x41 split left/right with pane 0 zoomed: R00-R49
+/// in pane 0 leave R00-R09 in history and the cursor on the last row.
+fn testZoomedSplit(viewer: *Viewer, version: []const u8, rows: size.CellCountInt) !*Viewer.Pane {
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, version);
+    try viewer.windows.append(testing.allocator, try testZoomedWindow(
+        0,
+        test_split_layouts[0],
+        test_zoomed_layouts[0],
+        true,
+    ));
+    _ = try testLivePane(viewer, 1, 24, rows, "");
+    return testLivePane(viewer, 0, 50, rows, testRows(0, 49, "\r\n"));
+}
+
+/// Accepts a client resize that captures these panes' screens.
+const TestAcceptCaptures = struct {
+    panes: []const usize,
+
+    pub fn submitClientResize(self: @This(), members: []const []const u8) !void {
+        try testing.expectEqual(3 + self.panes.len, members.len);
+        try testing.expect(std.mem.startsWith(u8, members[0], "list-panes -s -F '#{pane_id};"));
+        try testing.expect(std.mem.startsWith(u8, members[1], "refresh-client -C "));
+        try testing.expectEqualStrings(members[0], members[2]);
+        for (self.panes, members[3..]) |id, member| {
+            var buffer: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&buffer, "capture-pane -p -e -N -q -t %{d}", .{id});
+            try testing.expectEqualStrings(expected, member);
+        }
+    }
+};
+
+const test_show_before = "%0;50;41;0;40;10;0;" ++ test_split_layouts[0] ++ ";" ++ test_zoomed_layouts[0] ++
+    "\n%1;24;41;0;0;0;0;;";
+const test_show_after = "%0;50;25;1;24;26;0;fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};b59d,50x25,0,0,0" ++
+    "\n%1;24;25;0;0;0;0;;";
+const test_hide_before = "%0;50;25;1;24;26;0;fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};b59d,50x25,0,0,0" ++
+    "\n%1;24;25;0;0;0;0;;";
+const test_hide_after = "%0;50;41;1;40;10;0;" ++ test_split_layouts[0] ++ ";" ++ test_zoomed_layouts[0] ++
+    "\n%1;24;41;0;0;0;0;;";
+
+/// Reply to a resize group: the samples, then the screen captures. Returns
+/// the last reply's actions.
+fn testCompleteResize(
+    viewer: *Viewer,
+    before: []const u8,
+    after: []const u8,
+    screens: []const Viewer.CommandCompletion,
+) []const Viewer.Action {
+    _ = testComplete(viewer, before);
+    _ = testComplete(viewer, "");
+    var actions = testComplete(viewer, after);
+    for (screens) |screen| actions = viewer.next(.{ .command_complete = screen });
+    return actions;
+}
+
+/// No member of the actions' commands recaptures a pane.
+fn expectNoRecapture(actions: []const Viewer.Action) !void {
+    for (actions) |action| switch (action) {
+        .command => |group| for (group.members) |member| {
+            try testing.expect(std.mem.indexOf(u8, member, " -S ") == null);
+            try testing.expect(std.mem.indexOf(u8, member, ":pause'") == null);
+            try testing.expect(!std.mem.startsWith(u8, member, "display-message -p -t %"));
+        },
+        else => {},
+    };
+}
+
+/// Pane 0 is recaptured: paused first from tmux 3.2, captured at once on
+/// tmux 3.1.
+fn expectRecapture(viewer: *const Viewer, actions: []const Viewer.Action) !void {
+    const pane = viewer.panes.get(0).?;
+    if (std.mem.eql(u8, viewer.tmux_version, "3.1")) {
+        try testing.expectEqual(Viewer.Pane.Phase.refreshing, pane.phase);
+        for (actions) |action| switch (action) {
+            .command => |group| if (std.mem.startsWith(u8, group.members[0], "display-message -p -t %0 ")) return,
+            else => {},
+        };
+        return error.TestExpectedRecapture;
+    }
+    try testing.expectEqual(Viewer.Pane.Phase.refresh_pausing, pane.phase);
+    try testing.expect(testCommandWith(actions, "refresh-client -A '%0:pause'") != null);
+}
+
+fn expectScreen(pane: *Viewer.Pane, history: []const u8, active: []const u8) !void {
+    const screen = pane.terminal_owner.terminal.screens.active;
+    if (history.len == 0) {
+        try testing.expectEqual(0, resize.localHistory(&pane.terminal_owner.terminal));
+    } else {
+        const history_dump = try screen.dumpStringAlloc(testing.allocator, .{ .history = .{} });
+        defer testing.allocator.free(history_dump);
+        try testing.expectEqualStrings(history, history_dump);
+    }
+    const active_dump = try screen.dumpStringAlloc(testing.allocator, .{ .active = .{} });
+    defer testing.allocator.free(active_dump);
+    try testing.expectEqualStrings(active, active_dump);
+}
+
+test "a zoomed left/right pane follows the keyboard with tmux's screen and its own history" {
+    for ([_][]const u8{ "3.1", "3.5a" }) |version| {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        const pane = try testZoomedSplit(&viewer, version, 41);
+        const t = &pane.terminal_owner.terminal;
+
+        // The keyboard shows, and hides again before tmux replies: the
+        // hide is sent from the reply, also with the capture.
+        try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptCaptures{ .panes = &.{0} });
+        try viewer.setClientSize(.{ .columns = 50, .rows = 41 }, TestAcceptCaptures{ .panes = &.{0} });
+        const shown = testCompleteResize(&viewer, test_show_before, test_show_after, &.{.{
+            .success = testRows(26, 49, "\n") ++ "$",
+        }});
+        try expectNoRecapture(shown);
+        try testing.expect(for (shown) |action| {
+            if (action == .pane_changed and action.pane_changed.pane_id == 0) break true;
+        } else false);
+        const hide = testCommandWith(shown, "refresh-client -C 50x41").?;
+        try testing.expectEqual(4, hide.members.len);
+        try testing.expectEqualStrings("capture-pane -p -e -N -q -t %0", hide.members[3]);
+
+        try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+        try testing.expect(!pane.stale);
+        try testing.expectEqual(25, t.rows);
+        try testing.expectEqual(26, resize.localHistory(t));
+        try expectScreen(pane, testRows(0, 24, "\n") ++ "R25", testRows(26, 49, "\n") ++ "$");
+        try testing.expect(resize.cursorMatches(t, 1, 24));
+
+        const hidden = testCompleteResize(&viewer, test_hide_before, test_hide_after, &.{.{
+            .success = testRows(10, 49, "\n") ++ "$",
+        }});
+        try expectNoRecapture(hidden);
+        try testing.expect(!pane.stale);
+        try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+        try testing.expectEqual(41, t.rows);
+        try testing.expectEqual(10, resize.localHistory(t));
+        try expectScreen(pane, testRows(0, 8, "\n") ++ "R09", testRows(10, 49, "\n") ++ "$");
+        try testing.expect(resize.cursorMatches(t, 1, 40));
+        try testing.expect(viewer.resize_inflight == null);
+        try testing.expect(viewer.command_queue.empty());
+    }
+}
+
+test "a zoomed pane's resize keeps a cursor waiting to wrap" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testZoomedSplit(&viewer, "3.5a", 41);
+    try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptCaptures{ .panes = &.{0} });
+    _ = testCompleteResize(
+        &viewer,
+        test_show_before,
+        "%0;50;25;50;24;26;0;fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};b59d,50x25,0,0,0\n%1;24;25;0;0;0;0;;",
+        &.{.{ .success = testRows(26, 49, "\n") ++ "$" ** 50 }},
+    );
+    try testing.expect(!pane.stale);
+    try testing.expect(resize.cursorMatches(&pane.terminal_owner.terminal, 50, 24));
+    testOutput(&viewer, 0, "X");
+    try expectScreen(pane, testRows(0, 25, "\n") ++ "R26", testRows(27, 49, "\n") ++ "$" ** 50 ++ "\nX");
+}
+
+const TestDetourFallback = enum {
+    reordered,
+    cursor,
+    capture_failed,
+    capture_too_large,
+    unzoomed,
+    rotated,
+    region_scroll,
+};
+
+/// Each takes the canonical path: the pane is stale and recaptured, and
+/// the capture is ignored.
+fn testDetourFallback(version: []const u8, fallback: TestDetourFallback) !void {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    const hiding = fallback == .region_scroll;
+    const pane = try testZoomedSplit(&viewer, version, if (hiding) 25 else 41);
+    if (hiding) {
+        // A region below the top row scrolls a row into tmux's history but
+        // not the mirror's.
+        pane.stream.nextSlice("\x1b[5;10r\x1b[10;1H\n\x1b[r\x1b[25;2H");
+    }
+
+    try viewer.setClientSize(switch (fallback) {
+        .rotated => .{ .columns = 41, .rows = 50 },
+        .region_scroll => .{ .columns = 50, .rows = 41 },
+        else => .{ .columns = 50, .rows = 25 },
+    }, TestAcceptCaptures{ .panes = &.{0} });
+    if (fallback == .reordered) {
+        testOutput(&viewer, 0, "\x1b[0m");
+        testOutput(&viewer, 1, "\x1b[0m");
+    }
+    const before = switch (fallback) {
+        .cursor => "%0;50;41;0;39;10;0;" ++ test_split_layouts[0] ++ ";" ++ test_zoomed_layouts[0] ++
+            "\n%1;24;41;0;0;0;0;;",
+        .region_scroll => test_hide_before,
+        else => test_show_before,
+    };
+    const after = switch (fallback) {
+        .unzoomed => "%0;25;25;0;24;26;0;fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};\n%1;24;25;0;0;0;0;;",
+        .rotated => "%0;41;50;0;40;10;0;cc4a,41x50,0,0{20x50,0,0,0,20x50,21,0,1};a7dd,41x50,0,0,0" ++
+            "\n%1;20;50;0;0;0;0;;",
+        .region_scroll => test_hide_after,
+        else => test_show_after,
+    };
+    const screen: Viewer.CommandCompletion = switch (fallback) {
+        .capture_failed => .failure,
+        .capture_too_large => .{ .too_large = "\x1b[31mCAPTURED" },
+        else => .{ .success = "CAPTURED" },
+    };
+    const actions = testCompleteResize(&viewer, before, after, &.{screen});
+
+    try expectRecapture(&viewer, actions);
+    const contents = try pane.terminal_owner.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "CAPTURED") == null);
+}
+
+test "a zoomed pane's resize falls back to a recapture whenever the capture can't be trusted" {
+    for (std.enums.values(TestDetourFallback)) |fallback| {
+        testDetourFallback("3.5a", fallback) catch |err| {
+            log.warn("fallback={s}", .{@tagName(fallback)});
+            return err;
+        };
+    }
+    try testDetourFallback("3.1", .capture_failed);
+    try testDetourFallback("3.1", .cursor);
+}
+
+test "a zoomed top/bottom split and a single pane resize by rows without a capture" {
+    {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        viewer.state = .command_queue;
+        viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+        try viewer.windows.append(testing.allocator, try testZoomedWindow(
+            0,
+            "b5dc,50x41,0,0[50x20,0,0,0,50x20,0,21,1]",
+            test_zoomed_layouts[0],
+            true,
+        ));
+        _ = try testLivePane(&viewer, 1, 50, 20, "");
+        const pane = try testLivePane(&viewer, 0, 50, 41, testRows(0, 49, "\r\n"));
+
+        try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptResize{});
+        _ = testComplete(&viewer, "%0;50;41;0;40;10;0;b5dc,50x41,0,0[50x20,0,0,0,50x20,0,21,1];a99d,50x41,0,0,0\n" ++
+            "%1;50;20;0;0;0;0;;");
+        _ = testComplete(&viewer, "");
+        const actions = testComplete(&viewer, "%0;50;25;0;24;26;0;ff68,50x25,0,0[50x12,0,0,0,50x12,0,13,1];" ++
+            "b59d,50x25,0,0,0\n%1;50;12;0;0;0;0;;");
+        try expectNoRecapture(actions);
+        try testing.expect(!pane.stale);
+        try expectScreen(pane, testRows(0, 24, "\n") ++ "R25", testRows(26, 48, "\n") ++ "R49");
+    }
+    {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        viewer.state = .command_queue;
+        viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+        try viewer.windows.append(testing.allocator, try testResizeWindow(0, test_zoomed_layouts[0], true));
+        const pane = try testLivePane(&viewer, 0, 50, 41, testRows(0, 49, "\r\n"));
+
+        try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptResize{});
+        _ = testComplete(&viewer, "%0;50;41;0;40;10;0;a99d,50x41,0,0,0;");
+        _ = testComplete(&viewer, "");
+        const actions = testComplete(&viewer, "%0;50;25;0;24;26;0;b59d,50x25,0,0,0;");
+        try expectNoRecapture(actions);
+        try testing.expect(!pane.stale);
+        try expectScreen(pane, testRows(0, 24, "\n") ++ "R25", testRows(26, 48, "\n") ++ "R49");
+    }
+}
+
+test "a zoomed pane's resize on the alternate screen draws tmux's screen and leaves the normal one stale" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testZoomedSplit(&viewer, "3.5a", 41);
+    pane.stream.nextSlice("\x1b[?1049h\x1b[HALT");
+
+    try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptCaptures{ .panes = &.{0} });
+    const actions = testCompleteResize(
+        &viewer,
+        "%0;50;41;3;0;10;1;" ++ test_split_layouts[0] ++ ";" ++ test_zoomed_layouts[0] ++ "\n%1;24;41;0;0;0;0;;",
+        "%0;50;25;3;0;10;1;fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};b59d,50x25,0,0,0\n%1;24;25;0;0;0;0;;",
+        &.{.{ .success = "ALT\n\nredrawn" }},
+    );
+    try expectNoRecapture(actions);
+    try testing.expect(!pane.stale);
+    try testing.expect(pane.primary_stale);
+    try testing.expectEqual(25, pane.terminal_owner.terminal.rows);
+    try expectScreen(pane, "", "ALT\n\nredrawn");
+    try testing.expect(resize.cursorMatches(&pane.terminal_owner.terminal, 3, 0));
+
+    var leave = "\x1b[?1049l".*;
+    const left = viewer.next(.{ .tmux = .{ .output = .{ .pane_id = 0, .data = &leave } } });
+    try testing.expect(testCommandWith(left, "refresh-client -A '%0:pause'") != null);
+}
+
+/// `count` windows 50x41, each split left/right with pane 2i zoomed and
+/// holding R00-R49 (history R00-R09, the cursor on the last row).
+fn testZoomedSplits(viewer: *Viewer, count: usize, current: usize) !void {
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    for (0..count) |i| {
+        try viewer.windows.append(testing.allocator, try testZoomedWindow(
+            i,
+            test_split_layouts[i],
+            test_zoomed_layouts[i],
+            i == current,
+        ));
+        _ = try testLivePane(viewer, 2 * i + 1, 24, 41, "");
+        _ = try testLivePane(viewer, 2 * i, 50, 41, testRows(0, 49, "\r\n"));
+    }
+}
+
+const test_split_after_layouts = [_][]const u8{
+    "fa58,50x25,0,0{25x25,0,0,0,24x25,26,0,1};b59d,50x25,0,0,0",
+    "fa61,50x25,0,0{25x25,0,0,2,24x25,26,0,3};b59f,50x25,0,0,2",
+    "fa6a,50x25,0,0{25x25,0,0,4,24x25,26,0,5};b5a1,50x25,0,0,4",
+};
+
+/// The samples around the keyboard showing (rows 41 to 25) in
+/// `testZoomedSplits`' windows.
+inline fn testSplitSamples(comptime count: usize, comptime after: bool) []const u8 {
+    return comptime samples: {
+        var text: []const u8 = "";
+        for (0..count) |i| {
+            if (i > 0) text = text ++ "\n";
+            text = text ++ if (after) std.fmt.comptimePrint(
+                "%{d};50;25;1;24;26;0;{s}\n%{d};24;25;0;0;0;0;;",
+                .{ 2 * i, test_split_after_layouts[i], 2 * i + 1 },
+            ) else std.fmt.comptimePrint(
+                "%{d};50;41;0;40;10;0;{s};{s}\n%{d};24;41;0;0;0;0;;",
+                .{ 2 * i, test_split_layouts[i], test_zoomed_layouts[i], 2 * i + 1 },
+            );
+        }
+        break :samples text;
+    };
+}
+
+const test_show_screen: Viewer.CommandCompletion = .{ .success = testRows(26, 49, "\n") ++ "$" };
+
+fn expectShownKeyboard(pane: *Viewer.Pane) !void {
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    try testing.expect(!pane.stale);
+    try expectScreen(pane, testRows(0, 24, "\n") ++ "R25", testRows(26, 49, "\n") ++ "$");
+    try testing.expect(resize.cursorMatches(&pane.terminal_owner.terminal, 1, 24));
+}
+
+test "a client resize captures only the current window's zoomed pane and leaves hidden ones to a recapture" {
+    inline for ([_]usize{ 2, 3 }) |count| {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        try testZoomedSplits(&viewer, count, 1);
+
+        try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptCaptures{ .panes = &.{2} });
+        const actions = testCompleteResize(
+            &viewer,
+            testSplitSamples(count, false),
+            testSplitSamples(count, true),
+            &.{test_show_screen},
+        );
+        try expectNoRecapture(actions);
+        try expectShownKeyboard(viewer.panes.get(2).?);
+        for (0..count) |i| {
+            try testing.expect(!viewer.panes.get(2 * i + 1).?.stale);
+            if (i == 1) continue;
+            const hidden = viewer.panes.get(2 * i).?;
+            try testing.expect(hidden.stale);
+            try testing.expectEqual(25, hidden.terminal_owner.terminal.rows);
+        }
+
+        for (0..count) |i| {
+            if (i == 1) continue;
+            var buffer: [32]u8 = undefined;
+            const pause = try std.fmt.bufPrint(&buffer, "refresh-client -A '%{d}:pause'", .{2 * i});
+            try testing.expect(testCommandWith(testSelectWindow(&viewer, i), pause) != null);
+        }
+    }
+}
+
+const test_resize_sample = "list-panes -s -F '#{pane_id};#{pane_width};#{pane_height};#{cursor_x};#{cursor_y};" ++
+    "#{history_size};#{alternate_on};#{?#{||:#{&&:#{window_zoomed_flag},#{pane_active}},#{&&:#{pane_at_top}," ++
+    "#{pane_at_left}}},#{window_layout};#{?window_zoomed_flag,#{window_visible_layout},},;}'";
+
+/// Accepts only the client resize Remux sent before it captured screens.
+const TestAcceptPlainResize = struct {
+    pub fn submitClientResize(_: @This(), members: []const []const u8) !void {
+        var wire: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer wire.deinit();
+        try (Viewer.CommandGroup{ .members = members }).write(&wire.writer);
+        try testing.expectEqualStrings(
+            test_resize_sample ++ " ; refresh-client -C 50x25 ; " ++ test_resize_sample ++ "\n",
+            wire.writer.buffered(),
+        );
+    }
+};
+
+test "a current top/bottom or single-pane window sends today's resize whatever the hidden windows are" {
+    for ([_]usize{ 1, 2 }) |current| {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        viewer.state = .command_queue;
+        viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+        try viewer.windows.append(testing.allocator, try testZoomedWindow(
+            0,
+            test_split_layouts[0],
+            test_zoomed_layouts[0],
+            false,
+        ));
+        try viewer.windows.append(testing.allocator, try testZoomedWindow(
+            1,
+            "b5e5,50x41,0,0[50x20,0,0,2,50x20,0,21,3]",
+            test_zoomed_layouts[1],
+            current == 1,
+        ));
+        try viewer.windows.append(testing.allocator, try testResizeWindow(2, test_zoomed_layouts[2], current == 2));
+        _ = try testLivePane(&viewer, 1, 24, 41, "");
+        _ = try testLivePane(&viewer, 3, 50, 20, "");
+        for ([_]usize{ 0, 2, 4 }) |id| _ = try testLivePane(&viewer, id, 50, 41, testRows(0, 49, "\r\n"));
+
+        try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptPlainResize{});
+        _ = testComplete(&viewer, testSplitSamples(1, false) ++
+            "\n%2;50;41;0;40;10;0;b5e5,50x41,0,0[50x20,0,0,2,50x20,0,21,3];a99f,50x41,0,0,2" ++
+            "\n%3;50;20;0;0;0;0;;\n%4;50;41;0;40;10;0;a9a1,50x41,0,0,4;");
+        _ = testComplete(&viewer, "");
+        const actions = testComplete(&viewer, testSplitSamples(1, true) ++
+            "\n%2;50;25;0;24;26;0;ff71,50x25,0,0[50x12,0,0,2,50x12,0,13,3];b59f,50x25,0,0,2" ++
+            "\n%3;50;12;0;0;0;0;;\n%4;50;25;0;24;26;0;b5a1,50x25,0,0,4;");
+        try expectNoRecapture(actions);
+        try testing.expect(viewer.resize_inflight == null);
+        for ([_]usize{ 2, 4 }) |id| {
+            const pane = viewer.panes.get(id).?;
+            try testing.expect(!pane.stale);
+            try expectScreen(pane, testRows(0, 24, "\n") ++ "R25", testRows(26, 48, "\n") ++ "R49");
+        }
+        try testing.expect(!viewer.panes.get(1).?.stale);
+        try testing.expect(!viewer.panes.get(3).?.stale);
+
+        // The hidden zoomed left/right pane is recaptured when it's shown.
+        const hidden = viewer.panes.get(0).?;
+        try testing.expect(hidden.stale);
+        try testing.expectEqual(25, hidden.terminal_owner.terminal.rows);
+        try testing.expect(testCommandWith(testSelectWindow(&viewer, 0), "refresh-client -A '%0:pause'") != null);
+    }
+}
+
+fn testCell(pane: *Viewer.Pane, x: size.CellCountInt, y: size.CellCountInt) @import("../../terminal/PageList.zig").Pin {
+    return pane.terminal_owner.terminal.screens.active.pages.pin(.{ .active = .{ .x = x, .y = y } }).?;
+}
+
+fn expectCellChar(pane: *Viewer.Pane, x: size.CellCountInt, y: size.CellCountInt, expected: u21) !void {
+    try testing.expectEqual(expected, testCell(pane, x, y).rowAndCell().cell.codepoint());
+}
+
+/// The cell's hyperlink URI and explicit id, or null if it has none.
+fn expectCellLink(
+    pane: *Viewer.Pane,
+    x: size.CellCountInt,
+    y: size.CellCountInt,
+    expected: ?struct { uri: []const u8, id: []const u8 = "" },
+) !void {
+    const pin = testCell(pane, x, y);
+    const cell = pin.rowAndCell().cell;
+    const page = pin.node.page();
+    const id = page.lookupHyperlink(cell) orelse {
+        try testing.expect(expected == null);
+        return;
+    };
+    const want = expected orelse return error.TestUnexpectedHyperlink;
+    const link = page.hyperlink_set.get(page.memory, id);
+    try testing.expectEqualStrings(want.uri, link.uri.slice(page.memory));
+    switch (link.id) {
+        .explicit => |explicit| try testing.expectEqualStrings(want.id, explicit.slice(page.memory)),
+        .implicit => try testing.expectEqualStrings(want.id, ""),
+    }
+}
+
+fn expectCellForeground(pane: *Viewer.Pane, x: size.CellCountInt, y: size.CellCountInt, palette: u8) !void {
+    const pin = testCell(pane, x, y);
+    try testing.expectEqual(
+        @as(@import("../../terminal/style.zig").Style.Color, .{ .palette = palette }),
+        pin.style(pin.rowAndCell().cell).fg_color,
+    );
+}
+
+/// A detour of pane 0 with the program's state set by `bytes`, drawing
+/// `screen` as tmux's screen; the cursor ends at (1,24).
+fn testDetourWith(viewer: *Viewer, bytes: []const u8, screen: []const u8) !*Viewer.Pane {
+    const pane = try testZoomedSplit(viewer, "3.5a", 41);
+    pane.stream.nextSlice(bytes);
+    try viewer.setClientSize(.{ .columns = 50, .rows = 25 }, TestAcceptCaptures{ .panes = &.{0} });
+    _ = testCompleteResize(viewer, test_show_before, test_show_after, &.{.{ .success = screen }});
+    try testing.expect(!pane.stale);
+    try testing.expect(resize.cursorMatches(&pane.terminal_owner.terminal, 1, 24));
+    return pane;
+}
+
+/// Recapture pane 1 (20x3) with the program's state set by `bytes`, drawing
+/// `screen` as tmux's screen; the cursor ends at (3,0).
+fn testRecaptureWith(viewer: *Viewer, bytes: []const u8, screen: []const u8) !*Viewer.Pane {
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(viewer, 1, 3, bytes);
+    try viewer.refreshPane(1, TestAcceptPause{});
+    _ = testComplete(viewer, "");
+    _ = testComplete(viewer, "%1;20;3;3;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    for ([_][]const u8{ "", "", screen, "", "" }) |reply| _ = testComplete(viewer, reply);
+    try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+    return pane;
+}
+
+/// G1 is DEC line drawing and shifted in, as ncurses programs leave it.
+const test_dec_graphics = "\x1b)0\x0e";
+const test_open_link = "\x1b]8;id=prog;https://prog.example\x1b\\";
+const test_linked_screen = "A\x1b]8;;https://cap.example\x1b\\B\x1b]8;;\x1b\\C";
+
+test "a detour draws tmux's screen in its own character set and keeps the program's" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testDetourWith(&viewer, test_dec_graphics, "qqq");
+    for (0..3) |x| try expectCellChar(pane, @intCast(x), 0, 'q');
+    testOutput(&viewer, 0, "q");
+    try expectCellChar(pane, 1, 24, 0x2500);
+}
+
+test "a recapture draws tmux's screen in its own character set and keeps the program's" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testRecaptureWith(&viewer, test_dec_graphics, "qqq");
+    for (0..3) |x| try expectCellChar(pane, @intCast(x), 0, 'q');
+    testOutput(&viewer, 1, "q");
+    try expectCellChar(pane, 3, 0, 0x2500);
+}
+
+test "a detour draws tmux's screen with its own links and keeps the program's open link" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testDetourWith(&viewer, test_open_link, test_linked_screen);
+    try expectCellLink(pane, 0, 0, null);
+    try expectCellLink(pane, 1, 0, .{ .uri = "https://cap.example" });
+    try expectCellLink(pane, 2, 0, null);
+    testOutput(&viewer, 0, "D");
+    try expectCellLink(pane, 1, 24, .{ .uri = "https://prog.example", .id = "prog" });
+}
+
+test "a recapture draws tmux's screen with its own links and keeps the program's open link" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const pane = try testRecaptureWith(&viewer, test_open_link, test_linked_screen);
+    try expectCellLink(pane, 0, 0, null);
+    try expectCellLink(pane, 1, 0, .{ .uri = "https://cap.example" });
+    try expectCellLink(pane, 2, 0, null);
+    testOutput(&viewer, 1, "D");
+    try expectCellLink(pane, 3, 0, .{ .uri = "https://prog.example", .id = "prog" });
+}
+
+test "a recapture on the alternate screen draws the normal screen without the program's state and keeps it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    const pane = try testResizePane(&viewer, 1, 3, "\x1b[?1049h" ++ test_dec_graphics ++ test_open_link ++ "\x1b[31m");
+    try viewer.refreshPane(1, TestAcceptPause{});
+    _ = testComplete(&viewer, "");
+
+    // The normal screen tmux kept is replayed on the other screen, then the
+    // alternate screen.
+    for ([_][]const u8{ test_alternate_state, "", "qqq" ++ test_linked_screen, "ALT", "", "" }) |reply| {
+        _ = testComplete(&viewer, reply);
+    }
+    const t = &pane.terminal_owner.terminal;
+    try testing.expectEqual(ScreenSet.Key.alternate, t.screens.active_key);
+    const primary = t.screens.get(.primary).?;
+    for ("qqqA", 0..) |c, x| {
+        const pin = primary.pages.pin(.{ .active = .{ .x = @intCast(x), .y = 0 } }).?;
+        try testing.expectEqual(@as(u21, c), pin.rowAndCell().cell.codepoint());
+        try testing.expect(!pin.rowAndCell().cell.hyperlink);
+    }
+
+    testOutput(&viewer, 1, "q");
+    try expectCellChar(pane, 0, 0, 0x2500);
+    try expectCellLink(pane, 0, 0, .{ .uri = "https://prog.example", .id = "prog" });
+    try expectCellForeground(pane, 0, 0, 1);
+}
+
+test "a detour and a recapture keep the program's pen" {
+    {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        const pane = try testDetourWith(&viewer, "\x1b[31m", "\x1b[32mX");
+        try expectCellForeground(pane, 0, 0, 2);
+        testOutput(&viewer, 0, "Y");
+        try expectCellForeground(pane, 1, 24, 1);
+    }
+    {
+        var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+        defer viewer.deinit();
+        const pane = try testRecaptureWith(&viewer, "\x1b[31m", "\x1b[32mX");
+        try expectCellForeground(pane, 0, 0, 2);
+        testOutput(&viewer, 1, "Y");
+        try expectCellForeground(pane, 3, 0, 1);
+    }
 }
