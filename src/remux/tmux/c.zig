@@ -1217,13 +1217,14 @@ test "tmux C client pane paste" {
         ghostty_tmux_client_outbound(&client, &outbound),
     );
     const buffer = &client.control.paste_buffer;
-    var expected_storage: [256]u8 = undefined;
+    var expected_storage: [512]u8 = undefined;
     try testing.expectEqualStrings(
         try std.fmt.bufPrint(
             &expected_storage,
             "copy-mode -q -t %0\n" ++
                 "set-buffer -b {s} -- \"paste \\042\\044HOME\\042\\012🙂\"\n" ++
-                "paste-buffer -p -b {s} -t %0\n" ++
+                "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}},#{{?pane_dead,0,1}}}}' " ++
+                "'paste-buffer -p -b {s} -t %0' 'display-message -p \"\"'\n" ++
                 "delete-buffer -b {s}\n",
             .{ buffer, buffer, buffer },
         ),
@@ -1231,7 +1232,8 @@ test "tmux C client pane paste" {
     );
     try consumeAllTest(&client);
 
-    // The paste's own reply, the third, completes the host's token.
+    // The paste's own reply, the third, completes the host's token: this
+    // tmux is 3.1, which answers the paste's command once.
     try feedTest(
         &client,
         "%begin 9 9 1\n%end 9 9 1\n%begin 10 10 1\n%end 10 10 1\n",

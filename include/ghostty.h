@@ -1726,7 +1726,12 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
 // so reaches panes that have the text.
 //
 // The paste reports through COMMAND_COMPLETE with the correlation token
-// written to the final argument, once tmux has written the text to the pane.
+// written to the final argument, when tmux has run the paste. A pane whose
+// program has exited, or that has gone, takes no text, as typing into it takes
+// none: tmux checks that itself as it runs the paste, and the completion does
+// not report it. From tmux 3.2 the completion is an error if tmux refuses the
+// paste itself; tmux 3.1 gives that refusal to no command, so there the
+// completion is a success all the same.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_paste_pane(
     ghostty_tmux_client_t,
     uint64_t,

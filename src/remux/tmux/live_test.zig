@@ -21,7 +21,8 @@
 //!
 //! Pastes: a paste and the Enter after it, written together, must reach the
 //! pane and the panes tmux copies its input to as the paste and then the
-//! Enter, and every command after them must get its own reply. It also
+//! Enter, every command after them must get its own reply, and the server
+//! must still be there. Each scenario has a server of its own. It also
 //! needs:
 //!
 //! - REMUX_TMUX_LIVE_PASTE_REPORT: the path of the report it writes, with
@@ -92,6 +93,21 @@ const Live = struct {
         });
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
+    }
+
+    /// What a tmux command prints, trimmed. The caller frees it.
+    fn output(self: *Live, args: []const []const u8) ![]u8 {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(testing.allocator);
+        try argv.appendSlice(testing.allocator, &.{ self.bin, "-L", self.socket, "-f", "/dev/null" });
+        try argv.appendSlice(testing.allocator, args);
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = argv.items,
+            .environ_map = &self.env,
+        });
+        defer testing.allocator.free(result.stdout);
+        testing.allocator.free(result.stderr);
+        return testing.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \r\n"));
     }
 
     fn print(self: *Live, comptime fmt: []const u8, args: anytype) !void {
@@ -741,6 +757,10 @@ const PasteCase = struct {
     /// Close pane 0 just before the paste, so that the client still has it.
     target_gone: bool = false,
 
+    /// Pane 0's program has exited and tmux keeps the pane (remain-on-exit).
+    /// tmux 3.1 to 3.3a end the server when told to paste into such a pane.
+    target_exited: bool = false,
+
     /// What each pane's program reads.
     expected: [4][]const u8,
 };
@@ -789,6 +809,12 @@ const paste_cases = [_]PasteCase{
         .target_gone = true,
         .expected = .{ "", "", "", "" },
     },
+    .{
+        // The byte that had its program exit is all it ever read.
+        .name = "synchronized, the pasted pane's program exited",
+        .target_exited = true,
+        .expected = .{ "x", "", "", "" },
+    },
 };
 
 /// Bytes with the controls among them spelled out.
@@ -835,8 +861,10 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
             live.dir, std.c.getpid(), live.runs, i,
         });
         started += 1;
-        const program = try std.fmt.allocPrint(testing.allocator, "{s}stty raw -echo; exec cat > {s}", .{
+        // The program that is to exit does so on its first byte.
+        const program = try std.fmt.allocPrint(testing.allocator, "{s}stty raw -echo; exec {s} > {s}", .{
             if (case.plain == i) "" else "printf '\\033[?2004h'; ",
+            if (case.target_exited and i == 0) "head -c 1" else "cat",
             logs[i],
         });
         defer testing.allocator.free(program);
@@ -853,6 +881,18 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
         } else return error.PaneProgramDidNotStart;
     }
     try sleepMs(300);
+
+    // Before the panes are synchronized, or tmux copies the byte to them.
+    if (case.target_exited) {
+        try live.tmux(&.{ "set-option", "-g", "remain-on-exit", "on" });
+        try live.tmux(&.{ "send-keys", "-t", "%0", "x" });
+        for (0..200) |_| {
+            const dead = try live.output(&.{ "display-message", "-p", "-t", "%0", "#{pane_dead}" });
+            defer testing.allocator.free(dead);
+            if (std.mem.eql(u8, dead, "1")) break;
+            try sleepMs(25);
+        } else return error.PaneProgramDidNotExit;
+    }
     if (case.synchronized) try live.tmux(&.{ "set-option", "-w", "-t", "s:0", "synchronize-panes", "on" });
     if (case.zoomed) try live.tmux(&.{ "resize-pane", "-Z", "-t", "%0" });
     if (case.copy_mode) |pane| {
@@ -909,7 +949,11 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
             i,                                   if (pasted.ok) "ok" else "refused", pasted.body,
             if (entered.ok) "ok" else "refused", entered.body,
         });
-        if (pasted.ok == case.target_gone or entered.ok == case.target_gone) ok = false;
+
+        // The paste completes whether or not there was a pane to take the
+        // text. tmux refuses keys for a pane it doesn't have, and takes
+        // them for one whose program has exited.
+        if (!pasted.ok or entered.ok == case.target_gone) ok = false;
     }
 
     // tmux has deleted the buffer and the pane is in no mode, and each of
@@ -924,6 +968,12 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
 
     // Nor is any reply still awaited once tmux has gone quiet.
     try run.settle();
+
+    // And the server is still there for a new client.
+    const still_there = try live.output(&.{ "display-message", "-p", "-t", "s:1", "still there" });
+    defer testing.allocator.free(still_there);
+    try live.print("server: {s}", .{if (still_there.len == 0) "GONE" else still_there});
+    if (!std.mem.eql(u8, still_there, "still there")) ok = false;
 
     // What each program read: give the bytes time to arrive, then a little
     // more for any that shouldn't.
