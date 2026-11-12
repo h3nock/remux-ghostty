@@ -950,10 +950,12 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
             if (entered.ok) "ok" else "refused", entered.body,
         });
 
-        // The paste completes whether or not there was a pane to take the
-        // text. tmux refuses keys for a pane it doesn't have, and takes
-        // them for one whose program has exited.
-        if (!pasted.ok or entered.ok == case.target_gone) ok = false;
+        // A paste tmux didn't make fails, where tmux says so to the
+        // client: from 3.2. tmux refuses keys for a pane it doesn't have,
+        // and takes them for one whose program has exited.
+        const undelivered = (case.target_gone or case.target_exited) and
+            run.client.viewer.answersCommandsIfShellRuns();
+        if (pasted.ok == undelivered or entered.ok == case.target_gone) ok = false;
     }
 
     // tmux has deleted the buffer and the pane is in no mode, and each of

@@ -1224,9 +1224,9 @@ test "tmux C client pane paste" {
             "copy-mode -q -t %0\n" ++
                 "set-buffer -b {s} -- \"paste \\042\\044HOME\\042\\012🙂\"\n" ++
                 "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}},#{{?pane_dead,0,1}}}}' " ++
-                "'paste-buffer -p -b {s} -t %0' 'display-message -p \"\"'\n" ++
+                "'paste-buffer -p -b {s} -t %0' 'show-buffer -b {s}-undelivered'\n" ++
                 "delete-buffer -b {s}\n",
-            .{ buffer, buffer, buffer },
+            .{ buffer, buffer, buffer, buffer },
         ),
         try outbound.slice(),
     );

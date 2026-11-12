@@ -53,21 +53,33 @@ pub const ControlClient = struct {
     const pane_shown = "#{||:#{?window_zoomed_flag,0,1},#{pane_active}}";
 
     /// Pastes `buffer` into `pane` if `condition` holds for `target`, which
-    /// tmux decides as it runs the command:
+    /// tmux decides as it runs the command, and runs `otherwise` if not:
     ///
     ///   if-shell -F -t %<target> '#{&&:#{==:#{pane_id},%<target>},<condition>}'
-    ///       'paste-buffer -p -b <buffer> -t %<pane>' 'display-message -p ""'
+    ///       'paste-buffer -p -b <buffer> -t %<pane>' '<otherwise>'
     ///
     /// `#{==:#{pane_id},%<target>}` is that it is the target the condition
     /// is read for. When the target has gone, tmux reads it for another
     /// pane instead.
     ///
-    /// The other branch does nothing. It is there so that tmux answers with
-    /// as many blocks whichever branch it runs.
-    const guarded_paste_format =
-        "if-shell -F -t %{[target]d} " ++
-        "'#{{&&:#{{==:#{{pane_id}},%{[target]d}}},{[condition]s}}}' " ++
-        "'paste-buffer -p -b {[buffer]s} -t %{[pane]d}' 'display-message -p \"\"'";
+    /// `otherwise` is one command, so that tmux answers with as many blocks
+    /// whichever branch it runs.
+    fn guardedPasteFormat(comptime otherwise: []const u8) []const u8 {
+        return "if-shell -F -t %{[target]d} " ++
+            "'#{{&&:#{{==:#{{pane_id}},%{[target]d}}},{[condition]s}}}' " ++
+            "'paste-buffer -p -b {[buffer]s} -t %{[pane]d}' '" ++ otherwise ++ "'";
+    }
+
+    /// The paste into the target itself. A paste tmux doesn't make must not
+    /// read as made, so the other branch is a command tmux refuses: it
+    /// shows a buffer that is never set.
+    const target_paste_format = guardedPasteFormat(
+        "show-buffer -b {[buffer]s}-undelivered",
+    );
+
+    /// The paste into another pane. One that doesn't take the text is no
+    /// failure, so the other branch does nothing.
+    const other_paste_format = guardedPasteFormat("display-message -p \"\"");
 
     /// The condition for pasting into the target itself: its program
     /// hasn't exited. A pane whose program has exited has nothing to write
@@ -346,8 +358,10 @@ pub const ControlClient = struct {
     ///
     /// A pane whose program has exited, or that has gone, takes no text, as
     /// typing into it takes none. tmux checks that itself as it runs the
-    /// paste, and the token does not report it. From tmux 3.2 the token
-    /// fails if tmux refuses the paste itself.
+    /// paste. From tmux 3.2 the token fails when tmux made no paste into
+    /// the pane: its program had exited, it had gone, or tmux refused the
+    /// paste. tmux 3.1 gives that answer to no command, so there the token
+    /// completes all the same.
     ///
     /// The paste goes where typing into the pane would. A pane in a mode
     /// takes no input, so the pane leaves its mode first; and the panes
@@ -441,14 +455,14 @@ pub const ControlClient = struct {
 
         // tmux answers an `if-shell` once, and from tmux 3.2 once more for
         // the command it ran. Before 3.2 that second answer is in a block
-        // no command owns, so there a paste that tmux itself refuses still
+        // no command owns, so there a paste that tmux didn't make still
         // completes its token with success.
         const guarded_paste_replies: u32 =
             if (self.viewer.answersCommandsIfShellRuns()) 2 else 1;
         const paste_index = commands.items.len;
         commands.appendAssumeCapacity(.{
             .source = .host,
-            .text = try std.fmt.allocPrint(arena, guarded_paste_format, .{
+            .text = try std.fmt.allocPrint(arena, target_paste_format, .{
                 .target = pane_id,
                 .condition = pane_alive,
                 .buffer = buffer,
@@ -460,7 +474,7 @@ pub const ControlClient = struct {
             if (other == pane_id) continue;
             commands.appendAssumeCapacity(.{
                 .source = .best_effort,
-                .text = try std.fmt.allocPrint(arena, guarded_paste_format, .{
+                .text = try std.fmt.allocPrint(arena, other_paste_format, .{
                     .target = pane_id,
                     .condition = try std.fmt.allocPrint(arena, copies_input_format, .{
                         .takes = pane_takes_copied_input,
@@ -2293,11 +2307,12 @@ fn expectPasteOutbound(
             "copy-mode -q -t %0\n" ++
                 "set-buffer -b {s} -- \"{s}\"\n" ++
                 "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}},#{{?pane_dead,0,1}}}}' " ++
-                "'paste-buffer -p -b {s} -t %0' 'display-message -p \"\"'\n" ++
+                "'paste-buffer -p -b {s} -t %0' 'show-buffer -b {s}-undelivered'\n" ++
                 "delete-buffer -b {s}\n",
             .{
                 &client.paste_buffer, quoted_text,
                 &client.paste_buffer, &client.paste_buffer,
+                &client.paste_buffer,
             },
         ),
         client.outboundBytes(),
@@ -2355,7 +2370,7 @@ fn windowsPasteOutbound(
         "copy-mode -q -t %1\n" ++
             "set-buffer -b {s} -- \"text\"\n" ++
             "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{?pane_dead,0,1}}}}' " ++
-            "'paste-buffer -p -b {s} -t %1' 'display-message -p \"\"'\n" ++
+            "'paste-buffer -p -b {s} -t %1' 'show-buffer -b {s}-undelivered'\n" ++
             "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{&&:{s}," ++
             "#{{P:#{{?#{{==:#{{pane_id}},%0}},#{{&&:{s}," ++
             "#{{||:#{{?window_zoomed_flag,0,1}},#{{pane_active}}}}}},}}}}}}}}' " ++
@@ -2367,10 +2382,10 @@ fn windowsPasteOutbound(
             "delete-buffer -b {s}\n",
         .{
             buffer,                  buffer,
-            test_takes_copied_input, test_takes_copied_input,
             buffer,                  test_takes_copied_input,
             test_takes_copied_input, buffer,
-            buffer,
+            test_takes_copied_input, test_takes_copied_input,
+            buffer,                  buffer,
         },
     );
 }
@@ -2564,20 +2579,25 @@ test "control client paste counts one reply for each pane's paste before tmux 3.
     );
 }
 
-test "control client paste into a pane tmux no longer has completes and deletes its buffer" {
+test "control client paste into a pane tmux no longer has fails from tmux 3.2" {
     // tmux refuses to take the pane out of its mode. It reads each
     // `if-shell`'s condition for another pane, finds it isn't the pasted
-    // one, and runs the branch that does nothing: no text goes anywhere,
-    // as typing into the pane would go nowhere, and the buffer is deleted.
+    // one, and runs the other branch: no text goes anywhere, as typing
+    // into the pane would go nowhere. The pasted pane's other branch is
+    // refused, which is the paste's failure.
     try expectPasteReplies(
         "3.5a",
-        true,
-        test_refused ++ test_ok ++ (test_ok ++ test_ok) ** 3 ++ test_ok,
+        false,
+        test_refused ++ test_ok ++ test_ok ++ test_refused ++
+            (test_ok ++ test_ok) ** 2 ++ test_ok,
     );
+
+    // tmux 3.1 marks that refusal as the server's: the paste completes.
     try expectPasteReplies(
         "3.1",
         true,
-        test_refused ++ test_ok ++ (test_ok ++ test_server_ok) ** 3 ++ test_ok,
+        test_refused ++ test_ok ++ test_ok ++ test_server_refused ++
+            (test_ok ++ test_server_ok) ** 2 ++ test_ok,
     );
 }
 
