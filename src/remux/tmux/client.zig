@@ -937,7 +937,7 @@ test "control client hydration error skips only its group" {
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
         "%begin 4 4 1\n" ++
-            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;43;8,16;sh;/tmp\n" ++
+            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;43;8,16;sh;/tmp\n" ++
             "%end 4 4 1\n" ++
             "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
             "%begin 6 6 1\npending-host\n%end 6 6 1\n",
@@ -1141,8 +1141,8 @@ test "control client hydrates a pane tmux only skipped after other panes closed 
     // in one group. %1 closes before that group runs and %2 before the retry
     // of %2 and %3, so tmux skips every capture of %3 twice without ever
     // refusing one.
-    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
-    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
+    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
+    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
     try client.feed(
         "%window-renamed @0 bash\n%window-add @1\n" ++
             "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
@@ -1167,8 +1167,8 @@ test "control client hydrates a pane tmux only skipped after other panes closed 
         "%layout-change @1 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] \n" ++
             "%window-pane-changed @1 %2\n%window-renamed @1 sleep\n" ++
             "%begin 1792879759 292 1\n" ++ state_0 ++ "\n" ++
-            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
-            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
             "%end 1792879759 292 1\n" ++
             "%begin 1792879759 293 1\ncan't find pane: %1\n%error 1792879759 293 1\n",
         &actions,
@@ -1590,7 +1590,7 @@ test "control client pane refresh preserves identity and output cut" {
 
     try client.feed(
         "%begin 9 9 1\n" ++
-            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
+            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n",
         &actions,
     );
@@ -1710,7 +1710,7 @@ test "control client recaptures fewer history rows after their reply is too larg
     const row5 = "\x1b[38;2;150;0;75m\x1b[48;2;0;150;0m▀\x1b[38;2;150;30;90m\x1b[48;2;25;150;10m▀\x1b[38;2;150;60;105m\x1b[48;2;50;150;20m▀\x1b[38;2;150;90;120m\x1b[48;2;75;150;30m▀\x1b[38;2;150;120;135m\x1b[48;2;100;150;40m▀\x1b[38;2;150;150;150m\x1b[48;2;125;150;50m▀";
     const row6 = "\x1b[38;2;180;0;90m\x1b[48;2;0;180;0m▀\x1b[38;2;180;30;105m\x1b[48;2;25;180;10m▀\x1b[38;2;180;60;120m\x1b[48;2;50;180;20m▀\x1b[38;2;180;90;135m\x1b[48;2;75;180;30m▀\x1b[38;2;180;120;150m\x1b[48;2;100;180;40m▀\x1b[38;2;180;150;165m\x1b[48;2;125;180;50m▀";
     const row7 = "\x1b[38;2;210;0;105m\x1b[48;2;0;210;0m▀\x1b[38;2;210;30;120m\x1b[48;2;25;210;10m▀\x1b[38;2;210;60;135m\x1b[48;2;50;210;20m▀\x1b[38;2;210;90;150m\x1b[48;2;75;210;30m▀\x1b[38;2;210;120;165m\x1b[48;2;100;210;40m▀\x1b[38;2;210;150;180m\x1b[48;2;125;210;50m▀";
-    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;7;0;1;;sleep;/private/tmp";
+    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;7;0;1;;sleep;/private/tmp";
     client.channel.parser.max_bytes = 1024;
 
     try openTraceStartupTestClient(
@@ -1796,7 +1796,7 @@ test "control client recaptures plain screens after their styled reply is too la
     // large and the plain one isn't.
     const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
     const row1 = "\x1b[38;2;60;0;15m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;30m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;45m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;60m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;75m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;90m\x1b[48;2;125;60;50m▀";
-    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;sleep;/private/tmp";
+    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;1;;sleep;/private/tmp";
     client.channel.parser.max_bytes = 256;
 
     try openTraceStartupTestClient(
@@ -1884,7 +1884,7 @@ test "control client reads past the rest of a pending escape sequence too large 
     );
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
-        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
+        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
             "%begin 1792879997 280 1\n\n%end 1792879997 280 1\n" ++
             "%begin 1792879997 281 1\n\n\n%end 1792879997 281 1\n" ++
             "%begin 1792879997 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792879997 282 1\n",
@@ -1930,7 +1930,7 @@ fn openDroppedPendingTestClient(
     );
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
-        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
+        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
             "%begin 1792883185 281 1\n\n%end 1792883185 281 1\n" ++
             "%begin 1792883185 282 1\nBEFORE    \n\n\n\n%end 1792883185 282 1\n" ++
             "%begin 1792883185 283 1\n",

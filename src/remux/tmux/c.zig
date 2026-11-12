@@ -1283,7 +1283,7 @@ test "tmux C client pane refresh boundary" {
     try feedTest(
         &client,
         "%begin 9 9 1\n" ++
-            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
+            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n" ++
             "%begin 10 10 1\n%end 10 10 1\n" ++
             "%begin 11 11 1\n%end 11 11 1\n" ++
