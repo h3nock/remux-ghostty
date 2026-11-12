@@ -18,6 +18,10 @@ pub const CommandSource = enum {
     host,
     viewer,
     input,
+
+    /// A step of a paste whose outcome nothing acts on: a failure that
+    /// matters fails the paste's own command.
+    best_effort,
 };
 
 pub const CommandFailure = union(enum) {
@@ -95,6 +99,10 @@ pub const Channel = struct {
     const Pending = struct {
         token: CommandToken,
         source: CommandSource,
+
+        /// Reply blocks tmux has yet to send for the command, when none is
+        /// an error (see `Command.replies`).
+        replies: u32 = 1,
 
         /// True for standalone commands and the final member of a
         /// semicolon-joined group.
@@ -234,6 +242,69 @@ pub const Channel = struct {
             if (tokens_out) |tokens| tokens[i] = token;
         }
         self.outbound.appendAssumeCapacity('\n');
+    }
+
+    /// One standalone command and the layer that owns its response.
+    pub const Command = struct {
+        source: CommandSource,
+        text: []const u8,
+
+        /// How many reply blocks tmux answers the command with when none
+        /// is an error. A command that has tmux run another is answered
+        /// once itself and once more for the other, as `if-shell` is from
+        /// tmux 3.2. The command completes with its last block. An error
+        /// block fails it there and then: tmux runs nothing more for it,
+        /// so that block is its last.
+        replies: u32 = 1,
+    };
+
+    /// Queue standalone commands, each as its own newline-delimited tmux
+    /// command list, admitted together or not at all.
+    ///
+    /// Unlike a group, tmux runs each command whatever the ones before it
+    /// returned. Every text must independently satisfy `enqueueCommand`'s
+    /// single-command contract. Pass null when the caller does not need the
+    /// per-command tokens.
+    pub fn enqueueCommands(
+        self: *Channel,
+        commands: []const Command,
+        tokens_out: ?[]CommandToken,
+    ) EnqueueError!void {
+        try self.validateEnqueue();
+        if (commands.len == 0) return error.InvalidCommand;
+        if (tokens_out) |tokens| {
+            if (tokens.len != commands.len) return error.InvalidTokenCount;
+        }
+        try self.ensureTokens(commands.len);
+
+        var wire_len: usize = 0;
+        for (commands) |command| {
+            if (!isValidCommand(command.text)) return error.InvalidCommand;
+            if (command.replies == 0) return error.InvalidCommand;
+            wire_len = std.math.add(usize, wire_len, command.text.len) catch
+                return error.InvalidCommand;
+            wire_len = std.math.add(usize, wire_len, 1) catch
+                return error.InvalidCommand;
+        }
+
+        // Both reserves precede every logical mutation. If either allocation
+        // fails, no token, pending record, or wire byte becomes observable.
+        try self.ensurePendingCapacity(commands.len);
+        try self.ensureOutboundCapacity(wire_len);
+
+        for (commands, 0..) |command, i| {
+            self.outbound.appendSliceAssumeCapacity(command.text);
+            self.outbound.appendAssumeCapacity('\n');
+
+            const token = self.mintToken();
+            self.pending.appendAssumeCapacity(.{
+                .token = token,
+                .source = command.source,
+                .replies = command.replies,
+                .ends_group = true,
+            });
+            if (tokens_out) |tokens| tokens[i] = token;
+        }
     }
 
     /// Bytes awaiting transport. The slice is valid until the next enqueue,
@@ -426,10 +497,18 @@ pub const Channel = struct {
                     return;
                 }
 
-                const pending = self.popPending() orelse {
+                const head = self.pending.first() orelse {
                     self.abort(.unexpected_block, handler);
                     return;
                 };
+
+                // tmux has gone on to what the command runs next, whose
+                // reply is still to come.
+                if (!is_error and head.replies > 1) {
+                    head.replies -= 1;
+                    return;
+                }
+                const pending = self.popPending().?;
 
                 if (!is_error) {
                     const body = data orelse {
@@ -985,6 +1064,296 @@ test "tmux channel enqueue is allocation atomic" {
                 channel.outboundBytes(),
             );
             try testing.expectEqual(texts.len, channel.pendingCount());
+            channel.deinit();
+            if (!failing.has_induced_failure) break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualStrings("", channel.outboundBytes());
+            try testing.expectEqual(0, channel.pendingCount());
+            try testing.expectEqual(1, channel.next_token);
+            for (tokens) |token| try testing.expectEqual(sentinel, token);
+            channel.deinit();
+        }
+    }
+}
+
+test "tmux channel standalone commands each complete for their own source" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var opened: TestEvents = .{};
+    defer opened.deinit(testing.allocator);
+    openTestChannel(&channel, &opened);
+
+    var tokens: [3]CommandToken = undefined;
+    try channel.enqueueCommands(&.{
+        .{ .source = .input, .text = "command-a" },
+        .{ .source = .host, .text = "command-b" },
+        .{ .source = .input, .text = "command-c" },
+    }, &tokens);
+    try testing.expectEqualStrings(
+        "command-a\ncommand-b\ncommand-c\n",
+        channel.outboundBytes(),
+    );
+
+    const Completions = struct {
+        const Completion = struct {
+            token: CommandToken,
+            source: CommandSource,
+            ok: bool,
+        };
+
+        items: [3]Completion = undefined,
+        len: usize = 0,
+
+        pub fn channelEvent(self: *@This(), event: Event) void {
+            self.items[self.len] = switch (event) {
+                .command_ok => |command| .{
+                    .token = command.token,
+                    .source = command.source,
+                    .ok = true,
+                },
+                .command_failed => |command| failed: {
+                    testing.expect(command.failure == .error_block) catch
+                        @panic("a standalone command is never skipped");
+                    break :failed .{
+                        .token = command.token,
+                        .source = command.source,
+                        .ok = false,
+                    };
+                },
+                else => @panic("unexpected event"),
+            };
+            self.len += 1;
+        }
+    };
+    var completions: Completions = .{};
+    try channel.feed(
+        "%begin 2 2 1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\nfailed\n%error 3 3 1\n" ++
+            "%begin 4 4 1\n%end 4 4 1\n",
+        &completions,
+    );
+
+    try testing.expectEqualSlices(Completions.Completion, &.{
+        .{ .token = tokens[0], .source = .input, .ok = true },
+        .{ .token = tokens[1], .source = .host, .ok = false },
+        .{ .token = tokens[2], .source = .input, .ok = true },
+    }, completions.items[0..completions.len]);
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+/// Records each command's outcome with the reply it completed with.
+const TestReplies = struct {
+    const Reply = struct {
+        token: CommandToken,
+        ok: bool,
+        body: [16]u8 = @splat(0),
+    };
+
+    items: [4]Reply = undefined,
+    len: usize = 0,
+
+    pub fn channelEvent(self: *TestReplies, event: Event) void {
+        var reply: Reply = switch (event) {
+            .command_ok => |command| .{ .token = command.token, .ok = true },
+            .command_failed => |command| .{ .token = command.token, .ok = false },
+            else => @panic("unexpected event"),
+        };
+        const body = switch (event) {
+            .command_ok => |command| command.body,
+            .command_failed => |command| switch (command.failure) {
+                .error_block => |body| body,
+                else => @panic("unexpected failure"),
+            },
+            else => unreachable,
+        };
+        @memcpy(reply.body[0..body.len], body);
+        self.items[self.len] = reply;
+        self.len += 1;
+    }
+
+    fn expect(self: *const TestReplies, expected: []const struct { CommandToken, bool, []const u8 }) !void {
+        try std.testing.expectEqual(expected.len, self.len);
+        for (expected, self.items[0..self.len]) |want, got| {
+            try std.testing.expectEqual(want[0], got.token);
+            try std.testing.expectEqual(want[1], got.ok);
+            try std.testing.expectEqualStrings(want[2], std.mem.sliceTo(&got.body, 0));
+        }
+    }
+};
+
+test "tmux channel command answered in several blocks completes with its last" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var opened: TestEvents = .{};
+    defer opened.deinit(testing.allocator);
+    openTestChannel(&channel, &opened);
+
+    var tokens: [3]CommandToken = undefined;
+    try channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "runs-two-more", .replies = 3 },
+        .{ .source = .host, .text = "runs-one-more", .replies = 2 },
+        .{ .source = .host, .text = "after" },
+    }, &tokens);
+    try testing.expectEqualStrings(
+        "runs-two-more\nruns-one-more\nafter\n",
+        channel.outboundBytes(),
+    );
+
+    // Each block but a command's last says only that tmux went on.
+    var replies: TestReplies = .{};
+    try channel.feed(
+        "%begin 2 2 1\nitself\n%end 2 2 1\n" ++
+            "%begin 3 3 1\nsecond\n%end 3 3 1\n",
+        &replies,
+    );
+    try replies.expect(&.{});
+    try testing.expectEqual(3, channel.pendingCount());
+
+    try channel.feed(
+        "%begin 4 4 1\nthird\n%end 4 4 1\n" ++
+            "%begin 5 5 1\nitself\n%end 5 5 1\n" ++
+            "%begin 6 6 1\nother\n%end 6 6 1\n" ++
+            "%begin 7 7 1\nafter\n%end 7 7 1\n",
+        &replies,
+    );
+    try replies.expect(&.{
+        .{ tokens[0], true, "third" },
+        .{ tokens[1], true, "other" },
+        .{ tokens[2], true, "after" },
+    });
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel command answered in several blocks fails at its first error" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var opened: TestEvents = .{};
+    defer opened.deinit(testing.allocator);
+    openTestChannel(&channel, &opened);
+
+    var tokens: [4]CommandToken = undefined;
+    try channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "refused", .replies = 2 },
+        .{ .source = .host, .text = "after-refused" },
+        .{ .source = .host, .text = "runs-refused", .replies = 2 },
+        .{ .source = .host, .text = "after-runs-refused" },
+    }, &tokens);
+
+    // tmux refuses the first command itself and so runs nothing for it:
+    // the next block is the next command's. It runs the third, and refuses
+    // what that runs.
+    var replies: TestReplies = .{};
+    try channel.feed(
+        "%begin 2 2 1\nitself\n%error 2 2 1\n" ++
+            "%begin 3 3 1\nafter 1\n%end 3 3 1\n" ++
+            "%begin 4 4 1\nitself\n%end 4 4 1\n" ++
+            "%begin 5 5 1\nother\n%error 5 5 1\n" ++
+            "%begin 6 6 1\nafter 2\n%end 6 6 1\n",
+        &replies,
+    );
+    try replies.expect(&.{
+        .{ tokens[0], false, "itself" },
+        .{ tokens[1], true, "after 1" },
+        .{ tokens[2], false, "other" },
+        .{ tokens[3], true, "after 2" },
+    });
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel command half answered when the connection ends is cancelled once" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    openTestChannel(&channel, &events);
+
+    var tokens: [1]CommandToken = undefined;
+    try channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "runs-one-more", .replies = 2 },
+    }, &tokens);
+    try channel.feed("%begin 2 2 1\n%end 2 2 1\n%exit\n", &events);
+
+    try testing.expectEqual(3, events.items.items.len);
+    try testing.expectEqual(tokens[0], events.items.items[1].command_closed);
+    try testing.expect(events.items.items[2] == .exited);
+}
+
+test "tmux channel standalone commands validate inputs without mutation" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    openTestChannel(&channel, &events);
+
+    var tokens: [2]CommandToken = undefined;
+    try testing.expectError(
+        error.InvalidCommand,
+        channel.enqueueCommands(&.{}, null),
+    );
+    try testing.expectError(error.InvalidCommand, channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "valid" },
+        .{ .source = .host, .text = "two\nlines" },
+    }, &tokens));
+    try testing.expectError(error.InvalidTokenCount, channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "valid" },
+    }, &tokens));
+    try testing.expectError(error.InvalidCommand, channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "valid" },
+        .{ .source = .host, .text = "never answered", .replies = 0 },
+    }, &tokens));
+    try testing.expectEqualStrings("", channel.outboundBytes());
+    try testing.expectEqual(0, channel.pendingCount());
+    try testing.expectEqual(1, channel.next_token);
+}
+
+test "tmux channel standalone commands are allocation atomic" {
+    const testing = std.testing;
+    const sentinel: CommandToken = @enumFromInt(999);
+    var commands: [9]Channel.Command = undefined;
+    for (&commands, [_][]const u8{
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+    }) |*command, text| command.* = .{ .source = .host, .text = text };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(
+            testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const alloc = failing.allocator();
+
+        var channel = Channel.init(alloc) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        channel.state = .running;
+        var tokens = [_]CommandToken{sentinel} ** commands.len;
+
+        if (channel.enqueueCommands(&commands, &tokens)) |_| {
+            try testing.expectEqualStrings(
+                "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+                channel.outboundBytes(),
+            );
+            try testing.expectEqual(commands.len, channel.pendingCount());
             channel.deinit();
             if (!failing.has_induced_failure) break;
         } else |err| {

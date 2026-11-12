@@ -1706,11 +1706,34 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
     size_t,
     uint64_t*);
 
-// Sends one nonempty UTF-8 terminal payload to a known pane as a single
-// send-keys -l argument and reports completion exactly as the tracked exact
-// input API above. NUL and invalid UTF-8 are rejected because tmux literal
-// arguments cannot preserve them; use exact pane input for arbitrary bytes.
-GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_literal_input_tracked(
+// Pastes nonempty UTF-8 text into a known pane the way tmux pastes a buffer.
+// tmux, which knows the pane's modes, wraps the text in a bracketed paste when
+// the pane's program asked for one, and either way sends each line feed as a
+// carriage return, so a CRLF line end reaches the program as one carriage
+// return; the host needs no knowledge of the pane's paste mode. Bytes unsafe
+// in a paste are replaced as terminal_surface_paste replaces them, and invalid
+// UTF-8 is rejected.
+//
+// The paste goes where typing into the pane would. A pane in a tmux mode takes
+// no input, so the pane leaves its mode first. When the pane has
+// synchronize-panes on, the panes tmux copies its input to are pasted into as
+// well, each bracketed by its own program's request. Those are panes of the
+// pane's window as its layout was last reported; tmux decides for each as it
+// gets there.
+//
+// Everything the paste takes is queued by this call, in one piece and in
+// order. Input sent after it, with no wait, reaches tmux after all of it, and
+// so reaches panes that have the text.
+//
+// The paste reports through COMMAND_COMPLETE with the correlation token
+// written to the final argument, when tmux has run the paste. A pane whose
+// program has exited, whose input is turned off, or that has gone, takes no
+// text, as typing into it takes none: tmux checks that itself as it runs the
+// paste. From tmux 3.2 the completion is an error when tmux made no paste into
+// the pane: for one of those, or because tmux refused the paste. tmux 3.1
+// gives that answer to no command, so there the completion is a success all
+// the same.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_paste_pane(
     ghostty_tmux_client_t,
     uint64_t,
     const uint8_t*,

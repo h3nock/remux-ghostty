@@ -124,8 +124,6 @@ pub const Variable = enum {
     alternate_saved_x,
     /// Saved cursor Y in alternate screen.
     alternate_saved_y,
-    /// 1 if bracketed paste mode is enabled.
-    bracketed_paste,
     /// 1 if the cursor is blinking.
     cursor_blinking,
     /// Cursor colour in pane. Possible formats:
@@ -144,8 +142,6 @@ pub const Variable = enum {
     cursor_x,
     /// Cursor Y position in pane.
     cursor_y,
-    /// 1 if focus reporting is enabled.
-    focus_flag,
     /// Number of lines currently retained in pane history.
     history_size,
     /// Pane insert flag.
@@ -213,10 +209,8 @@ pub const Variable = enum {
     pub fn parse(comptime self: Variable, value: []const u8) !Type(self) {
         return switch (self) {
             .alternate_on,
-            .bracketed_paste,
             .cursor_blinking,
             .cursor_flag,
-            .focus_flag,
             .insert_flag,
             .keypad_cursor_flag,
             .keypad_flag,
@@ -270,10 +264,8 @@ pub const Variable = enum {
     pub fn Type(comptime self: Variable) type {
         return switch (self) {
             .alternate_on,
-            .bracketed_paste,
             .cursor_blinking,
             .cursor_flag,
-            .focus_flag,
             .insert_flag,
             .keypad_cursor_flag,
             .keypad_flag,
@@ -488,25 +480,11 @@ test "parse wrap_flag" {
     try testing.expectEqual(false, try Variable.parse(.wrap_flag, "true"));
 }
 
-test "parse bracketed_paste" {
-    try testing.expectEqual(true, try Variable.parse(.bracketed_paste, "1"));
-    try testing.expectEqual(false, try Variable.parse(.bracketed_paste, "0"));
-    try testing.expectEqual(false, try Variable.parse(.bracketed_paste, ""));
-    try testing.expectEqual(false, try Variable.parse(.bracketed_paste, "true"));
-}
-
 test "parse cursor_blinking" {
     try testing.expectEqual(true, try Variable.parse(.cursor_blinking, "1"));
     try testing.expectEqual(false, try Variable.parse(.cursor_blinking, "0"));
     try testing.expectEqual(false, try Variable.parse(.cursor_blinking, ""));
     try testing.expectEqual(false, try Variable.parse(.cursor_blinking, "true"));
-}
-
-test "parse focus_flag" {
-    try testing.expectEqual(true, try Variable.parse(.focus_flag, "1"));
-    try testing.expectEqual(false, try Variable.parse(.focus_flag, "0"));
-    try testing.expectEqual(false, try Variable.parse(.focus_flag, ""));
-    try testing.expectEqual(false, try Variable.parse(.focus_flag, "true"));
 }
 
 test "parse mouse_all_flag" {

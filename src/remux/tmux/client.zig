@@ -4,6 +4,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const SharedTerminal = @import("../Shared.zig");
 const channel_pkg = @import("channel.zig");
+const Layout = @import("../../terminal/tmux/layout.zig").Layout;
+const paste = @import("../../input/paste.zig");
 const Viewer = @import("viewer.zig").Viewer;
 
 /// A sans-I/O tmux control-mode client.
@@ -24,6 +26,79 @@ pub const ControlClient = struct {
     channel: channel_pkg.Channel,
     viewer: Viewer,
     state: State = .active,
+
+    /// The tmux buffer this client pastes through. tmux buffers belong to
+    /// the server, so the name is this client's alone: another client's
+    /// paste can never land between this one's commands and change what
+    /// they paste. One name serves every paste: tmux runs a client's
+    /// commands in order and none of a paste's waits, so it has run a
+    /// paste's commands, from setting the buffer to deleting it, before it
+    /// runs the next paste's.
+    paste_buffer: [paste_buffer_prefix.len + 16]u8,
+
+    const paste_buffer_prefix = "remux-paste-";
+
+    /// The pane's program hasn't exited and its input isn't turned off
+    /// (`select-pane -d`).
+    ///
+    /// It is the condition for pasting into the target itself. tmux drops
+    /// a paste into a pane with its input off and says nothing. A pane
+    /// whose program has exited has nothing to write to, and tmux 3.1 to
+    /// 3.3a don't look before they write: a `paste-buffer` into one ends
+    /// the server.
+    const pane_takes_input = "#{&&:#{?pane_dead,0,1},#{?pane_input_off,0,1}}";
+
+    /// tmux's own test for copying one pane's input to another
+    /// (`window_pane_key`): it copies the input of a pane that is
+    /// synchronized and takes input to every other pane of its window that
+    /// is too and is shown.
+    ///
+    /// Synchronized and taking input is synchronize-panes on, in no mode,
+    /// alive and input not turned off.
+    const pane_takes_copied_input =
+        "#{&&:#{pane_synchronized},#{&&:#{?pane_in_mode,0,1}," ++
+        pane_takes_input ++ "}}";
+
+    /// Shown, as only the active pane of a zoomed window is.
+    const pane_shown = "#{||:#{?window_zoomed_flag,0,1},#{pane_active}}";
+
+    /// Pastes `buffer` into `pane` if `condition` holds for `target`, which
+    /// tmux decides as it runs the command, and runs `otherwise` if not:
+    ///
+    ///   if-shell -F -t %<target> '#{&&:#{==:#{pane_id},%<target>},<condition>}'
+    ///       'paste-buffer -p -b <buffer> -t %<pane>' '<otherwise>'
+    ///
+    /// `#{==:#{pane_id},%<target>}` is that it is the target the condition
+    /// is read for. When the target has gone, tmux reads it for another
+    /// pane instead.
+    ///
+    /// `otherwise` is one command, so that tmux answers with as many blocks
+    /// whichever branch it runs.
+    fn guardedPasteFormat(comptime otherwise: []const u8) []const u8 {
+        return "if-shell -F -t %{[target]d} " ++
+            "'#{{&&:#{{==:#{{pane_id}},%{[target]d}}},{[condition]s}}}' " ++
+            "'paste-buffer -p -b {[buffer]s} -t %{[pane]d}' '" ++ otherwise ++ "'";
+    }
+
+    /// The paste into the target itself. A paste tmux doesn't make must not
+    /// read as made, so the other branch is a command tmux refuses: it
+    /// shows a buffer that is never set.
+    const target_paste_format = guardedPasteFormat(
+        "show-buffer -b {[buffer]s}-undelivered",
+    );
+
+    /// The paste into another pane. One that doesn't take the text is no
+    /// failure, so the other branch does nothing.
+    const other_paste_format = guardedPasteFormat("display-message -p \"\"");
+
+    /// The condition for pasting into another pane, that tmux would copy
+    /// the target's input to it: the target is synchronized and takes
+    /// input, and `#{P:...}`, which goes through the panes of the target's
+    /// window, gives at `pane` that it is too and is shown. A pane that has
+    /// gone, or moved to another window, gives nothing.
+    const copies_input_format =
+        "#{{&&:{[takes]s}," ++
+        "#{{P:#{{?#{{==:#{{pane_id}},%{[pane]d}}},#{{&&:{[takes]s},{[shown]s}}},}}}}}}";
 
     const State = enum {
         active,
@@ -71,9 +146,14 @@ pub const ControlClient = struct {
         var channel = try channel_pkg.Channel.init(alloc);
         errdefer channel.deinit();
 
+        var paste_buffer_id: [8]u8 = undefined;
+        io.random(&paste_buffer_id);
+
         return .{
             .channel = channel,
             .viewer = try .init(io, alloc, options),
+            .paste_buffer = paste_buffer_prefix.* ++
+                std.fmt.bytesToHex(paste_buffer_id, .lower),
         };
     }
 
@@ -84,7 +164,7 @@ pub const ControlClient = struct {
 
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
     /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`,
-    /// `sendPaneInputTracked`, `sendPaneLiteralInputTracked`, `refreshPane`,
+    /// `sendPaneInputTracked`, `pastePane`, `refreshPane`,
     /// `refreshWindowPaneMetadata`, `setClientSize`, or `consumeOutbound`
     /// call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
@@ -271,10 +351,34 @@ pub const ControlClient = struct {
         return self.enqueuePaneInput(.host, pane_id, bytes);
     }
 
-    /// Send one nonempty UTF-8 terminal payload to a known pane as a single
-    /// literal tmux argument and return this command's completion token.
-    /// Unlike exact key input, this path cannot represent NUL bytes.
-    pub fn sendPaneLiteralInputTracked(
+    /// Paste nonempty UTF-8 text into one known pane the way tmux pastes a
+    /// buffer, and return the token that completes when tmux has run the
+    /// paste. tmux knows the pane's modes: it wraps the text in a bracketed
+    /// paste when the pane's program asked for one, and either way sends
+    /// each line feed as a carriage return, so a CRLF line end is sent to
+    /// tmux as one line feed and reaches the program as one carriage
+    /// return. Bytes that are unsafe in a paste are replaced as they are
+    /// for any other pasted text.
+    ///
+    /// A pane whose program has exited, whose input is turned off, or that
+    /// has gone, takes no text, as typing into it takes none. tmux checks
+    /// that itself as it runs the paste. From tmux 3.2 the token fails
+    /// when tmux made no paste into the pane: for one of those, or because
+    /// tmux refused the paste. tmux 3.1 gives that answer to no command,
+    /// so there the token completes all the same.
+    ///
+    /// The paste goes where typing into the pane would. A pane in a mode
+    /// takes no input, so the pane leaves its mode first; and the panes
+    /// tmux copies this pane's input to (synchronize-panes) are pasted into
+    /// as well. Everything the paste takes is queued here, in one piece and
+    /// in order, so whatever is queued after it reaches tmux after all of
+    /// it: input sent next, with no wait for the token, reaches panes that
+    /// have the text.
+    ///
+    /// The other panes are those of the pane's window as its layout was
+    /// last reported. tmux pastes into each only if it would copy the
+    /// pane's input to it when it gets there.
+    pub fn pastePane(
         self: *ControlClient,
         pane_id: usize,
         bytes: []const u8,
@@ -282,14 +386,133 @@ pub const ControlClient = struct {
         try self.validateCommandAdmission();
         if (self.channel.state == .handshake) return error.NotReady;
         if (!self.viewer.panes.contains(pane_id)) return error.PaneUnknown;
-        if (bytes.len == 0 or
-            std.mem.indexOfScalar(u8, bytes, 0) != null or
-            !std.unicode.utf8ValidateSlice(bytes))
-        {
+        if (bytes.len == 0 or !std.unicode.utf8ValidateSlice(bytes)) {
             return error.InvalidInput;
         }
 
-        return self.enqueuePaneLiteralInput(pane_id, bytes);
+        // The commands are copied into the channel as they are queued.
+        var arena_state: std.heap.ArenaAllocator = .init(self.channel.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // The body of a bracketed paste: tmux adds the frame, or converts
+        // the line feeds, once it has the buffer. A CRLF's own carriage
+        // return beside the one tmux makes of its line feed would be a
+        // second line end.
+        const body = try arena.alloc(
+            u8,
+            std.mem.replacementSize(u8, bytes, "\r\n", "\n"),
+        );
+        _ = std.mem.replace(u8, bytes, "\r\n", "\n", body);
+        _ = paste.encode(body, .{ .bracketed = true });
+
+        const buffer: []const u8 = &self.paste_buffer;
+        const set_prefix = "set-buffer -b ";
+        const payload_prefix = " -- \"";
+        var set_len: usize = set_prefix.len + buffer.len +
+            payload_prefix.len + 1;
+        for (body) |byte| {
+            const width: usize = if (quotedByteNeedsEscape(byte)) 4 else 1;
+            set_len = std.math.add(usize, set_len, width) catch
+                return error.OutOfMemory;
+        }
+        var set_buffer: std.ArrayList(u8) = try .initCapacity(arena, set_len);
+        set_buffer.appendSliceAssumeCapacity(set_prefix);
+        set_buffer.appendSliceAssumeCapacity(buffer);
+        set_buffer.appendSliceAssumeCapacity(payload_prefix);
+        for (body) |byte| {
+            if (quotedByteNeedsEscape(byte)) {
+                set_buffer.appendSliceAssumeCapacity(&.{
+                    '\\',
+                    '0' + (byte >> 6),
+                    '0' + ((byte >> 3) & 0x07),
+                    '0' + (byte & 0x07),
+                });
+            } else {
+                set_buffer.appendAssumeCapacity(byte);
+            }
+        }
+        set_buffer.appendAssumeCapacity('"');
+
+        var others: std.ArrayList(usize) = .empty;
+        for (self.viewer.windows.items) |window| {
+            try appendLayoutPanes(arena, &others, window.layout);
+            if (std.mem.indexOfScalar(usize, others.items, pane_id) != null) break;
+            others.clearRetainingCapacity();
+        }
+
+        // Standalone commands: each runs whatever the ones before it
+        // returned.
+        var commands: std.ArrayList(channel_pkg.Channel.Command) = try .initCapacity(
+            arena,
+            others.items.len + 3,
+        );
+
+        commands.appendAssumeCapacity(.{
+            .source = .best_effort,
+            .text = try std.fmt.allocPrint(arena, "copy-mode -q -t %{d}", .{pane_id}),
+        });
+        commands.appendAssumeCapacity(.{
+            .source = .best_effort,
+            .text = set_buffer.items,
+        });
+
+        // tmux answers an `if-shell` once, and from tmux 3.2 once more for
+        // the command it ran. Before 3.2 that second answer is in a block
+        // no command owns, so there a paste that tmux didn't make still
+        // completes its token with success.
+        const guarded_paste_replies: u32 =
+            if (self.viewer.answersCommandsIfShellRuns()) 2 else 1;
+        const paste_index = commands.items.len;
+        commands.appendAssumeCapacity(.{
+            .source = .host,
+            .text = try std.fmt.allocPrint(arena, target_paste_format, .{
+                .target = pane_id,
+                .condition = pane_takes_input,
+                .buffer = buffer,
+                .pane = pane_id,
+            }),
+            .replies = guarded_paste_replies,
+        });
+        for (others.items) |other| {
+            if (other == pane_id) continue;
+            commands.appendAssumeCapacity(.{
+                .source = .best_effort,
+                .text = try std.fmt.allocPrint(arena, other_paste_format, .{
+                    .target = pane_id,
+                    .condition = try std.fmt.allocPrint(arena, copies_input_format, .{
+                        .takes = pane_takes_copied_input,
+                        .shown = pane_shown,
+                        .pane = other,
+                    }),
+                    .buffer = buffer,
+                    .pane = other,
+                }),
+                .replies = guarded_paste_replies,
+            });
+        }
+        commands.appendAssumeCapacity(.{
+            .source = .best_effort,
+            .text = try std.fmt.allocPrint(arena, "delete-buffer -b {s}", .{buffer}),
+        });
+
+        const tokens = try arena.alloc(channel_pkg.CommandToken, commands.items.len);
+        try self.channel.enqueueCommands(commands.items, tokens);
+        return tokens[paste_index];
+    }
+
+    /// Append the panes of `layout`, in its order.
+    fn appendLayoutPanes(
+        alloc: Allocator,
+        panes: *std.ArrayList(usize),
+        layout: Layout,
+    ) Allocator.Error!void {
+        switch (layout.content) {
+            .pane => |id| try panes.append(alloc, id),
+            .horizontal, .vertical => |children| for (children) |child| {
+                try appendLayoutPanes(alloc, panes, child);
+            },
+        }
     }
 
     fn enqueuePaneInput(
@@ -338,71 +561,14 @@ pub const ControlClient = struct {
         return self.channel.enqueueCommandFrom(source, command);
     }
 
-    fn enqueuePaneLiteralInput(
-        self: *ControlClient,
-        pane_id: usize,
-        bytes: []const u8,
-    ) Error!channel_pkg.CommandToken {
-        const prefix = "send-keys -l -t %";
-        const payload_prefix = " -- \"";
-        var id_buffer: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buffer, "{d}", .{pane_id}) catch
-            unreachable;
-
-        var encoded_len: usize = 0;
-        for (bytes) |byte| {
-            const width: usize = if (literalByteNeedsEscape(byte)) 4 else 1;
-            encoded_len = std.math.add(usize, encoded_len, width) catch
-                return error.OutOfMemory;
-        }
-        const command_len = std.math.add(
-            usize,
-            prefix.len + id.len + payload_prefix.len + 1,
-            encoded_len,
-        ) catch return error.OutOfMemory;
-
-        var stack: [256]u8 = undefined;
-        const heap = command_len > stack.len;
-        const command = if (heap)
-            try self.channel.alloc.alloc(u8, command_len)
-        else
-            stack[0..command_len];
-        defer if (heap) self.channel.alloc.free(command);
-
-        var offset: usize = 0;
-        @memcpy(command[offset..][0..prefix.len], prefix);
-        offset += prefix.len;
-        @memcpy(command[offset..][0..id.len], id);
-        offset += id.len;
-        @memcpy(command[offset..][0..payload_prefix.len], payload_prefix);
-        offset += payload_prefix.len;
-        for (bytes) |byte| {
-            if (literalByteNeedsEscape(byte)) {
-                command[offset] = '\\';
-                command[offset + 1] = '0' + (byte >> 6);
-                command[offset + 2] = '0' + ((byte >> 3) & 0x07);
-                command[offset + 3] = '0' + (byte & 0x07);
-                offset += 4;
-            } else {
-                command[offset] = byte;
-                offset += 1;
-            }
-        }
-        command[offset] = '"';
-        std.debug.assert(offset + 1 == command.len);
-
-        return self.channel.enqueueCommandFrom(.host, command);
-    }
-
-    /// Bytes escaped as octal inside the double-quoted `send-keys -l`
-    /// payload, per tmux(1) PARSING SYNTAX: inside double quotes tmux
-    /// still replaces `$VAR`, expands a leading `~`, and decodes `\`
-    /// escapes, and a raw `"` would terminate the argument. Control
-    /// bytes and DEL are escaped because quoted strings cannot span
-    /// lines and the control channel is newline-delimited. Everything
-    /// else is literal in double quotes — including `;` and `#{...}`,
-    /// which deliberately pass through unescaped.
-    fn literalByteNeedsEscape(byte: u8) bool {
+    /// Bytes escaped as octal inside a double-quoted tmux argument, per
+    /// tmux(1) PARSING SYNTAX: inside double quotes tmux still replaces
+    /// `$VAR`, expands a leading `~`, and decodes `\` escapes, and a raw `"`
+    /// would terminate the argument. Control bytes and DEL are escaped
+    /// because quoted strings cannot span lines and the control channel is
+    /// newline-delimited. Everything else is literal in double quotes,
+    /// including `;` and `#{...}`, which deliberately pass through unescaped.
+    fn quotedByteNeedsEscape(byte: u8) bool {
         return byte < 0x20 or byte == 0x7f or
             byte == '\\' or byte == '"' or byte == '$' or byte == '~';
     }
@@ -562,6 +728,7 @@ pub const ControlClient = struct {
                         // group members.
                         .skipped_after_error => unreachable,
                     },
+                    .best_effort => {},
                 }
             }
 
@@ -937,7 +1104,7 @@ test "control client hydration error skips only its group" {
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
         "%begin 4 4 1\n" ++
-            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;43;8,16;sh;/tmp\n" ++
+            "%0;83;44;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;43;8,16;sh;/tmp\n" ++
             "%end 4 4 1\n" ++
             "%begin 5 5 1\nfailed\n%error 5 5 1\n" ++
             "%begin 6 6 1\npending-host\n%end 6 6 1\n",
@@ -1141,8 +1308,8 @@ test "control client hydrates a pane tmux only skipped after other panes closed 
     // in one group. %1 closes before that group runs and %2 before the retry
     // of %2 and %3, so tmux skips every capture of %3 twice without ever
     // refusing one.
-    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
-    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
+    const state_0 = "%0;100;30;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;bash;/private/tmp";
+    const state_3 = "%3;100;30;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;29;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp";
     try client.feed(
         "%window-renamed @0 bash\n%window-add @1\n" ++
             "%layout-change @1 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] 527d,100x30,0,0[100x15,0,0,1,100x7,0,16,2,100x6,0,24,3] \n" ++
@@ -1167,8 +1334,8 @@ test "control client hydrates a pane tmux only skipped after other panes closed 
         "%layout-change @1 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] 1d91,100x30,0,0[100x23,0,0,2,100x6,0,24,3] \n" ++
             "%window-pane-changed @1 %2\n%window-renamed @1 sleep\n" ++
             "%begin 1792879759 292 1\n" ++ state_0 ++ "\n" ++
-            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
-            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%2;100;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
+            "%3;100;6;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;5;8,16,24,32,40,48,56,64,72,80,88,96;sleep;/private/tmp\n" ++
             "%end 1792879759 292 1\n" ++
             "%begin 1792879759 293 1\ncan't find pane: %1\n%error 1792879759 293 1\n",
         &actions,
@@ -1590,7 +1757,7 @@ test "control client pane refresh preserves identity and output cut" {
 
     try client.feed(
         "%begin 9 9 1\n" ++
-            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
+            "%0;100;40;12;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n",
         &actions,
     );
@@ -1710,7 +1877,7 @@ test "control client recaptures fewer history rows after their reply is too larg
     const row5 = "\x1b[38;2;150;0;75m\x1b[48;2;0;150;0m▀\x1b[38;2;150;30;90m\x1b[48;2;25;150;10m▀\x1b[38;2;150;60;105m\x1b[48;2;50;150;20m▀\x1b[38;2;150;90;120m\x1b[48;2;75;150;30m▀\x1b[38;2;150;120;135m\x1b[48;2;100;150;40m▀\x1b[38;2;150;150;150m\x1b[48;2;125;150;50m▀";
     const row6 = "\x1b[38;2;180;0;90m\x1b[48;2;0;180;0m▀\x1b[38;2;180;30;105m\x1b[48;2;25;180;10m▀\x1b[38;2;180;60;120m\x1b[48;2;50;180;20m▀\x1b[38;2;180;90;135m\x1b[48;2;75;180;30m▀\x1b[38;2;180;120;150m\x1b[48;2;100;180;40m▀\x1b[38;2;180;150;165m\x1b[48;2;125;180;50m▀";
     const row7 = "\x1b[38;2;210;0;105m\x1b[48;2;0;210;0m▀\x1b[38;2;210;30;120m\x1b[48;2;25;210;10m▀\x1b[38;2;210;60;135m\x1b[48;2;50;210;20m▀\x1b[38;2;210;90;150m\x1b[48;2;75;210;30m▀\x1b[38;2;210;120;165m\x1b[48;2;100;210;40m▀\x1b[38;2;210;150;180m\x1b[48;2;125;210;50m▀";
-    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;7;0;1;;sleep;/private/tmp";
+    const state = "%0;6;2;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;7;0;1;;sleep;/private/tmp";
     client.channel.parser.max_bytes = 1024;
 
     try openTraceStartupTestClient(
@@ -1796,7 +1963,7 @@ test "control client recaptures plain screens after their styled reply is too la
     // large and the plain one isn't.
     const row0 = "\x1b[38;2;0;0;0m\x1b[48;2;0;0;0m▀\x1b[38;2;0;30;15m\x1b[48;2;25;0;10m▀\x1b[38;2;0;60;30m\x1b[48;2;50;0;20m▀\x1b[38;2;0;90;45m\x1b[48;2;75;0;30m▀\x1b[38;2;0;120;60m\x1b[48;2;100;0;40m▀\x1b[38;2;0;150;75m\x1b[48;2;125;0;50m▀";
     const row1 = "\x1b[38;2;60;0;15m\x1b[48;2;0;60;0m▀\x1b[38;2;60;30;30m\x1b[48;2;25;60;10m▀\x1b[38;2;60;60;45m\x1b[48;2;50;60;20m▀\x1b[38;2;60;90;60m\x1b[48;2;75;60;30m▀\x1b[38;2;60;120;75m\x1b[48;2;100;60;40m▀\x1b[38;2;60;150;90m\x1b[48;2;125;60;50m▀";
-    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;sleep;/private/tmp";
+    const state = "%0;6;2;6;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;1;;sleep;/private/tmp";
     client.channel.parser.max_bytes = 256;
 
     try openTraceStartupTestClient(
@@ -1884,7 +2051,7 @@ test "control client reads past the rest of a pending escape sequence too large 
     );
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
-        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
+        "%begin 1792879997 279 1\n%0;6;2;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;1;;zsh;/private/tmp\n%end 1792879997 279 1\n" ++
             "%begin 1792879997 280 1\n\n%end 1792879997 280 1\n" ++
             "%begin 1792879997 281 1\n\n\n%end 1792879997 281 1\n" ++
             "%begin 1792879997 282 1\n\\033]2;" ++ "a" ** 300 ++ "\n%end 1792879997 282 1\n",
@@ -1930,7 +2097,7 @@ fn openDroppedPendingTestClient(
     );
     try client.consumeOutbound(client.outboundBytes().len);
     try client.feed(
-        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
+        "%begin 1792883185 280 1\n%0;20;4;0;1;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;3;8,16;Python;/private/tmp\n%end 1792883185 280 1\n" ++
             "%begin 1792883185 281 1\n\n%end 1792883185 281 1\n" ++
             "%begin 1792883185 282 1\nBEFORE    \n\n\n\n%end 1792883185 282 1\n" ++
             "%begin 1792883185 283 1\n",
@@ -2131,30 +2298,105 @@ test "control client correlates tracked pane input completion" {
     try testing.expectEqual(token, actions.records.items[0].command_success);
 }
 
-test "control client serializes tracked literal pane input as one argument" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    const payload = "\x1b[200~line 1\n'\"$~\\;#{x}\t café🙂\x1b[201~";
-    const token = try client.sendPaneLiteralInputTracked(0, payload);
-    try testing.expectEqualStrings(
-        "send-keys -l -t %0 -- \"\\033[200\\176line 1\\012'\\042\\044" ++
-            "\\176\\134;#{x}\\011 café🙂\\033[201\\176\"\n",
+/// The command lines of one paste into pane 0, the only pane of its window,
+/// given its text as tmux reads it inside double quotes.
+fn expectPasteOutbound(
+    client: *const ControlClient,
+    quoted_text: []const u8,
+) !void {
+    var storage: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(
+            &storage,
+            "copy-mode -q -t %0\n" ++
+                "set-buffer -b {s} -- \"{s}\"\n" ++
+                "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}}," ++
+                "#{{&&:#{{?pane_dead,0,1}},#{{?pane_input_off,0,1}}}}}}' " ++
+                "'paste-buffer -p -b {s} -t %0' 'show-buffer -b {s}-undelivered'\n" ++
+                "delete-buffer -b {s}\n",
+            .{
+                &client.paste_buffer, quoted_text,
+                &client.paste_buffer, &client.paste_buffer,
+                &client.paste_buffer,
+            },
+        ),
         client.outboundBytes(),
+    );
+}
+
+/// A client of tmux `version` with panes 0, 1 and 2 in one window and pane 3
+/// in another.
+fn openWindowsTestClient(
+    client: *ControlClient,
+    actions: *TestActions,
+    comptime version: []const u8,
+) !void {
+    try client.feed(
+        "%begin 1 1 0\n%end 1 1 0\n%session-changed $42 main\n",
+        actions,
     );
     try client.consumeOutbound(client.outboundBytes().len);
-    try client.feed("%begin 9 9 1\n%end 9 9 1\n", &actions);
+    try client.feed(
+        "%begin 2 2 1\n" ++ version ++ "\n%end 2 2 1\n" ++
+            "%begin 3 3 1\n" ++
+            "$42 @0 1 %0 100 30 d258,100x30,0,0[100x15,0,0,0,100x7,0,16,1,100x6,0,24,2] " ++
+            "d258,100x30,0,0[100x15,0,0,0,100x7,0,16,1,100x6,0,24,2] shell\n" ++
+            "$42 @1 0 %3 100 30 a880,100x30,0,0,3 a880,100x30,0,0,3 other\n" ++
+            "%end 3 3 1\n",
+        actions,
+    );
 
-    try testing.expectEqual(1, actions.records.items.len);
-    try testing.expectEqual(token, actions.records.items[0].command_success);
+    // tmux answers everything the client asks about its panes.
+    while (client.outboundBytes().len > 0) {
+        try client.consumeOutbound(client.outboundBytes().len);
+        for (0..client.channel.pending.len()) |_| {
+            try client.feed("%begin 4 4 1\n%end 4 4 1\n", actions);
+        }
+    }
+    try std.testing.expectEqual(4, client.viewer.panes.count());
+    actions.records.clearRetainingCapacity();
+    actions.input_failure_len = 0;
 }
 
-test "control client tracked literal input terminates flags before payload" {
+/// tmux's own test for copying a pane's input to another, as the client
+/// writes it for a pane of each kind.
+const test_takes_copied_input =
+    "#{&&:#{pane_synchronized},#{&&:#{?pane_in_mode,0,1}," ++
+    "#{&&:#{?pane_dead,0,1},#{?pane_input_off,0,1}}}}";
+
+/// The command lines of one paste into pane 1 of `openWindowsTestClient`.
+fn windowsPasteOutbound(
+    client: *const ControlClient,
+    storage: []u8,
+) ![]const u8 {
+    const buffer = &client.paste_buffer;
+    return std.fmt.bufPrint(
+        storage,
+        "copy-mode -q -t %1\n" ++
+            "set-buffer -b {s} -- \"text\"\n" ++
+            "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}}," ++
+            "#{{&&:#{{?pane_dead,0,1}},#{{?pane_input_off,0,1}}}}}}' " ++
+            "'paste-buffer -p -b {s} -t %1' 'show-buffer -b {s}-undelivered'\n" ++
+            "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{&&:{s}," ++
+            "#{{P:#{{?#{{==:#{{pane_id}},%0}},#{{&&:{s}," ++
+            "#{{||:#{{?window_zoomed_flag,0,1}},#{{pane_active}}}}}},}}}}}}}}' " ++
+            "'paste-buffer -p -b {s} -t %0' 'display-message -p \"\"'\n" ++
+            "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{&&:{s}," ++
+            "#{{P:#{{?#{{==:#{{pane_id}},%2}},#{{&&:{s}," ++
+            "#{{||:#{{?window_zoomed_flag,0,1}},#{{pane_active}}}}}},}}}}}}}}' " ++
+            "'paste-buffer -p -b {s} -t %2' 'display-message -p \"\"'\n" ++
+            "delete-buffer -b {s}\n",
+        .{
+            buffer,                  buffer,
+            buffer,                  test_takes_copied_input,
+            test_takes_copied_input, buffer,
+            test_takes_copied_input, test_takes_copied_input,
+            buffer,                  buffer,
+        },
+    );
+}
+
+test "control client pastes through a buffer of its own" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{});
@@ -2163,14 +2405,267 @@ test "control client tracked literal input terminates flags before payload" {
     defer actions.deinit();
     try openPaneTestClient(&client, &actions);
 
-    _ = try client.sendPaneLiteralInputTracked(0, "-l");
+    try testing.expect(std.mem.startsWith(u8, &client.paste_buffer, "remux-paste-"));
+    var other = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer other.deinit();
+    try testing.expect(!std.mem.eql(u8, &client.paste_buffer, &other.paste_buffer));
+
+    const token = try client.pastePane(0, "line 1\nline 2\r\n'\"$~\\;#{x}\t café🙂");
+    try expectPasteOutbound(
+        &client,
+        "line 1\\012line 2\\012'\\042\\044\\176\\134;#{x}\\011 café🙂",
+    );
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    // tmux answers each command. Leaving the mode and setting the buffer
+    // are nobody's to hear about.
+    try client.feed("%begin 9 9 1\n%end 9 9 1\n%begin 10 10 1\n%end 10 10 1\n", &actions);
+    try testing.expectEqual(0, actions.records.items.len);
+
+    // Only the paste's reply is the host's. This tmux is 3.1, which
+    // answers the paste's command once.
+    try client.feed("%begin 11 11 1\n%end 11 11 1\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqual(token, actions.records.items[0].command_success);
+    try client.feed("%begin 12 12 1\n%end 12 12 1\n", &actions);
+    try testing.expectEqual(1, actions.records.items.len);
+    try testing.expectEqualStrings("", client.outboundBytes());
+}
+
+test "control client input sent right after a paste is written behind every pane's paste" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openWindowsTestClient(&client, &actions, "3.5a");
+
+    // Enter straight after the paste, before tmux has answered anything
+    // and before a byte has been written. One command for each other pane
+    // of pane 1's window, 0 and 2, and none for pane 3 in the other
+    // window, all written ahead of the Enter: tmux copies the Enter to
+    // panes 0 and 2 when it reaches it, and by then has run the paste into
+    // each.
+    _ = try client.pastePane(1, "text");
+    try client.sendPaneInput(1, "\r");
+
+    const written = client.outboundBytes();
+    const enter = "send-keys -H -t %1 0d\n";
+    try testing.expect(std.mem.endsWith(u8, written, enter));
+    var storage: [2048]u8 = undefined;
     try testing.expectEqualStrings(
-        "send-keys -l -t %0 -- \"-l\"\n",
-        client.outboundBytes(),
+        try windowsPasteOutbound(&client, &storage),
+        written[0 .. written.len - enter.len],
     );
 }
 
-test "control client tracked literal input rejects non-text bytes atomically" {
+/// Paste into pane 1 of a `version` client, then Enter and a command of the
+/// host's, all before tmux answers. tmux answers with `replies`; the paste
+/// must end as `paste_ok` says, once, and the Enter and the command after
+/// it must each get the reply that is theirs.
+fn expectPasteReplies(
+    comptime version: []const u8,
+    paste_ok: bool,
+    replies: []const u8,
+) !void {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openWindowsTestClient(&client, &actions, version);
+
+    const pasted = try client.pastePane(1, "text");
+    const enter = try client.sendPaneInputTracked(1, "\r");
+    const after = try client.enqueueCommand("display-message -p after");
+    try client.consumeOutbound(client.outboundBytes().len);
+
+    try client.feed(replies, &actions);
+    try client.feed(
+        "%begin 30 30 1\n%end 30 30 1\n" ++
+            "%begin 31 31 1\nafter\n%end 31 31 1\n",
+        &actions,
+    );
+    try testing.expectEqual(3, actions.records.items.len);
+    if (paste_ok) {
+        try testing.expectEqual(pasted, actions.records.items[0].command_success);
+    } else {
+        try testing.expectEqual(pasted, actions.records.items[0].command_error);
+    }
+    try testing.expectEqual(enter, actions.records.items[1].command_success);
+    try testing.expectEqual(after, actions.records.items[2].command_success);
+    try testing.expectEqual(0, client.channel.pending.len());
+    try testing.expectEqualStrings("", client.outboundBytes());
+    try testing.expectEqual(0, actions.input_failure_len);
+}
+
+const test_ok = "%begin 9 9 1\n%end 9 9 1\n";
+const test_refused = "%begin 9 9 1\nrefused\n%error 9 9 1\n";
+
+/// What tmux before 3.2 sends for the command an `if-shell` ran: a block
+/// marked as the server's, whether the command worked or not.
+const test_server_ok = "%begin 9 9 0\n%end 9 9 0\n";
+const test_server_refused = "%begin 9 9 0\nrefused\n%error 9 9 0\n";
+
+test "control client paste counts two replies for each pane's paste from tmux 3.2" {
+    // Leave the mode and set the buffer; then for pane 1, the pasted pane,
+    // and for panes 0 and 2, the `if-shell` and the command it ran; then
+    // delete the buffer.
+    try expectPasteReplies(
+        "3.2a",
+        true,
+        test_ok ** 2 ++ (test_ok ++ test_ok) ** 3 ++ test_ok,
+    );
+
+    // A tmux built from git names the release it is heading for.
+    try expectPasteReplies(
+        "next-3.7",
+        true,
+        test_ok ** 2 ++ (test_ok ++ test_ok) ** 3 ++ test_ok,
+    );
+    // tmux refuses the paste into pane 1 itself: the paste fails.
+    try expectPasteReplies(
+        "3.5a",
+        false,
+        test_ok ** 2 ++ test_ok ++ test_refused ++ (test_ok ++ test_ok) ** 2 ++ test_ok,
+    );
+
+    // tmux refuses pane 1's `if-shell` and so runs nothing for it: one
+    // reply, and the next is pane 0's.
+    try expectPasteReplies(
+        "3.5a",
+        false,
+        test_ok ** 2 ++ test_refused ++ (test_ok ++ test_ok) ** 2 ++ test_ok,
+    );
+
+    // The same of the other panes' is nobody's failure: what pane 0's
+    // `if-shell` ran is refused, then pane 2's `if-shell` itself, and the
+    // buffer's deletion.
+    try expectPasteReplies(
+        "3.6a",
+        true,
+        test_ok ** 2 ++ (test_ok ++ test_ok) ++
+            test_ok ++ test_refused ++ test_refused ++ test_refused,
+    );
+}
+
+test "control client paste counts one reply for each pane's paste before tmux 3.2" {
+    // The command each `if-shell` ran is answered in a block marked as the
+    // server's, which belongs to no command.
+    try expectPasteReplies(
+        "3.1",
+        true,
+        test_ok ** 2 ++ (test_ok ++ test_server_ok) ** 3 ++ test_ok,
+    );
+
+    // So when tmux refuses the paste into pane 1 itself, nothing tells the
+    // paste: it completes all the same.
+    try expectPasteReplies(
+        "3.1c",
+        true,
+        test_ok ** 2 ++ test_ok ++ test_server_refused ++
+            (test_ok ++ test_server_ok) ** 2 ++ test_ok,
+    );
+
+    // tmux refuses pane 1's `if-shell`: the paste fails, on one reply.
+    try expectPasteReplies(
+        "3.1c",
+        false,
+        test_ok ** 2 ++ test_refused ++ (test_ok ++ test_server_ok) ** 2 ++ test_ok,
+    );
+
+    // And pane 0's: one reply all the same, and nobody's failure.
+    try expectPasteReplies(
+        "3.1",
+        true,
+        test_ok ** 2 ++ test_ok ++ test_server_ok ++ test_refused ++
+            test_ok ++ test_server_refused ++ test_ok,
+    );
+}
+
+test "control client paste into a pane tmux no longer has fails from tmux 3.2" {
+    // tmux refuses to take the pane out of its mode. It reads each
+    // `if-shell`'s condition for another pane, finds it isn't the pasted
+    // one, and runs the other branch: no text goes anywhere, as typing
+    // into the pane would go nowhere. The pasted pane's other branch is
+    // refused, which is the paste's failure.
+    try expectPasteReplies(
+        "3.5a",
+        false,
+        test_refused ++ test_ok ++ test_ok ++ test_refused ++
+            (test_ok ++ test_ok) ** 2 ++ test_ok,
+    );
+
+    // tmux 3.1 marks that refusal as the server's: the paste completes.
+    try expectPasteReplies(
+        "3.1",
+        true,
+        test_refused ++ test_ok ++ test_ok ++ test_server_refused ++
+            (test_ok ++ test_server_ok) ** 2 ++ test_ok,
+    );
+}
+
+test "control client never has tmux paste into a pane without checking it first" {
+    const testing = std.testing;
+
+    // tmux 3.1 to 3.3a end the server when told to paste into a pane whose
+    // program has exited. So on every tmux each paste, the pasted pane's
+    // included, is what an `if-shell` runs once tmux has checked that the
+    // pane it reads is the pasted one and that the pane hasn't exited.
+    inline for (.{ "3.1", "3.3a", "3.4" }) |version| {
+        var client = try ControlClient.init(testing.io, testing.allocator, .{});
+        defer client.deinit();
+        var actions: TestActions = .{};
+        defer actions.deinit();
+        try openWindowsTestClient(&client, &actions, version);
+
+        _ = try client.pastePane(1, "text");
+        var pastes: usize = 0;
+        var lines = std.mem.tokenizeScalar(u8, client.outboundBytes(), '\n');
+        while (lines.next()) |line| {
+            const paste_at = std.mem.indexOf(u8, line, "paste-buffer") orelse continue;
+            pastes += 1;
+            try testing.expect(std.mem.startsWith(
+                u8,
+                line,
+                "if-shell -F -t %1 '#{&&:#{==:#{pane_id},%1},",
+            ));
+            try testing.expect(std.mem.indexOf(u8, line[0..paste_at], "#{?pane_dead,0,1}") != null);
+        }
+        try testing.expectEqual(3, pastes);
+    }
+}
+
+test "control client paste sends a CRLF line end as one line end" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    // A carriage return on its own is a line end already and stays.
+    _ = try client.pastePane(0, "one\r\ntwo\rthree\r\n");
+    try expectPasteOutbound(&client, "one\\012two\\015three\\012");
+}
+
+test "control client paste replaces bytes that could leave the paste" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    _ = try client.pastePane(0, "safe\x1b[201~rm -rf\x03\x00end");
+    try expectPasteOutbound(&client, "safe [201\\176rm -rf  end");
+}
+
+test "control client paste rejects what is not text atomically" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{});
@@ -2180,19 +2675,17 @@ test "control client tracked literal input rejects non-text bytes atomically" {
     try openPaneTestClient(&client, &actions);
 
     const next_token = client.channel.next_token;
+    try testing.expectError(error.InvalidInput, client.pastePane(0, ""));
     try testing.expectError(
         error.InvalidInput,
-        client.sendPaneLiteralInputTracked(0, &.{ 'a', 0, 'b' }),
+        client.pastePane(0, &.{ 0x80, 0xff }),
     );
-    try testing.expectError(
-        error.InvalidInput,
-        client.sendPaneLiteralInputTracked(0, &.{ 0x80, 0xff }),
-    );
+    try testing.expectError(error.PaneUnknown, client.pastePane(99, "text"));
     try testing.expectEqual(next_token, client.channel.next_token);
     try testing.expectEqualStrings("", client.outboundBytes());
 }
 
-test "control client tracked literal input keeps large payload in one argument" {
+test "control client paste keeps a large text in one argument" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{});
@@ -2202,14 +2695,19 @@ test "control client tracked literal input keeps large payload in one argument" 
     try openPaneTestClient(&client, &actions);
 
     const payload = [_]u8{'x'} ** (64 * 1024);
-    _ = try client.sendPaneLiteralInputTracked(0, &payload);
-    const outbound = client.outboundBytes();
-    try testing.expect(std.mem.startsWith(u8, outbound, "send-keys -l -t %0 -- \""));
-    try testing.expect(std.mem.endsWith(u8, outbound, "\"\n"));
-    try testing.expectEqual(payload.len + "send-keys -l -t %0 -- \"\"\n".len, outbound.len);
+    _ = try client.pastePane(0, &payload);
+    var lines = std.mem.splitScalar(u8, client.outboundBytes(), '\n');
+    _ = lines.next().?;
+    const set_buffer = lines.next().?;
+    try testing.expect(std.mem.startsWith(u8, set_buffer, "set-buffer -b remux-paste-"));
+    try testing.expect(std.mem.endsWith(u8, set_buffer, "\""));
+    try testing.expectEqual(
+        "set-buffer -b ".len + client.paste_buffer.len + " -- \"\"".len + payload.len,
+        set_buffer.len,
+    );
 }
 
-test "control client tracked literal input formatting failure is allocation atomic" {
+test "control client paste is allocation atomic" {
     const testing = std.testing;
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
 
@@ -2217,17 +2715,23 @@ test "control client tracked literal input formatting failure is allocation atom
     defer client.deinit();
     var actions: TestActions = .{};
     defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
+    try openWindowsTestClient(&client, &actions, "3.5a");
 
-    const bytes = [_]u8{'x'} ** 512;
+    // Each allocation of a paste fails in turn: building its commands, then
+    // queueing them.
+    const bytes = [_]u8{'x'} ** 8192;
     const next_token = client.channel.next_token;
-    failing.fail_index = failing.alloc_index;
-    try testing.expectError(
-        error.OutOfMemory,
-        client.sendPaneLiteralInputTracked(0, &bytes),
-    );
-    try testing.expectEqual(next_token, client.channel.next_token);
-    try testing.expectEqualStrings("", client.outboundBytes());
+    var failures: usize = 0;
+    while (true) : (failures += 1) {
+        failing.fail_index = failing.alloc_index + failures;
+        if (client.pastePane(1, &bytes)) |_| break else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(next_token, client.channel.next_token);
+            try testing.expectEqual(0, client.channel.pending.len());
+            try testing.expectEqualStrings("", client.outboundBytes());
+        }
+    }
+    try testing.expect(failures >= 2);
 }
 
 test "control client pane input validates without no-op mutation" {

@@ -1,17 +1,32 @@
-//! The tmux client against a real tmux: after every client resize, each
-//! zoomed pane's mirror must equal tmux's pane, fetched through the same
-//! control connection. Skipped unless these name what it needs:
+//! The tmux client against a real tmux. Each test is skipped unless the
+//! environment names what it needs, starts its own tmux server on a private
+//! socket, and kills it afterwards, also on failure.
 //!
-//! - REMUX_TMUX_LIVE_BIN: the tmux binary.
+//! Both need:
+//!
+//! - REMUX_TMUX_LIVE_BIN: the tmux binary, or a program that takes tmux's
+//!   arguments and runs one, in a container say.
+//! - REMUX_TMUX_LIVE_DIR: a directory for the files the panes' programs
+//!   write, at the same path for those programs as for the test.
+//!
+//! Resizes: after every client resize, each zoomed pane's mirror must equal
+//! tmux's pane, fetched through the same control connection. A pane that
+//! falls back to a recapture isn't a failure; a mirror that differs from
+//! tmux is, and is reported. It also needs:
+//!
 //! - REMUX_TMUX_LIVE_GEN: the content generator, run in each pane as
 //!   `python3 -I <gen> <mode> <seed> <donefile>`; it writes its content,
 //!   creates the done file and idles.
-//! - REMUX_TMUX_LIVE_DIR: a directory for the done files.
 //! - REMUX_TMUX_LIVE_REPORT: the path of the report it writes.
 //!
-//! Each run starts its own tmux server on a private socket and kills it
-//! afterwards, also on failure. A pane that falls back to a recapture isn't
-//! a failure; a mirror that differs from tmux is, and is reported.
+//! Pastes: a paste and the Enter after it, written together, must reach the
+//! pane and the panes tmux copies its input to as the paste and then the
+//! Enter, every command after them must get its own reply, and the server
+//! must still be there. Each scenario has a server of its own. It also
+//! needs:
+//!
+//! - REMUX_TMUX_LIVE_PASTE_REPORT: the path of the report it writes, with
+//!   the commands the client wrote and the bytes each pane's program read.
 
 const std = @import("std");
 const testing = std.testing;
@@ -78,6 +93,21 @@ const Live = struct {
         });
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
+    }
+
+    /// What a tmux command prints, trimmed. The caller frees it.
+    fn output(self: *Live, args: []const []const u8) ![]u8 {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(testing.allocator);
+        try argv.appendSlice(testing.allocator, &.{ self.bin, "-L", self.socket, "-f", "/dev/null" });
+        try argv.appendSlice(testing.allocator, args);
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = argv.items,
+            .environ_map = &self.env,
+        });
+        defer testing.allocator.free(result.stdout);
+        testing.allocator.free(result.stderr);
+        return testing.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \r\n"));
     }
 
     fn print(self: *Live, comptime fmt: []const u8, args: anytype) !void {
@@ -606,4 +636,422 @@ fn add(total: *Counts, counts: Counts) void {
     inline for (@typeInfo(Counts).@"struct".fields) |field| {
         @field(total, field.name) += @field(counts, field.name);
     }
+}
+
+/// One attached control client that pastes.
+const PasteRun = struct {
+    live: *Live,
+    child: std.process.Child,
+    client: ControlClient,
+    buffer: []u8,
+    completions: std.ArrayList(Completion) = .empty,
+    failure: ?anyerror = null,
+    exited: bool = false,
+
+    const Completion = struct {
+        token: CommandToken,
+        ok: bool,
+        body: []u8,
+    };
+
+    fn deinit(self: *PasteRun) void {
+        for (self.completions.items) |item| testing.allocator.free(item.body);
+        self.completions.deinit(testing.allocator);
+        self.client.deinit();
+        testing.allocator.free(self.buffer);
+    }
+
+    pub fn controlClientAction(self: *PasteRun, action: ControlClient.Action) void {
+        self.handle(action) catch |err| {
+            if (self.failure == null) self.failure = err;
+        };
+    }
+
+    fn handle(self: *PasteRun, action: ControlClient.Action) !void {
+        switch (action) {
+            .exit => self.exited = true,
+            .command_complete => |complete| {
+                const body = switch (complete.result) {
+                    .success, .error_block => |body| body,
+                    .skipped_after_error => "",
+                };
+                const copy = try testing.allocator.dupe(u8, body);
+                errdefer testing.allocator.free(copy);
+                try self.completions.append(testing.allocator, .{
+                    .token = complete.token,
+                    .ok = complete.result == .success,
+                    .body = copy,
+                });
+            },
+            .windows, .pane_changed, .input_failed => {},
+        }
+    }
+
+    /// Write everything the client queued in one write.
+    fn flush(self: *PasteRun) !void {
+        const out = self.client.outboundBytes();
+        if (out.len == 0) return;
+        try self.child.stdin.?.writeStreamingAll(testing.io, out);
+        try self.client.consumeOutbound(out.len);
+    }
+
+    /// Feed what tmux sends within `timeout_ms`. False if it sent nothing.
+    fn pump(self: *PasteRun, timeout_ms: i32) !bool {
+        try self.flush();
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.child.stdout.?.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&fds, timeout_ms) == 0) return false;
+        const len = try std.posix.read(fds[0].fd, self.buffer);
+        if (len == 0) return error.TmuxClosed;
+        try self.client.feed(self.buffer[0..len], self);
+        if (self.failure) |err| return err;
+        if (self.exited) return error.TmuxExited;
+        try self.flush();
+        return true;
+    }
+
+    /// Wait until every pane is live, nothing is unanswered and tmux has
+    /// been quiet for a while.
+    fn settle(self: *PasteRun) !void {
+        for (0..2000) |_| {
+            if (try self.pump(50)) continue;
+            if (self.client.channel.pending.len() != 0) continue;
+            for (self.client.viewer.panes.values()) |pane| {
+                if (pane.phase != .live) break;
+            } else if (!try self.pump(250)) return;
+        }
+        return error.TmuxDidNotSettle;
+    }
+
+    /// Wait for the reply to `token`.
+    fn completion(self: *PasteRun, token: CommandToken) !Completion {
+        for (0..400) |_| {
+            for (self.completions.items) |item| {
+                if (item.token == token) return item;
+            }
+            _ = try self.pump(50);
+        }
+        return error.TmuxDidNotAnswer;
+    }
+};
+
+/// What a paste scenario sets up in the session, whose first window has
+/// panes 0, 1 and 2 and whose second has pane 3, and what it expects of a
+/// paste of each text into pane 0 with Enter after each.
+const PasteCase = struct {
+    name: []const u8,
+    texts: []const []const u8 = &.{"one\ntwo"},
+
+    /// synchronize-panes on in the first window.
+    synchronized: bool = true,
+
+    /// A pane in copy mode, a pane whose program doesn't ask for bracketed
+    /// pastes, and whether pane 0 is zoomed.
+    copy_mode: ?usize = null,
+    plain: ?usize = null,
+    zoomed: bool = false,
+
+    /// Close pane 0 just before the paste, so that the client still has it.
+    target_gone: bool = false,
+
+    /// Pane 0's program has exited and tmux keeps the pane (remain-on-exit).
+    /// tmux 3.1 to 3.3a end the server when told to paste into such a pane.
+    target_exited: bool = false,
+
+    /// Pane 0's input is turned off (`select-pane -d`).
+    target_input_off: bool = false,
+
+    /// What each pane's program reads.
+    expected: [4][]const u8,
+};
+
+const pasted_one_two = "\x1b[200~one\rtwo\x1b[201~";
+
+const paste_cases = [_]PasteCase{
+    .{
+        .name = "synchronized, one pane in copy mode",
+        .copy_mode = 2,
+        .expected = .{ pasted_one_two ++ "\r", pasted_one_two ++ "\r", "", "" },
+    },
+    .{
+        .name = "not synchronized",
+        .synchronized = false,
+        .expected = .{ pasted_one_two ++ "\r", "", "", "" },
+    },
+    .{
+        .name = "the pasted pane in copy mode",
+        .synchronized = false,
+        .copy_mode = 0,
+        .expected = .{ pasted_one_two ++ "\r", "", "", "" },
+    },
+    .{
+        .name = "synchronized, two pastes queued together",
+        .texts = &.{ "one\ntwo", "three" },
+        .expected = .{
+            pasted_one_two ++ "\r\x1b[200~three\x1b[201~\r",
+            pasted_one_two ++ "\r\x1b[200~three\x1b[201~\r",
+            pasted_one_two ++ "\r\x1b[200~three\x1b[201~\r",
+            "",
+        },
+    },
+    .{
+        .name = "synchronized, one pane without bracketed paste",
+        .plain = 1,
+        .expected = .{ pasted_one_two ++ "\r", "one\rtwo\r", pasted_one_two ++ "\r", "" },
+    },
+    .{
+        .name = "synchronized, the pasted pane zoomed",
+        .zoomed = true,
+        .expected = .{ pasted_one_two ++ "\r", "", "", "" },
+    },
+    .{
+        .name = "synchronized, the pasted pane gone",
+        .target_gone = true,
+        .expected = .{ "", "", "", "" },
+    },
+    .{
+        // The byte that had its program exit is all it ever read.
+        .name = "synchronized, the pasted pane's program exited",
+        .target_exited = true,
+        .expected = .{ "x", "", "", "" },
+    },
+    .{
+        .name = "synchronized, the pasted pane's input off",
+        .target_input_off = true,
+        .expected = .{ "", "", "", "" },
+    },
+};
+
+/// Bytes with the controls among them spelled out.
+fn escaped(bytes: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer out.deinit();
+    for (bytes) |byte| switch (byte) {
+        '\r' => try out.writer.writeAll("\\r"),
+        '\n' => try out.writer.writeAll("\\n"),
+        0x1b => try out.writer.writeAll("\\e"),
+        0x20...0x7e => try out.writer.writeByte(byte),
+        else => try out.writer.print("\\x{x:0>2}", .{byte}),
+    };
+    return out.toOwnedSlice();
+}
+
+fn sleepMs(ms: i32) !void {
+    var none: [0]std.posix.pollfd = .{};
+    _ = try std.posix.poll(&none, ms);
+}
+
+/// Run one paste scenario. Returns whether everything was as expected.
+fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
+    live.runs += 1;
+
+    // A server of its own: one started on a socket whose last server is
+    // still exiting can be lost with it.
+    var socket_buffer: [64]u8 = undefined;
+    live.socket = try std.fmt.bufPrint(&socket_buffer, "remux-paste-live-{d}-{d}", .{
+        std.c.getpid(), live.runs,
+    });
+    defer live.tmux(&.{"kill-server"}) catch {};
+
+    // Each pane's program asks for bracketed pastes, unless it is the
+    // plain one, and writes every byte it reads to its log.
+    var logs: [4][]u8 = undefined;
+    var started: usize = 0;
+    defer for (logs[0..started]) |log| {
+        std.Io.Dir.deleteFileAbsolute(testing.io, log) catch {};
+        testing.allocator.free(log);
+    };
+    for (0..4) |i| {
+        logs[i] = try std.fmt.allocPrint(testing.allocator, "{s}/paste-{d}-{d}-{d}.log", .{
+            live.dir, std.c.getpid(), live.runs, i,
+        });
+        started += 1;
+        // The program that is to exit does so on its first byte.
+        const program = try std.fmt.allocPrint(testing.allocator, "{s}stty raw -echo; exec {s} > {s}", .{
+            if (case.plain == i) "" else "printf '\\033[?2004h'; ",
+            if (case.target_exited and i == 0) "head -c 1" else "cat",
+            logs[i],
+        });
+        defer testing.allocator.free(program);
+        switch (i) {
+            0 => try live.tmux(&.{ "new-session", "-d", "-s", "s", "-x", "120", "-y", "40", program }),
+            1, 2 => try live.tmux(&.{ "split-window", "-d", "-t", "s:0", program }),
+            else => try live.tmux(&.{ "new-window", "-d", "-t", "s:1", program }),
+        }
+    }
+    for (logs) |log| {
+        for (0..400) |_| {
+            if (std.Io.Dir.accessAbsolute(testing.io, log, .{})) |_| break else |_| {}
+            try sleepMs(25);
+        } else return error.PaneProgramDidNotStart;
+    }
+    try sleepMs(300);
+
+    // Before the panes are synchronized, or tmux copies the byte to them.
+    if (case.target_exited) {
+        try live.tmux(&.{ "set-option", "-g", "remain-on-exit", "on" });
+        try live.tmux(&.{ "send-keys", "-t", "%0", "x" });
+        for (0..200) |_| {
+            const dead = try live.output(&.{ "display-message", "-p", "-t", "%0", "#{pane_dead}" });
+            defer testing.allocator.free(dead);
+            if (std.mem.eql(u8, dead, "1")) break;
+            try sleepMs(25);
+        } else return error.PaneProgramDidNotExit;
+    }
+    if (case.synchronized) try live.tmux(&.{ "set-option", "-w", "-t", "s:0", "synchronize-panes", "on" });
+    if (case.zoomed) try live.tmux(&.{ "resize-pane", "-Z", "-t", "%0" });
+    if (case.target_input_off) try live.tmux(&.{ "select-pane", "-d", "-t", "%0" });
+    if (case.copy_mode) |pane| {
+        var target_buffer: [16]u8 = undefined;
+        try live.tmux(&.{ "copy-mode", "-t", try std.fmt.bufPrint(&target_buffer, "%{d}", .{pane}) });
+    }
+
+    var run: PasteRun = .{
+        .live = live,
+        .child = try std.process.spawn(testing.io, .{
+            .argv = &.{ live.bin, "-L", live.socket, "-f", "/dev/null", "-C", "attach", "-t", "s" },
+            .environ_map = &live.env,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }),
+        .client = undefined,
+        .buffer = undefined,
+    };
+    defer run.child.kill(testing.io);
+    run.buffer = try testing.allocator.alloc(u8, 1 << 16);
+    run.client = ControlClient.init(testing.io, testing.allocator, .{}) catch |err| {
+        testing.allocator.free(run.buffer);
+        return err;
+    };
+    defer run.deinit();
+    try run.settle();
+
+    // The client doesn't hear that the pane closed before it pastes.
+    if (case.target_gone) try live.tmux(&.{ "kill-pane", "-t", "%0" });
+
+    // Every paste, the Enter after each, and three commands whose replies
+    // show that each command still gets its own, all in one write.
+    var pastes: [2]CommandToken = undefined;
+    var enters: [2]CommandToken = undefined;
+    for (case.texts, 0..) |text, i| {
+        pastes[i] = try run.client.pastePane(0, text);
+        enters[i] = try run.client.sendPaneInputTracked(0, "\r");
+    }
+    const buffers_token = try run.client.enqueueCommand("list-buffers -F '#{buffer_name}'");
+    const mode_token = try run.client.enqueueCommand("display-message -p -t %0 'in a mode: #{pane_in_mode}'");
+    const last_token = try run.client.enqueueCommand("display-message -p 'the last reply'");
+    const written = try testing.allocator.dupe(u8, run.client.outboundBytes());
+    defer testing.allocator.free(written);
+    try run.flush();
+
+    var ok = true;
+    try live.print("== {s}: {s}", .{ version, case.name });
+    try live.print("wrote in one write:\n{s}", .{std.mem.trimEnd(u8, written, "\n")});
+    for (case.texts, 0..) |_, i| {
+        const pasted = try run.completion(pastes[i]);
+        const entered = try run.completion(enters[i]);
+        try live.print("paste {d}: {s} {s}; Enter: {s} {s}", .{
+            i,                                   if (pasted.ok) "ok" else "refused", pasted.body,
+            if (entered.ok) "ok" else "refused", entered.body,
+        });
+
+        // A paste tmux didn't make fails, where tmux says so to the
+        // client: from 3.2. tmux refuses keys for a pane it doesn't have,
+        // and takes them for one whose program has exited or whose input
+        // is off.
+        const undelivered = (case.target_gone or case.target_exited or case.target_input_off) and
+            run.client.viewer.answersCommandsIfShellRuns();
+        if (pasted.ok == undelivered or entered.ok == case.target_gone) ok = false;
+    }
+
+    // tmux has deleted the buffer and the pane is in no mode, and each of
+    // these replies is its command's own: none was counted as another's.
+    const buffers = try run.completion(buffers_token);
+    const mode = try run.completion(mode_token);
+    const last = try run.completion(last_token);
+    try live.print("buffers left: '{s}'; pane %0 {s}; last reply: {s}", .{ buffers.body, mode.body, last.body });
+    if (!buffers.ok or buffers.body.len != 0) ok = false;
+    if (!case.target_gone and !(mode.ok and std.mem.eql(u8, mode.body, "in a mode: 0"))) ok = false;
+    if (!last.ok or !std.mem.eql(u8, last.body, "the last reply")) ok = false;
+
+    // Nor is any reply still awaited once tmux has gone quiet.
+    try run.settle();
+
+    // And the server is still there for a new client.
+    const still_there = try live.output(&.{ "display-message", "-p", "-t", "s:1", "still there" });
+    defer testing.allocator.free(still_there);
+    try live.print("server: {s}", .{if (still_there.len == 0) "GONE" else still_there});
+    if (!std.mem.eql(u8, still_there, "still there")) ok = false;
+
+    // What each program read: give the bytes time to arrive, then a little
+    // more for any that shouldn't.
+    for (0..80) |_| {
+        var complete = true;
+        for (logs, case.expected) |log, expected| {
+            const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, log, testing.allocator, .limited(1 << 20));
+            defer testing.allocator.free(got);
+            if (got.len < expected.len) complete = false;
+        }
+        if (complete) break;
+        try sleepMs(25);
+    }
+    try sleepMs(300);
+    for (logs, case.expected, 0..) |log, expected, i| {
+        const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, log, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(got);
+        const got_text = try escaped(got);
+        defer testing.allocator.free(got_text);
+        if (std.mem.eql(u8, got, expected)) {
+            try live.print("pane %{d} read: {s}", .{ i, got_text });
+            continue;
+        }
+        ok = false;
+        const expected_text = try escaped(expected);
+        defer testing.allocator.free(expected_text);
+        try live.print("pane %{d} read: {s}   <-- expected {s}", .{ i, got_text, expected_text });
+    }
+    try live.print("{s}", .{if (ok) "PASS" else "FAIL"});
+    if (!ok) live.mismatches += 1;
+    return ok;
+}
+
+test "tmux client pastes reach a real tmux's panes ahead of the input after them" {
+    const bin = env("REMUX_TMUX_LIVE_BIN") orelse return error.SkipZigTest;
+    const dir = env("REMUX_TMUX_LIVE_DIR") orelse return error.SkipZigTest;
+    const report_path = env("REMUX_TMUX_LIVE_PASTE_REPORT") orelse return error.SkipZigTest;
+
+    var live: Live = .{
+        .bin = bin,
+        .gen = "",
+        .dir = dir,
+        .socket = "",
+        .env = .init(testing.allocator),
+        .report = try std.Io.Dir.createFileAbsolute(testing.io, report_path, .{}),
+    };
+    defer live.env.deinit();
+    defer live.report.close(testing.io);
+    try live.env.put("PATH", "/usr/bin:/bin");
+    try live.env.put("HOME", env("HOME") orelse "/");
+    try live.env.put("TERM", "xterm-256color");
+    try live.env.put("LANG", "en_US.UTF-8");
+    try live.env.put("SHELL", "/bin/sh");
+
+    const version_result = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ bin, "-V" } });
+    defer testing.allocator.free(version_result.stdout);
+    defer testing.allocator.free(version_result.stderr);
+    const version = std.mem.trim(u8, version_result.stdout, " \r\n");
+
+    for (paste_cases) |case| {
+        _ = pasteRun(&live, version, case) catch |err| {
+            live.errors += 1;
+            try live.print("ERROR {s} {s}: {s}", .{ version, case.name, @errorName(err) });
+        };
+    }
+    try live.print("mismatches={d} errors={d}", .{ live.mismatches, live.errors });
+    try testing.expectEqual(0, live.mismatches);
+    try testing.expectEqual(0, live.errors);
 }

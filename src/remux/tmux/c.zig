@@ -456,7 +456,7 @@ export fn ghostty_tmux_client_send_pane_input_tracked(
     return .ok;
 }
 
-export fn ghostty_tmux_client_send_pane_literal_input_tracked(
+export fn ghostty_tmux_client_paste_pane(
     client: ?*Client,
     pane_id: u64,
     ptr: ?[*]const u8,
@@ -469,7 +469,7 @@ export fn ghostty_tmux_client_send_pane_literal_input_tracked(
     const bytes = (Bytes{ .ptr = ptr, .len = len }).slice() catch
         return .invalid_input;
     if (bytes.len == 0) return .invalid_input;
-    const token = value.control.sendPaneLiteralInputTracked(id, bytes) catch |err|
+    const token = value.control.pastePane(id, bytes) catch |err|
         return mapClientError(err);
     out.* = @intFromEnum(token);
     return .ok;
@@ -1191,7 +1191,7 @@ test "tmux C client pane input validation and action mapping" {
     );
 }
 
-test "tmux C client tracked literal pane input" {
+test "tmux C client pane paste" {
     const testing = std.testing;
     var context: TestContext = .{};
     var client = try Client.init(testing.allocator, testConfig(&context));
@@ -1203,7 +1203,7 @@ test "tmux C client tracked literal pane input" {
     var token: u64 = 0;
     try testing.expectEqual(
         Result.ok,
-        ghostty_tmux_client_send_pane_literal_input_tracked(
+        ghostty_tmux_client_paste_pane(
             &client,
             0,
             payload.ptr,
@@ -1216,15 +1216,37 @@ test "tmux C client tracked literal pane input" {
         Result.ok,
         ghostty_tmux_client_outbound(&client, &outbound),
     );
+    const buffer = &client.control.paste_buffer;
+    var expected_storage: [512]u8 = undefined;
     try testing.expectEqualStrings(
-        "send-keys -l -t %0 -- \"paste \\042\\044HOME\\042\\012🙂\"\n",
+        try std.fmt.bufPrint(
+            &expected_storage,
+            "copy-mode -q -t %0\n" ++
+                "set-buffer -b {s} -- \"paste \\042\\044HOME\\042\\012🙂\"\n" ++
+                "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}}," ++
+                "#{{&&:#{{?pane_dead,0,1}},#{{?pane_input_off,0,1}}}}}}' " ++
+                "'paste-buffer -p -b {s} -t %0' 'show-buffer -b {s}-undelivered'\n" ++
+                "delete-buffer -b {s}\n",
+            .{ buffer, buffer, buffer, buffer },
+        ),
         try outbound.slice(),
     );
     try consumeAllTest(&client);
-    try feedTest(&client, "%begin 9 9 1\n%end 9 9 1\n");
+
+    // The paste's own reply, the third, completes the host's token: this
+    // tmux is 3.1, which answers the paste's command once.
+    try feedTest(
+        &client,
+        "%begin 9 9 1\n%end 9 9 1\n%begin 10 10 1\n%end 10 10 1\n",
+    );
+    try testing.expectEqual(0, context.completion_count);
+    try feedTest(&client, "%begin 11 11 1\n%end 11 11 1\n");
     try testing.expectEqual(1, context.completion_count);
     try testing.expectEqual(token, context.completions[0].token);
     try testing.expectEqual(CommandStatus.success, context.completions[0].status);
+    try feedTest(&client, "%begin 12 12 1\n%end 12 12 1\n");
+    try testing.expectEqual(1, context.completion_count);
+    try testing.expectEqual(0, context.input_failure_count);
 }
 
 test "tmux C client pane refresh boundary" {
@@ -1283,7 +1305,7 @@ test "tmux C client pane refresh boundary" {
     try feedTest(
         &client,
         "%begin 9 9 1\n" ++
-            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
+            "%0;100;40;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;39;8,16;nvim;/work/editor\n" ++
             "%end 9 9 1\n" ++
             "%begin 10 10 1\n%end 10 10 1\n" ++
             "%begin 11 11 1\n%end 11 11 1\n" ++
