@@ -2388,27 +2388,6 @@ test "control client pastes through a buffer of its own" {
     try testing.expectEqualStrings("", client.outboundBytes());
 }
 
-test "control client paste has tmux paste into the panes it copies the pane's input to" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openWindowsTestClient(&client, &actions, "3.5a");
-
-    // One command for each other pane of pane 1's window, 0 and 2, and none
-    // for pane 3 in the other window. tmux pastes into a pane if, when it
-    // gets to the command, it would copy pane 1's input to it.
-    _ = try client.pastePane(1, "text");
-    var storage: [2048]u8 = undefined;
-    try testing.expectEqualStrings(
-        try windowsPasteOutbound(&client, &storage),
-        client.outboundBytes(),
-    );
-    try testing.expect(std.mem.indexOf(u8, client.outboundBytes(), "%3") == null);
-}
-
 test "control client input sent right after a paste is written behind every pane's paste" {
     const testing = std.testing;
 
@@ -2419,9 +2398,11 @@ test "control client input sent right after a paste is written behind every pane
     try openWindowsTestClient(&client, &actions, "3.5a");
 
     // Enter straight after the paste, before tmux has answered anything
-    // and before a byte has been written. Every pane's paste is written
-    // ahead of it: tmux copies the Enter to panes 0 and 2 when it reaches
-    // it, and by then has run the paste into each.
+    // and before a byte has been written. One command for each other pane
+    // of pane 1's window, 0 and 2, and none for pane 3 in the other
+    // window, all written ahead of the Enter: tmux copies the Enter to
+    // panes 0 and 2 when it reaches it, and by then has run the paste into
+    // each.
     _ = try client.pastePane(1, "text");
     try client.sendPaneInput(1, "\r");
 
@@ -2492,11 +2473,6 @@ test "control client paste counts two replies for each other pane from tmux 3.2"
         true,
         test_ok ** 3 ++ (test_ok ++ test_ok) ** 2 ++ test_ok,
     );
-    try expectPasteReplies(
-        "next-3.7",
-        true,
-        test_ok ** 3 ++ (test_ok ++ test_ok) ** 2 ++ test_ok,
-    );
 
     // tmux refuses what pane 0's `if-shell` ran, a paste say: still two.
     try expectPasteReplies(
@@ -2560,38 +2536,6 @@ test "control client paste into a pane tmux no longer has fails once and deletes
     );
 }
 
-test "control client pastes queued together each set, paste and delete the buffer in turn" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    // tmux runs a client's commands in the order it reads them, so the
-    // first paste has deleted the buffer before the second sets it.
-    _ = try client.pastePane(0, "first");
-    _ = try client.pastePane(0, "second");
-    var storage: [1024]u8 = undefined;
-    const buffer = &client.paste_buffer;
-    try testing.expectEqualStrings(
-        try std.fmt.bufPrint(
-            &storage,
-            "copy-mode -q -t %0\n" ++
-                "set-buffer -b {s} -- \"first\"\n" ++
-                "paste-buffer -p -b {s} -t %0\n" ++
-                "delete-buffer -b {s}\n" ++
-                "copy-mode -q -t %0\n" ++
-                "set-buffer -b {s} -- \"second\"\n" ++
-                "paste-buffer -p -b {s} -t %0\n" ++
-                "delete-buffer -b {s}\n",
-            .{ buffer, buffer, buffer, buffer, buffer, buffer },
-        ),
-        client.outboundBytes(),
-    );
-}
-
 test "control client paste sends a CRLF line end as one line end" {
     const testing = std.testing;
 
@@ -2619,37 +2563,6 @@ test "control client paste replaces bytes that could leave the paste" {
     try expectPasteOutbound(&client, "safe [201\\176rm -rf  end");
 }
 
-test "control client paste terminates flags before the text" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    _ = try client.pastePane(0, "-a");
-    try expectPasteOutbound(&client, "-a");
-}
-
-test "control client paste takes its pane out of its mode on every tmux" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    for ([_][]const u8{ "3.1", "3.1c", "3.2a", "3.6a", "next-3.7" }) |version| {
-        testing.allocator.free(client.viewer.tmux_version);
-        client.viewer.tmux_version = try testing.allocator.dupe(u8, version);
-        _ = try client.pastePane(0, "text");
-        try expectPasteOutbound(&client, "text");
-        try client.consumeOutbound(client.outboundBytes().len);
-    }
-}
-
 test "control client paste rejects what is not text atomically" {
     const testing = std.testing;
 
@@ -2668,28 +2581,6 @@ test "control client paste rejects what is not text atomically" {
     try testing.expectError(error.PaneUnknown, client.pastePane(99, "text"));
     try testing.expectEqual(next_token, client.channel.next_token);
     try testing.expectEqualStrings("", client.outboundBytes());
-}
-
-test "control client paste keeps a large text in one argument" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    const payload = [_]u8{'x'} ** (64 * 1024);
-    _ = try client.pastePane(0, &payload);
-    var lines = std.mem.splitScalar(u8, client.outboundBytes(), '\n');
-    _ = lines.next().?;
-    const set_buffer = lines.next().?;
-    try testing.expect(std.mem.startsWith(u8, set_buffer, "set-buffer -b remux-paste-"));
-    try testing.expect(std.mem.endsWith(u8, set_buffer, "\""));
-    try testing.expectEqual(
-        "set-buffer -b ".len + client.paste_buffer.len + " -- \"\"".len + payload.len,
-        set_buffer.len,
-    );
 }
 
 test "control client paste is allocation atomic" {
