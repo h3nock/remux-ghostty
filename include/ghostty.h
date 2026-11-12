@@ -1706,11 +1706,23 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
     size_t,
     uint64_t*);
 
-// Sends one nonempty UTF-8 terminal payload to a known pane as a single
-// send-keys -l argument and reports completion exactly as the tracked exact
-// input API above. NUL and invalid UTF-8 are rejected because tmux literal
-// arguments cannot preserve them; use exact pane input for arbitrary bytes.
-GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_literal_input_tracked(
+// Pastes nonempty UTF-8 text into a known pane the way tmux pastes a buffer.
+// tmux, which knows the pane's modes, wraps the text in a bracketed paste when
+// the pane's program asked for one, and either way sends each line feed as a
+// carriage return, so a CRLF line end goes as one line feed; the host needs no
+// knowledge of the pane's paste mode. Bytes unsafe in a paste are replaced as
+// terminal_surface_paste replaces them, and invalid UTF-8 is rejected.
+//
+// The paste goes where typing into the pane would. A pane in a tmux mode takes
+// no input, so the pane leaves its mode first. When the pane has
+// synchronize-panes on, the panes tmux copies its input to are pasted into as
+// well, each bracketed by its own program's request.
+//
+// The paste reports through COMMAND_COMPLETE with the correlation token
+// written to the final argument, for callers that must sequence later input
+// after it: by then tmux has written the text to the pane and has been told
+// every other paste, so input sent next reaches panes that have the text.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_paste_pane(
     ghostty_tmux_client_t,
     uint64_t,
     const uint8_t*,
