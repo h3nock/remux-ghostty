@@ -2497,6 +2497,13 @@ test "control client paste counts two replies for each pane's paste from tmux 3.
         true,
         test_ok ** 2 ++ (test_ok ++ test_ok) ** 3 ++ test_ok,
     );
+
+    // A tmux built from git names the release it is heading for.
+    try expectPasteReplies(
+        "next-3.7",
+        true,
+        test_ok ** 2 ++ (test_ok ++ test_ok) ** 3 ++ test_ok,
+    );
     // tmux refuses the paste into pane 1 itself: the paste fails.
     try expectPasteReplies(
         "3.5a",
@@ -2650,6 +2657,28 @@ test "control client paste rejects what is not text atomically" {
     try testing.expectError(error.PaneUnknown, client.pastePane(99, "text"));
     try testing.expectEqual(next_token, client.channel.next_token);
     try testing.expectEqualStrings("", client.outboundBytes());
+}
+
+test "control client paste keeps a large text in one argument" {
+    const testing = std.testing;
+
+    var client = try ControlClient.init(testing.io, testing.allocator, .{});
+    defer client.deinit();
+    var actions: TestActions = .{};
+    defer actions.deinit();
+    try openPaneTestClient(&client, &actions);
+
+    const payload = [_]u8{'x'} ** (64 * 1024);
+    _ = try client.pastePane(0, &payload);
+    var lines = std.mem.splitScalar(u8, client.outboundBytes(), '\n');
+    _ = lines.next().?;
+    const set_buffer = lines.next().?;
+    try testing.expect(std.mem.startsWith(u8, set_buffer, "set-buffer -b remux-paste-"));
+    try testing.expect(std.mem.endsWith(u8, set_buffer, "\""));
+    try testing.expectEqual(
+        "set-buffer -b ".len + client.paste_buffer.len + " -- \"\"".len + payload.len,
+        set_buffer.len,
+    );
 }
 
 test "control client paste is allocation atomic" {
