@@ -761,6 +761,9 @@ const PasteCase = struct {
     /// tmux 3.1 to 3.3a end the server when told to paste into such a pane.
     target_exited: bool = false,
 
+    /// Pane 0's input is turned off (`select-pane -d`).
+    target_input_off: bool = false,
+
     /// What each pane's program reads.
     expected: [4][]const u8,
 };
@@ -814,6 +817,11 @@ const paste_cases = [_]PasteCase{
         .name = "synchronized, the pasted pane's program exited",
         .target_exited = true,
         .expected = .{ "x", "", "", "" },
+    },
+    .{
+        .name = "synchronized, the pasted pane's input off",
+        .target_input_off = true,
+        .expected = .{ "", "", "", "" },
     },
 };
 
@@ -895,6 +903,7 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
     }
     if (case.synchronized) try live.tmux(&.{ "set-option", "-w", "-t", "s:0", "synchronize-panes", "on" });
     if (case.zoomed) try live.tmux(&.{ "resize-pane", "-Z", "-t", "%0" });
+    if (case.target_input_off) try live.tmux(&.{ "select-pane", "-d", "-t", "%0" });
     if (case.copy_mode) |pane| {
         var target_buffer: [16]u8 = undefined;
         try live.tmux(&.{ "copy-mode", "-t", try std.fmt.bufPrint(&target_buffer, "%{d}", .{pane}) });
@@ -952,8 +961,9 @@ fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
 
         // A paste tmux didn't make fails, where tmux says so to the
         // client: from 3.2. tmux refuses keys for a pane it doesn't have,
-        // and takes them for one whose program has exited.
-        const undelivered = (case.target_gone or case.target_exited) and
+        // and takes them for one whose program has exited or whose input
+        // is off.
+        const undelivered = (case.target_gone or case.target_exited or case.target_input_off) and
             run.client.viewer.answersCommandsIfShellRuns();
         if (pasted.ok == undelivered or entered.ok == case.target_gone) ok = false;
     }

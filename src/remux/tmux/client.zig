@@ -38,16 +38,26 @@ pub const ControlClient = struct {
 
     const paste_buffer_prefix = "remux-paste-";
 
+    /// The pane's program hasn't exited and its input isn't turned off
+    /// (`select-pane -d`).
+    ///
+    /// It is the condition for pasting into the target itself. tmux drops
+    /// a paste into a pane with its input off and says nothing. A pane
+    /// whose program has exited has nothing to write to, and tmux 3.1 to
+    /// 3.3a don't look before they write: a `paste-buffer` into one ends
+    /// the server.
+    const pane_takes_input = "#{&&:#{?pane_dead,0,1},#{?pane_input_off,0,1}}";
+
     /// tmux's own test for copying one pane's input to another
     /// (`window_pane_key`): it copies the input of a pane that is
     /// synchronized and takes input to every other pane of its window that
     /// is too and is shown.
     ///
-    /// Synchronized and taking input is synchronize-panes on, alive, in no
-    /// mode and input not disabled.
+    /// Synchronized and taking input is synchronize-panes on, in no mode,
+    /// alive and input not turned off.
     const pane_takes_copied_input =
         "#{&&:#{pane_synchronized},#{&&:#{?pane_in_mode,0,1}," ++
-        "#{&&:#{?pane_dead,0,1},#{?pane_input_off,0,1}}}}";
+        pane_takes_input ++ "}}";
 
     /// Shown, as only the active pane of a zoomed window is.
     const pane_shown = "#{||:#{?window_zoomed_flag,0,1},#{pane_active}}";
@@ -80,12 +90,6 @@ pub const ControlClient = struct {
     /// The paste into another pane. One that doesn't take the text is no
     /// failure, so the other branch does nothing.
     const other_paste_format = guardedPasteFormat("display-message -p \"\"");
-
-    /// The condition for pasting into the target itself: its program
-    /// hasn't exited. A pane whose program has exited has nothing to write
-    /// to, and tmux 3.1 to 3.3a don't look before they write: a
-    /// `paste-buffer` into one ends the server.
-    const pane_alive = "#{?pane_dead,0,1}";
 
     /// The condition for pasting into another pane, that tmux would copy
     /// the target's input to it: the target is synchronized and takes
@@ -356,12 +360,12 @@ pub const ControlClient = struct {
     /// return. Bytes that are unsafe in a paste are replaced as they are
     /// for any other pasted text.
     ///
-    /// A pane whose program has exited, or that has gone, takes no text, as
-    /// typing into it takes none. tmux checks that itself as it runs the
-    /// paste. From tmux 3.2 the token fails when tmux made no paste into
-    /// the pane: its program had exited, it had gone, or tmux refused the
-    /// paste. tmux 3.1 gives that answer to no command, so there the token
-    /// completes all the same.
+    /// A pane whose program has exited, whose input is turned off, or that
+    /// has gone, takes no text, as typing into it takes none. tmux checks
+    /// that itself as it runs the paste. From tmux 3.2 the token fails
+    /// when tmux made no paste into the pane: for one of those, or because
+    /// tmux refused the paste. tmux 3.1 gives that answer to no command,
+    /// so there the token completes all the same.
     ///
     /// The paste goes where typing into the pane would. A pane in a mode
     /// takes no input, so the pane leaves its mode first; and the panes
@@ -464,7 +468,7 @@ pub const ControlClient = struct {
             .source = .host,
             .text = try std.fmt.allocPrint(arena, target_paste_format, .{
                 .target = pane_id,
-                .condition = pane_alive,
+                .condition = pane_takes_input,
                 .buffer = buffer,
                 .pane = pane_id,
             }),
@@ -2306,7 +2310,8 @@ fn expectPasteOutbound(
             &storage,
             "copy-mode -q -t %0\n" ++
                 "set-buffer -b {s} -- \"{s}\"\n" ++
-                "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}},#{{?pane_dead,0,1}}}}' " ++
+                "if-shell -F -t %0 '#{{&&:#{{==:#{{pane_id}},%0}}," ++
+                "#{{&&:#{{?pane_dead,0,1}},#{{?pane_input_off,0,1}}}}}}' " ++
                 "'paste-buffer -p -b {s} -t %0' 'show-buffer -b {s}-undelivered'\n" ++
                 "delete-buffer -b {s}\n",
             .{
@@ -2369,7 +2374,8 @@ fn windowsPasteOutbound(
         storage,
         "copy-mode -q -t %1\n" ++
             "set-buffer -b {s} -- \"text\"\n" ++
-            "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{?pane_dead,0,1}}}}' " ++
+            "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}}," ++
+            "#{{&&:#{{?pane_dead,0,1}},#{{?pane_input_off,0,1}}}}}}' " ++
             "'paste-buffer -p -b {s} -t %1' 'show-buffer -b {s}-undelivered'\n" ++
             "if-shell -F -t %1 '#{{&&:#{{==:#{{pane_id}},%1}},#{{&&:{s}," ++
             "#{{P:#{{?#{{==:#{{pane_id}},%0}},#{{&&:{s}," ++
