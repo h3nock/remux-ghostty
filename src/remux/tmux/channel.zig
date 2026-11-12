@@ -19,9 +19,6 @@ pub const CommandSource = enum {
     viewer,
     input,
 
-    /// Asks which panes tmux would copy a paste's pane's input to.
-    paste_query,
-
     /// A step of a paste whose outcome nothing acts on: a failure that
     /// matters fails the paste's own command.
     best_effort,

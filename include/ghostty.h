@@ -1716,12 +1716,16 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
 // The paste goes where typing into the pane would. A pane in a tmux mode takes
 // no input, so the pane leaves its mode first. When the pane has
 // synchronize-panes on, the panes tmux copies its input to are pasted into as
-// well, each bracketed by its own program's request.
+// well, each bracketed by its own program's request. Those are panes of the
+// pane's window as its layout was last reported; tmux decides for each as it
+// gets there.
+//
+// Everything the paste takes is queued by this call, in one piece and in
+// order. Input sent after it, with no wait, reaches tmux after all of it, and
+// so reaches panes that have the text.
 //
 // The paste reports through COMMAND_COMPLETE with the correlation token
-// written to the final argument, for callers that must sequence later input
-// after it: by then tmux has written the text to the pane and has been told
-// every other paste, so input sent next reaches panes that have the text.
+// written to the final argument, once tmux has written the text to the pane.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_paste_pane(
     ghostty_tmux_client_t,
     uint64_t,

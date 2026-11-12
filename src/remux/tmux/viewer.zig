@@ -1085,6 +1085,18 @@ pub const Viewer = struct {
 
     /// `refresh-client -A` exists from tmux 3.2.
     fn supportsPanePause(self: *const Viewer) bool {
+        return self.isAtLeastTmux32();
+    }
+
+    /// From tmux 3.2 the command an `if-shell` runs is answered in a block
+    /// of its own that is marked as the client's, after the `if-shell`'s.
+    /// Before that the block is marked as the server's, which no command
+    /// waits for.
+    pub fn answersCommandsIfShellRuns(self: *const Viewer) bool {
+        return self.isAtLeastTmux32();
+    }
+
+    fn isAtLeastTmux32(self: *const Viewer) bool {
         const version = parseTmuxVersion(self.tmux_version) orelse return false;
         return version.major > 3 or (version.major == 3 and version.minor >= 2);
     }
