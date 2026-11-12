@@ -1709,9 +1709,10 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_send_pane_input_tracked(
 // Pastes nonempty UTF-8 text into a known pane the way tmux pastes a buffer.
 // tmux, which knows the pane's modes, wraps the text in a bracketed paste when
 // the pane's program asked for one, and either way sends each line feed as a
-// carriage return, so a CRLF line end goes as one line feed; the host needs no
-// knowledge of the pane's paste mode. Bytes unsafe in a paste are replaced as
-// terminal_surface_paste replaces them, and invalid UTF-8 is rejected.
+// carriage return, so a CRLF line end reaches the program as one carriage
+// return; the host needs no knowledge of the pane's paste mode. Bytes unsafe
+// in a paste are replaced as terminal_surface_paste replaces them, and invalid
+// UTF-8 is rejected.
 //
 // The paste goes where typing into the pane would. A pane in a tmux mode takes
 // no input, so the pane leaves its mode first. When the pane has

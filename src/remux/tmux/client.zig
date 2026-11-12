@@ -30,9 +30,10 @@ pub const ControlClient = struct {
     /// The tmux buffer this client pastes through. tmux buffers belong to
     /// the server, so the name is this client's alone: another client's
     /// paste can never land between this one's commands and change what
-    /// they paste. One name serves every paste, because tmux runs a paste's
-    /// commands, from setting the buffer to deleting it, before it reads
-    /// the next paste's.
+    /// they paste. One name serves every paste: tmux runs a client's
+    /// commands in order and none of a paste's waits, so it has run a
+    /// paste's commands, from setting the buffer to deleting it, before it
+    /// runs the next paste's.
     paste_buffer: [paste_buffer_prefix.len + 16]u8,
 
     const paste_buffer_prefix = "remux-paste-";
@@ -330,9 +331,10 @@ pub const ControlClient = struct {
     /// buffer, and return the token that completes once tmux has written it
     /// to the pane. tmux knows the pane's modes: it wraps the text in a
     /// bracketed paste when the pane's program asked for one, and either way
-    /// sends each line feed as a carriage return, so a CRLF line end goes as
-    /// one line feed. Bytes that are unsafe in a paste are replaced as they
-    /// are for any other pasted text.
+    /// sends each line feed as a carriage return, so a CRLF line end is sent
+    /// to tmux as one line feed and reaches the program as one carriage
+    /// return. Bytes that are unsafe in a paste are replaced as they are for
+    /// any other pasted text.
     ///
     /// The paste goes where typing into the pane would. A pane in a mode
     /// takes no input, so the pane leaves its mode first; and the panes
@@ -2417,7 +2419,9 @@ test "control client input sent right after a paste is written behind every pane
     try openWindowsTestClient(&client, &actions, "3.5a");
 
     // Enter straight after the paste, before tmux has answered anything
-    // and before a byte has been written.
+    // and before a byte has been written. Every pane's paste is written
+    // ahead of it: tmux copies the Enter to panes 0 and 2 when it reaches
+    // it, and by then has run the paste into each.
     _ = try client.pastePane(1, "text");
     try client.sendPaneInput(1, "\r");
 
@@ -2429,19 +2433,6 @@ test "control client input sent right after a paste is written behind every pane
         try windowsPasteOutbound(&client, &storage),
         written[0 .. written.len - enter.len],
     );
-
-    // tmux copies the Enter to panes 0 and 2 when it reaches it: by then it
-    // has run the paste into each, and nothing came back in between.
-    const enter_at = std.mem.indexOf(u8, written, enter).?;
-    for ([_][]const u8{ " -t %1\n", " -t %0' ", " -t %2' " }) |target| {
-        var command_storage: [96]u8 = undefined;
-        const command = try std.fmt.bufPrint(
-            &command_storage,
-            "paste-buffer -p -b {s}{s}",
-            .{ &client.paste_buffer, target },
-        );
-        try testing.expect(std.mem.indexOf(u8, written, command).? < enter_at);
-    }
 }
 
 /// Paste into pane 1 of a `version` client, then Enter and a command of the

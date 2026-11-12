@@ -813,7 +813,13 @@ fn sleepMs(ms: i32) !void {
 /// Run one paste scenario. Returns whether everything was as expected.
 fn pasteRun(live: *Live, version: []const u8, case: PasteCase) !bool {
     live.runs += 1;
-    try live.tmux(&.{"kill-server"});
+
+    // A server of its own: one started on a socket whose last server is
+    // still exiting can be lost with it.
+    var socket_buffer: [64]u8 = undefined;
+    live.socket = try std.fmt.bufPrint(&socket_buffer, "remux-paste-live-{d}-{d}", .{
+        std.c.getpid(), live.runs,
+    });
     defer live.tmux(&.{"kill-server"}) catch {};
 
     // Each pane's program asks for bracketed pastes, unless it is the
@@ -956,12 +962,11 @@ test "tmux client pastes reach a real tmux's panes ahead of the input after them
     const dir = env("REMUX_TMUX_LIVE_DIR") orelse return error.SkipZigTest;
     const report_path = env("REMUX_TMUX_LIVE_PASTE_REPORT") orelse return error.SkipZigTest;
 
-    var socket_buffer: [64]u8 = undefined;
     var live: Live = .{
         .bin = bin,
         .gen = "",
         .dir = dir,
-        .socket = try std.fmt.bufPrint(&socket_buffer, "remux-paste-live-{d}", .{std.c.getpid()}),
+        .socket = "",
         .env = .init(testing.allocator),
         .report = try std.Io.Dir.createFileAbsolute(testing.io, report_path, .{}),
     };
