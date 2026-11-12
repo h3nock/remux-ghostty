@@ -645,6 +645,11 @@ pub const Parser = struct {
             // Important: do not clear buffer here since client/name point to it
             self.state = .idle;
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%paste-buffer-changed") or
+            std.mem.eql(u8, cmd, "%paste-buffer-deleted"))
+        {
+            // Nothing here follows tmux's paste buffers, and every paste of
+            // this client's own makes tmux send both.
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -1407,6 +1412,22 @@ test "tmux client-detached" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .client_detached);
     try testing.expectEqualStrings("/dev/pts/1", n.client_detached.client);
+}
+
+test "tmux paste buffer notifications are dropped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%paste-buffer-changed remux-paste-0123456789abcdef\n" ++
+        "%paste-buffer-deleted remux-paste-0123456789abcdef\n" ++
+        "%client-detached /dev/pts/1") |byte|
+    {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .client_detached);
 }
 
 test "tmux client-session-changed" {
