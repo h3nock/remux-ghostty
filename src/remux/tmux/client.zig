@@ -378,21 +378,12 @@ pub const ControlClient = struct {
         }
         set_buffer.appendAssumeCapacity('"');
 
-        // tmux 3.1 can only cancel copy mode, which it refuses to do for a
-        // pane that isn't in it.
         var leave_storage: [48]u8 = undefined;
-        const leave_mode = if (self.viewer.supportsLeavingAnyMode())
-            std.fmt.bufPrint(
-                &leave_storage,
-                "copy-mode -q -t %{d}",
-                .{pane_id},
-            ) catch unreachable
-        else
-            std.fmt.bufPrint(
-                &leave_storage,
-                "send-keys -X -t %{d} cancel",
-                .{pane_id},
-            ) catch unreachable;
+        const leave_mode = std.fmt.bufPrint(
+            &leave_storage,
+            "copy-mode -q -t %{d}",
+            .{pane_id},
+        ) catch unreachable;
         var query_storage: [320]u8 = undefined;
         const query = std.fmt.bufPrint(
             &query_storage,
@@ -2298,7 +2289,7 @@ fn expectPasteOutbound(
     try std.testing.expectEqualStrings(
         try std.fmt.bufPrint(
             &storage,
-            "send-keys -X -t %0 cancel\n" ++
+            "copy-mode -q -t %0\n" ++
                 "set-buffer -b {s}-{d} -- \"{s}\"\n" ++
                 "{s}" ++
                 "paste-buffer -p -b {s}-{d} -t %0\n",
@@ -2546,7 +2537,7 @@ test "control client paste into a pane tmux no longer has fails once and deletes
     try testing.expectEqual(after, actions.records.items[1].command_success);
 }
 
-test "control client paste takes its pane out of any mode where tmux can" {
+test "control client paste takes its pane out of its mode on every tmux" {
     const testing = std.testing;
 
     var client = try ControlClient.init(testing.io, testing.allocator, .{});
@@ -2555,7 +2546,7 @@ test "control client paste takes its pane out of any mode where tmux can" {
     defer actions.deinit();
     try openPaneTestClient(&client, &actions);
 
-    for ([_][]const u8{ "3.1a", "3.2a", "3.6a", "next-3.7" }) |version| {
+    for ([_][]const u8{ "3.1", "3.1c", "3.2a", "3.6a", "next-3.7" }) |version| {
         testing.allocator.free(client.viewer.tmux_version);
         client.viewer.tmux_version = try testing.allocator.dupe(u8, version);
         _ = try client.pastePane(0, "text");
@@ -2566,29 +2557,6 @@ test "control client paste takes its pane out of any mode where tmux can" {
         ));
         try client.consumeOutbound(client.outboundBytes().len);
     }
-}
-
-test "control client paste goes on when its pane was in no mode to leave" {
-    const testing = std.testing;
-
-    var client = try ControlClient.init(testing.io, testing.allocator, .{});
-    defer client.deinit();
-    var actions: TestActions = .{};
-    defer actions.deinit();
-    try openPaneTestClient(&client, &actions);
-
-    // tmux 3.1 refuses to cancel the mode of a pane that isn't in one.
-    const token = try client.pastePane(0, "text");
-    try client.consumeOutbound(client.outboundBytes().len);
-    try client.feed(
-        "%begin 9 9 1\nnot in a mode\n%error 9 9 1\n" ++
-            "%begin 10 10 1\n%end 10 10 1\n" ++
-            "%begin 11 11 1\n%0 1 0 1\n%end 11 11 1\n" ++
-            "%begin 12 12 1\n%end 12 12 1\n",
-        &actions,
-    );
-    try testing.expectEqual(1, actions.records.items.len);
-    try testing.expectEqual(token, actions.records.items[0].command_success);
 }
 
 test "control client paste rejects what is not text atomically" {

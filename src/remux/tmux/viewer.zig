@@ -1083,14 +1083,6 @@ pub const Viewer = struct {
         }
     }
 
-    /// `copy-mode -q`, which takes a pane out of whatever mode it is in,
-    /// exists from tmux 3.1a.
-    pub fn supportsLeavingAnyMode(self: *const Viewer) bool {
-        var version = std.mem.trim(u8, self.tmux_version, " \t\r\n");
-        if (std.mem.startsWith(u8, version, "next-")) version = version[5..];
-        return !std.mem.eql(u8, version, "3.1");
-    }
-
     /// `refresh-client -A` exists from tmux 3.2.
     fn supportsPanePause(self: *const Viewer) bool {
         const version = parseTmuxVersion(self.tmux_version) orelse return false;

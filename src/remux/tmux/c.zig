@@ -1219,7 +1219,7 @@ test "tmux C client pane paste" {
     const buffer = &client.control.paste_buffer;
     var expected_storage: [256]u8 = undefined;
     var lines = std.mem.splitScalar(u8, try outbound.slice(), '\n');
-    try testing.expectEqualStrings("send-keys -X -t %0 cancel", lines.next().?);
+    try testing.expectEqualStrings("copy-mode -q -t %0", lines.next().?);
     try testing.expectEqualStrings(
         try std.fmt.bufPrint(
             &expected_storage,
