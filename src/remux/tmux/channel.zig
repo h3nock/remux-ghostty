@@ -236,6 +236,59 @@ pub const Channel = struct {
         self.outbound.appendAssumeCapacity('\n');
     }
 
+    /// One standalone command and the layer that owns its response.
+    pub const Command = struct {
+        source: CommandSource,
+        text: []const u8,
+    };
+
+    /// Queue standalone commands, each as its own newline-delimited tmux
+    /// command list, admitted together or not at all.
+    ///
+    /// Unlike a group, tmux runs each command whatever the ones before it
+    /// returned. Every text must independently satisfy `enqueueCommand`'s
+    /// single-command contract. Pass null when the caller does not need the
+    /// per-command tokens.
+    pub fn enqueueCommands(
+        self: *Channel,
+        commands: []const Command,
+        tokens_out: ?[]CommandToken,
+    ) EnqueueError!void {
+        try self.validateEnqueue();
+        if (commands.len == 0) return error.InvalidCommand;
+        if (tokens_out) |tokens| {
+            if (tokens.len != commands.len) return error.InvalidTokenCount;
+        }
+        try self.ensureTokens(commands.len);
+
+        var wire_len: usize = 0;
+        for (commands) |command| {
+            if (!isValidCommand(command.text)) return error.InvalidCommand;
+            wire_len = std.math.add(usize, wire_len, command.text.len) catch
+                return error.InvalidCommand;
+            wire_len = std.math.add(usize, wire_len, 1) catch
+                return error.InvalidCommand;
+        }
+
+        // Both reserves precede every logical mutation. If either allocation
+        // fails, no token, pending record, or wire byte becomes observable.
+        try self.ensurePendingCapacity(commands.len);
+        try self.ensureOutboundCapacity(wire_len);
+
+        for (commands, 0..) |command, i| {
+            self.outbound.appendSliceAssumeCapacity(command.text);
+            self.outbound.appendAssumeCapacity('\n');
+
+            const token = self.mintToken();
+            self.pending.appendAssumeCapacity(.{
+                .token = token,
+                .source = command.source,
+                .ends_group = true,
+            });
+            if (tokens_out) |tokens| tokens[i] = token;
+        }
+    }
+
     /// Bytes awaiting transport. The slice is valid until the next enqueue,
     /// feed, or consume call.
     pub fn outboundBytes(self: *const Channel) []const u8 {
@@ -985,6 +1038,149 @@ test "tmux channel enqueue is allocation atomic" {
                 channel.outboundBytes(),
             );
             try testing.expectEqual(texts.len, channel.pendingCount());
+            channel.deinit();
+            if (!failing.has_induced_failure) break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualStrings("", channel.outboundBytes());
+            try testing.expectEqual(0, channel.pendingCount());
+            try testing.expectEqual(1, channel.next_token);
+            for (tokens) |token| try testing.expectEqual(sentinel, token);
+            channel.deinit();
+        }
+    }
+}
+
+test "tmux channel standalone commands each complete for their own source" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var opened: TestEvents = .{};
+    defer opened.deinit(testing.allocator);
+    openTestChannel(&channel, &opened);
+
+    var tokens: [3]CommandToken = undefined;
+    try channel.enqueueCommands(&.{
+        .{ .source = .input, .text = "command-a" },
+        .{ .source = .host, .text = "command-b" },
+        .{ .source = .input, .text = "command-c" },
+    }, &tokens);
+    try testing.expectEqualStrings(
+        "command-a\ncommand-b\ncommand-c\n",
+        channel.outboundBytes(),
+    );
+
+    const Completions = struct {
+        const Completion = struct {
+            token: CommandToken,
+            source: CommandSource,
+            ok: bool,
+        };
+
+        items: [3]Completion = undefined,
+        len: usize = 0,
+
+        pub fn channelEvent(self: *@This(), event: Event) void {
+            self.items[self.len] = switch (event) {
+                .command_ok => |command| .{
+                    .token = command.token,
+                    .source = command.source,
+                    .ok = true,
+                },
+                .command_failed => |command| failed: {
+                    testing.expect(command.failure == .error_block) catch
+                        @panic("a standalone command is never skipped");
+                    break :failed .{
+                        .token = command.token,
+                        .source = command.source,
+                        .ok = false,
+                    };
+                },
+                else => @panic("unexpected event"),
+            };
+            self.len += 1;
+        }
+    };
+    var completions: Completions = .{};
+    try channel.feed(
+        "%begin 2 2 1\n%end 2 2 1\n" ++
+            "%begin 3 3 1\nfailed\n%error 3 3 1\n" ++
+            "%begin 4 4 1\n%end 4 4 1\n",
+        &completions,
+    );
+
+    try testing.expectEqualSlices(Completions.Completion, &.{
+        .{ .token = tokens[0], .source = .input, .ok = true },
+        .{ .token = tokens[1], .source = .host, .ok = false },
+        .{ .token = tokens[2], .source = .input, .ok = true },
+    }, completions.items[0..completions.len]);
+    try testing.expectEqual(0, channel.pendingCount());
+}
+
+test "tmux channel standalone commands validate inputs without mutation" {
+    const testing = std.testing;
+
+    var channel = try Channel.init(testing.allocator);
+    defer channel.deinit();
+    var events: TestEvents = .{};
+    defer events.deinit(testing.allocator);
+    openTestChannel(&channel, &events);
+
+    var tokens: [2]CommandToken = undefined;
+    try testing.expectError(
+        error.InvalidCommand,
+        channel.enqueueCommands(&.{}, null),
+    );
+    try testing.expectError(error.InvalidCommand, channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "valid" },
+        .{ .source = .host, .text = "two\nlines" },
+    }, &tokens));
+    try testing.expectError(error.InvalidTokenCount, channel.enqueueCommands(&.{
+        .{ .source = .host, .text = "valid" },
+    }, &tokens));
+    try testing.expectEqualStrings("", channel.outboundBytes());
+    try testing.expectEqual(0, channel.pendingCount());
+    try testing.expectEqual(1, channel.next_token);
+}
+
+test "tmux channel standalone commands are allocation atomic" {
+    const testing = std.testing;
+    const sentinel: CommandToken = @enumFromInt(999);
+    var commands: [9]Channel.Command = undefined;
+    for (&commands, [_][]const u8{
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+    }) |*command, text| command.* = .{ .source = .host, .text = text };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(
+            testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const alloc = failing.allocator();
+
+        var channel = Channel.init(alloc) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        channel.state = .running;
+        var tokens = [_]CommandToken{sentinel} ** commands.len;
+
+        if (channel.enqueueCommands(&commands, &tokens)) |_| {
+            try testing.expectEqualStrings(
+                "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+                channel.outboundBytes(),
+            );
+            try testing.expectEqual(commands.len, channel.pendingCount());
             channel.deinit();
             if (!failing.has_induced_failure) break;
         } else |err| {
