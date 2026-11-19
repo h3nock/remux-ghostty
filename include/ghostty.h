@@ -1523,6 +1523,15 @@ typedef struct {
   bool visible;
 } ghostty_terminal_surface_cell_geometry_s;
 
+// The cursor's cell and the lowest row of the viewport that shows anything,
+// read from one state of the terminal. content_bottom is the first cell of the
+// lowest viewport row holding a non-empty cell (text, a wide character or a
+// background color); it is visible=false when no viewport row holds one.
+typedef struct {
+  ghostty_terminal_surface_cell_geometry_s cursor;
+  ghostty_terminal_surface_cell_geometry_s content_bottom;
+} ghostty_terminal_surface_content_geometry_s;
+
 // start and end preserve Ghostty's canonical endpoint roles. They are not
 // ordered by content position and are not swapped when a selection crosses
 // over. rectangle identifies canonical block-selection semantics. Geometry is
@@ -1926,6 +1935,16 @@ GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_cursor_geometry(
     ghostty_terminal_surface_t,
     ghostty_terminal_surface_cell_geometry_s*);
+
+// Returns the cursor-cell geometry, as ghostty_terminal_surface_cursor_geometry
+// does, and the lowest viewport row with content, from one read, without
+// changing terminal state or waking the renderer. For a host that keeps the
+// cursor and what is drawn below it in view while it covers the bottom of the
+// surface.
+GHOSTTY_API ghostty_terminal_surface_result_e
+ghostty_terminal_surface_content_geometry(
+    ghostty_terminal_surface_t,
+    ghostty_terminal_surface_content_geometry_s*);
 
 // Sets the composition text drawn over the cursor, as ghostty_surface_preedit
 // does for a surface. The text is UTF-8; a length of 0 clears it. This is
