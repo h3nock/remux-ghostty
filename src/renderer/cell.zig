@@ -230,6 +230,11 @@ pub const Contents = struct {
         }
     }
 
+    /// The background cells of row `y`.
+    pub fn bgRow(self: *const Contents, y: terminal.size.CellCountInt) []const shaderpkg.CellBg {
+        return self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns];
+    }
+
     /// Clear all of the cell contents for a given row.
     pub fn clear(self: *Contents, y: terminal.size.CellCountInt) void {
         assert(y < self.size.rows);

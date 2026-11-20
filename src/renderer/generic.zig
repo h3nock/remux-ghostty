@@ -13,6 +13,7 @@ const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const frame_rows = @import("frame_rows.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -351,6 +352,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The rows drawn from `terminal_state`: its viewport rows, plus
         /// its overscan row below while scrolled by part of a row.
         render_rows: terminal.size.CellCountInt = 0,
+
+        /// Remux: which rows hold anything, published with each frame (frame_rows.zig).
+        frame_rows: frame_rows.Tracker = .{},
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -924,6 +928,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
+            self.frame_rows.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
 
@@ -2027,6 +2032,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
+            if (@hasField(@TypeOf(frame.target), "frame_rows")) {
+                frame.target.frame_rows = self.frame_rows.frame(
+                    self.render_rows,
+                    @floatFromInt(self.size.cell.height),
+                    @floatFromInt(self.size.padding.top),
+                    self.uniforms.scroll_cell_offset * @as(f32, @floatFromInt(self.size.cell.height)),
+                );
+            }
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
@@ -2773,6 +2786,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = self.render_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
+                try self.frame_rows.resize(self.alloc, new_size.rows);
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
@@ -2884,7 +2898,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+                self.frame_rows.noteRow(y, self.cells.fg_rows[y + 1].items.len, self.cells.bgRow(y));
             }
+            self.frame_rows.cursor_row = if (state.cursor.viewport) |vp| vp.y else null;
 
             // Setup our cursor rendering information.
             cursor: {

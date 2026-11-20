@@ -36,6 +36,9 @@ surface: *IOSurface,
 /// The underlying MTLTexture.
 texture: objc.Object,
 
+/// Remux: the rows of the frame drawn into this target, shown with it (frame_rows.zig).
+frame_rows: @import("../frame_rows.zig").FrameRows = .{},
+
 /// Current width of this target.
 width: usize,
 /// Current height of this target.

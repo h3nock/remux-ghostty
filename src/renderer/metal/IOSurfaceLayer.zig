@@ -1,6 +1,7 @@
 //! A wrapper around a CALayer with a utility method
 //! for settings its `contents` to an IOSurface.
 const IOSurfaceLayer = @This();
+const FrameRows = @import("../frame_rows.zig").FrameRows;
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,7 +51,7 @@ pub fn release(self: *IOSurfaceLayer) void {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, rows: FrameRows) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -63,6 +64,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .rows = rows,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -84,13 +86,28 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface, rows: FrameRows) void {
+    setFrameRows(self.layer, rows);
     self.layer.setProperty("contents", surface);
+}
+
+/// Remux: attaches the frame's rows to the layer, set just before `contents` so the two always describe the same
+/// picture. Read with `[layer valueForKey:@"remuxFrameRows"]`: an NSData holding a `FrameRows`.
+fn setFrameRows(layer: objc.Object, rows: FrameRows) void {
+    const NSData = objc.getClass("NSData") orelse return;
+    const NSString = objc.getClass("NSString") orelse return;
+    const data = NSData.msgSend(objc.Object, "dataWithBytes:length:", .{
+        @as(*const anyopaque, @ptrCast(&rows)),
+        @as(c_ulong, @sizeOf(FrameRows)),
+    });
+    const key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*:0]const u8, "remuxFrameRows")});
+    layer.msgSend(void, "setValue:forKey:", .{ data.value, key.value });
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    rows: FrameRows,
 }, .{}, void);
 
 fn setSurfaceCallback(
@@ -119,6 +136,7 @@ fn setSurfaceCallback(
         return;
     }
 
+    setFrameRows(layer, block.rows);
     layer.setProperty("contents", surface);
 }
 

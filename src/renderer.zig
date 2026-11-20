@@ -68,4 +68,5 @@ test {
     _ = EventSink;
     _ = Thread;
     _ = State;
+    _ = @import("renderer/frame_rows.zig");
 }
