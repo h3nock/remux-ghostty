@@ -159,6 +159,17 @@ pub const CellGeometry = extern struct {
     visible: bool = false,
 };
 
+/// The cursor's cell and the lowest row of the viewport that shows anything,
+/// read together, for a host that keeps both in view when it covers the bottom
+/// of the surface (as an on-screen keyboard does).
+pub const ContentGeometry = extern struct {
+    cursor: CellGeometry = .{},
+    /// The first cell of the lowest viewport row holding a non-empty cell:
+    /// text, a wide character or a background color. Not visible when no
+    /// viewport row holds one.
+    content_bottom: CellGeometry = .{},
+};
+
 pub const SelectionSnapshot = extern struct {
     start: CellGeometry = .{},
     end: CellGeometry = .{},
@@ -392,6 +403,17 @@ pub fn cursorGeometry(self: *TerminalSurface) CellGeometry {
     self.shared.mutex.lockUncancelable(global.io());
     defer self.shared.mutex.unlock(global.io());
     return self.cursorGeometryLocked();
+}
+
+/// Snapshot the cursor-cell geometry and the lowest viewport row with content
+/// from one state of the terminal.
+pub fn contentGeometry(self: *TerminalSurface) ContentGeometry {
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
+    return .{
+        .cursor = self.cursorGeometryLocked(),
+        .content_bottom = self.contentBottomGeometryLocked(),
+    };
 }
 
 /// Replace the composition text drawn over the cursor, as
@@ -1094,6 +1116,17 @@ fn cursorGeometryLocked(self: *const TerminalSurface) CellGeometry {
         .x = cursor.x,
         .y = std.math.cast(u32, viewport_y) orelse return .{},
     });
+}
+
+fn contentBottomGeometryLocked(self: *const TerminalSurface) CellGeometry {
+    const pages = &self.shared.terminal.screens.active.pages;
+    var rows = pages.rowIterator(.left_up, .{ .viewport = .{} }, null);
+    while (rows.next()) |row| {
+        for (row.cells(.all)) |cell| {
+            if (!cell.isEmpty()) return self.cellGeometryLocked(row);
+        }
+    }
+    return .{};
 }
 
 fn cellGeometryLocked(
@@ -2565,6 +2598,55 @@ test "terminal surface cursor geometry follows viewport and active screen" {
     try testing.expect(geometry.visible);
     try testing.expectEqual(@as(f64, 22), geometry.x_px);
     try testing.expectEqual(@as(f64, 22), geometry.y_px);
+}
+
+test "terminal surface content geometry finds the lowest row with content" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 4,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+    surface.size = .{
+        .screen = .{ .width = 104, .height = 84 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 2, .bottom = 2, .left = 2, .right = 2 },
+    };
+
+    // Nothing written: no row with content; the cursor is on the first row.
+    var geometry = surface.contentGeometry();
+    try testing.expect(geometry.cursor.visible);
+    try testing.expectEqual(@as(f64, 2), geometry.cursor.y_px);
+    try testing.expect(!geometry.content_bottom.visible);
+    try testing.expectEqualDeep(CellGeometry{}, geometry.content_bottom);
+
+    // A shell: text above the cursor, blank rows below it.
+    testFeed(shared, "one\r\ntwo\r\n");
+    geometry = surface.contentGeometry();
+    try testing.expectEqual(@as(f64, 42), geometry.cursor.y_px);
+    try testing.expect(geometry.content_bottom.visible);
+    try testing.expectEqual(@as(f64, 2), geometry.content_bottom.x_px);
+    try testing.expectEqual(@as(f64, 22), geometry.content_bottom.y_px);
+    try testing.expectEqual(@as(u32, 20), geometry.content_bottom.height_px);
+
+    // A footer below the cursor, as an agent's input box draws.
+    testFeed(shared, "\x1b[4;5Hfooter\x1b[2;1H");
+    geometry = surface.contentGeometry();
+    try testing.expectEqual(@as(f64, 22), geometry.cursor.y_px);
+    try testing.expectEqual(@as(f64, 62), geometry.content_bottom.y_px);
+
+    // A row whose cells only have a background color counts as content.
+    testFeed(shared, "\x1b[H\x1b[2J\x1b[3;1H\x1b[44m\x1b[K\x1b[0m\x1b[H");
+    geometry = surface.contentGeometry();
+    try testing.expectEqual(@as(f64, 2), geometry.cursor.y_px);
+    try testing.expectEqual(@as(f64, 42), geometry.content_bottom.y_px);
+
+    // The alternate screen is read on its own.
+    testFeed(shared, "\x1b[?1049h\x1b[2;1Hvim");
+    geometry = surface.contentGeometry();
+    try testing.expectEqual(@as(f64, 22), geometry.content_bottom.y_px);
 }
 
 test "terminal surface preedit is presentation only" {
