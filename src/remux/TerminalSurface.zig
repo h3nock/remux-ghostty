@@ -1288,9 +1288,21 @@ pub fn scroll(
             yoff
     else
         yoff;
+    const interaction_state = self.normalizeAndSnapshotInteractionLocked();
+
+    // A forwarded gesture that begins against travel left over from the
+    // previous one would have to undo it before its first step. Leftover
+    // travel in the same direction stays, so short repeated strokes add up.
+    const drops_opposite_carry = drops: {
+        if (!scroll_mods.precision or scroll_mods.momentum != .began) break :drops false;
+        if (interaction_state.route == .viewport) break :drops false;
+        const travel = normalized_yoff * y_multiplier;
+        const pending = self.interaction.pending_scroll_y;
+        break :drops (travel > 0 and pending < 0) or (travel < 0 and pending > 0);
+    };
     const y = normalizeScrollAxis(
         normalized_yoff,
-        self.interaction.pending_scroll_y,
+        if (drops_opposite_carry) 0 else self.interaction.pending_scroll_y,
         self.size.cell.height,
         y_multiplier,
         scroll_mods.precision,
@@ -1298,7 +1310,8 @@ pub fn scroll(
         self.shared.mutex.unlock(global.io());
         return .invalid_input;
     };
-    const interaction_state = self.normalizeAndSnapshotInteractionLocked();
+    // The old gesture's travel is gone even if this event's write is rejected.
+    if (drops_opposite_carry) self.interaction.pending_scroll_y = 0;
 
     snapshot = .{
         .route = interaction_state.route,
@@ -3269,6 +3282,139 @@ test "terminal surface scroll routing concatenation and remainders" {
         error.InvalidInput,
         normalizeScrollAxis(-isize_min, 0, 1, 1, true),
     );
+}
+
+test "terminal surface scroll drops opposite carry when a gesture begins" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.flags.mouse_event = .normal;
+    shared.terminal.flags.mouse_format = .sgr;
+    shared.mutex.unlock(global.io());
+    try testing.expectEqual(InputResult.consumed_no_output, surface.pointerPosition(5, 5, .{}));
+
+    const began: input.ScrollMods = .{ .precision = true, .momentum = .began };
+    const changed: input.ScrollMods = .{ .precision = true, .momentum = .changed };
+    const ended: input.ScrollMods = .{ .precision = true, .momentum = .ended };
+    const up = "\x1b[<64;1;1M";
+    const down = "\x1b[<65;1;1M";
+
+    // The test cell is 20 units tall. Travel left from an upward gesture no
+    // longer delays the first step of a downward one.
+    surface.interaction.pending_scroll_y = 15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, -10, began));
+    try testing.expectEqual(@as(f64, -10), surface.interaction.pending_scroll_y);
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, -10, changed));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(down, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
+
+    surface.interaction.pending_scroll_y = -15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 20, began));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(up, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
+
+    // Travel in the same direction still counts toward the next gesture.
+    surface.interaction.pending_scroll_y = 15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 10, began));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(up, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, 5), surface.interaction.pending_scroll_y);
+
+    // Four strokes of 0.6 cells make two steps.
+    surface.interaction.pending_scroll_y = 0;
+    sink.calls = 0;
+    for (0..4) |_| {
+        _ = surface.scroll(0, 12, began);
+        _ = surface.scroll(0, 0, ended);
+    }
+    try testing.expectEqual(@as(usize, 2), sink.calls);
+    try testing.expectEqual(@as(f64, 8), surface.interaction.pending_scroll_y);
+
+    // A small move back within one gesture only subtracts its own travel.
+    surface.interaction.pending_scroll_y = 0;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, 19, began));
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, -1, changed));
+    try testing.expectEqual(@as(f64, 18), surface.interaction.pending_scroll_y);
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 3, changed));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(up, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, 1), surface.interaction.pending_scroll_y);
+
+    // A rejected first event still ends the old gesture's travel, and keeps
+    // none of its own.
+    surface.interaction.pending_scroll_y = 15;
+    sink.accept = false;
+    try testing.expectEqual(InputResult.not_accepted, surface.scroll(0, -30, began));
+    try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
+    sink.accept = true;
+
+    const pointer = surface.interaction.pointer;
+    surface.interaction.pointer = null;
+    surface.interaction.pending_scroll_y = 15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.not_accepted, surface.scroll(0, -30, began));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
+    surface.interaction.pointer = pointer;
+
+    // Events that do not begin a precise gesture keep the signed sum.
+    surface.interaction.pending_scroll_y = 15;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, -10, changed));
+    try testing.expectEqual(@as(f64, 5), surface.interaction.pending_scroll_y);
+    surface.interaction.pending_scroll_y = 15;
+    try testing.expectEqual(
+        InputResult.consumed_no_output,
+        surface.scroll(0, -10, .{ .precision = true }),
+    );
+    try testing.expectEqual(@as(f64, 5), surface.interaction.pending_scroll_y);
+    surface.interaction.pending_scroll_y = 15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, -1, .{ .momentum = .began }));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings(down ** 2, sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, -5), surface.interaction.pending_scroll_y);
+
+    // The cursor-key route follows the same rule.
+    shared.mutex.lockUncancelable(global.io());
+    {
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.flags.mouse_event = .none;
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049h");
+    }
+    surface.interaction.pending_scroll_y = 15;
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, -25, began));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[B", sink.data[0..sink.len]);
+    try testing.expectEqual(@as(f64, -5), surface.interaction.pending_scroll_y);
+
+    // The local viewport keeps its existing accumulation.
+    shared.mutex.lockUncancelable(global.io());
+    {
+        defer shared.mutex.unlock(global.io());
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049l");
+    }
+    surface.interaction.pending_scroll_y = 15;
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, -10, began));
+    try testing.expectEqual(@as(f64, 5), surface.interaction.pending_scroll_y);
 }
 
 test "terminal surface pointer and pressure validation" {
