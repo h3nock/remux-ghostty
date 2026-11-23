@@ -353,6 +353,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// its overscan row below while scrolled by part of a row.
         render_rows: terminal.size.CellCountInt = 0,
 
+        /// Remux: the cursor as of the cells last rebuilt (frame_rows.zig).
+        remux_cursor: remux_frame_rows.Cursor = .{},
+
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
         /// 15 minutes at 120Hz) to prevent wasted memory buildup from
@@ -2889,6 +2892,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.cells.clear(y);
                 };
             }
+
+            self.remux_cursor = .of(state, preedit != null);
 
             // Setup our cursor rendering information.
             cursor: {
