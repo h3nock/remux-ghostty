@@ -794,6 +794,19 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return value.core.scroll(x, y, mods);
     }
 
+    export fn ghostty_terminal_surface_mouse_scroll_at(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        scroll_mods_raw: c_int,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const mods = scrollMods(scroll_mods_raw) orelse return .invalid_input;
+        return value.core.scrollAt(x, y, mods, pointer_x, pointer_y);
+    }
+
     export fn ghostty_terminal_surface_mouse_pressure(
         surface: ?*Surface,
         stage_raw: u32,

@@ -1259,6 +1259,38 @@ pub fn scroll(
     yoff: f64,
     scroll_mods: input.ScrollMods,
 ) InputResult {
+    return self.scrollWithPointer(xoff, yoff, scroll_mods, null);
+}
+
+/// Scroll with the pointer at (x, y). The position becomes the pointer's, as
+/// with pointerPosition, but no motion is reported for it: a touch scroll
+/// carries the finger's cell in each wheel report without moving a pointer,
+/// so a program that scrolls only the region under the pointer follows the
+/// finger, and no hover or motion handling runs on the way.
+pub fn scrollAt(
+    self: *TerminalSurface,
+    xoff: f64,
+    yoff: f64,
+    scroll_mods: input.ScrollMods,
+    x: f64,
+    y: f64,
+) InputResult {
+    if (!self.validPointerCoordinates(x, y)) {
+        return .invalid_input;
+    }
+    return self.scrollWithPointer(xoff, yoff, scroll_mods, .{
+        .x = @floatCast(x),
+        .y = @floatCast(y),
+    });
+}
+
+fn scrollWithPointer(
+    self: *TerminalSurface,
+    xoff: f64,
+    yoff: f64,
+    scroll_mods: input.ScrollMods,
+    pointer: ?input.mouse_encode.Event.Pos,
+) InputResult {
     if (!std.math.isFinite(xoff) or !std.math.isFinite(yoff)) {
         return .invalid_input;
     }
@@ -1267,6 +1299,7 @@ pub fn scroll(
     var snapshot: ScrollSnapshot = undefined;
     self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
+    if (pointer) |pos| self.interaction.pointer = pos;
     // A gesture's first event carries momentum `.began`. It starts from whole cells: travel left over from an
     // earlier gesture would otherwise delay this gesture's first step, or cancel it when the direction reverses.
     const gesture_began = scroll_mods.momentum == .began;
@@ -3374,4 +3407,46 @@ test "terminal surface pointer and pressure validation" {
     try testing.expect(validPointerCoordinate(2_147_483_520, 0));
     try testing.expect(!validPointerCoordinate(2_147_483_648, 0));
     try testing.expect(!validPointerCoordinate(-2_147_483_520, 256));
+}
+
+test "terminal surface scroll at a pointer position reports there without motion" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.flags.mouse_event = .any;
+    shared.terminal.flags.mouse_format = .sgr;
+    shared.mutex.unlock(global.io());
+
+    // Any-motion tracking reports a pointer move.
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
+    try testing.expectEqualStrings("\x1b[<35;1;1M", sink.data[0..sink.len]);
+
+    // A scroll at another cell reports the wheel there and nothing else.
+    sink.calls = 0;
+    sink.len = 0;
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45),
+    );
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
+
+    // The cell stays the pointer's for a plain scroll that follows.
+    sink.calls = 0;
+    sink.len = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, -20, .{ .precision = true }));
+    try testing.expectEqualStrings("\x1b[<65;2;3M", sink.data[0..sink.len]);
+
+    try testing.expectEqual(
+        InputResult.invalid_input,
+        surface.scrollAt(0, 20, .{ .precision = true }, std.math.nan(f64), 5),
+    );
 }
