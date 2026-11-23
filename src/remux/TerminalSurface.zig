@@ -1267,9 +1267,12 @@ pub fn scroll(
     var snapshot: ScrollSnapshot = undefined;
     self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
+    // A gesture's first event carries momentum `.began`. It starts from whole cells: travel left over from an
+    // earlier gesture would otherwise delay this gesture's first step, or cancel it when the direction reverses.
+    const gesture_began = scroll_mods.momentum == .began;
     const x = normalizeScrollAxis(
         xoff,
-        self.interaction.pending_scroll_x,
+        if (gesture_began) 0 else self.interaction.pending_scroll_x,
         self.size.cell.width,
         if (scroll_mods.precision) 1 else 0,
         scroll_mods.precision,
@@ -1290,7 +1293,7 @@ pub fn scroll(
         yoff;
     const y = normalizeScrollAxis(
         normalized_yoff,
-        self.interaction.pending_scroll_y,
+        if (gesture_began) 0 else self.interaction.pending_scroll_y,
         self.size.cell.height,
         y_multiplier,
         scroll_mods.precision,
@@ -3219,6 +3222,22 @@ test "terminal surface scroll routing concatenation and remainders" {
     );
     try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
     try testing.expectEqual(@as(usize, 1), sink.calls);
+
+    // A new gesture in the other direction gets its first step after one cell of its own travel, whatever the
+    // previous gesture left over.
+    sink.calls = 0;
+    try testing.expectEqual(
+        InputResult.consumed_no_output,
+        surface.scroll(0, 15, .{ .precision = true }),
+    );
+    try testing.expectEqual(@as(f64, 15), surface.interaction.pending_scroll_y);
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.scroll(0, -20, .{ .precision = true, .momentum = .began }),
+    );
+    try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[<65;1;1M", sink.data[0..sink.len]);
 
     shared.mutex.lockUncancelable(global.io());
     {
