@@ -1576,6 +1576,33 @@ pub fn freeSelectedText(
     self.alloc.free(text);
 }
 
+pub const ViewportRowsError = error{ MidUpdate, OutOfMemory };
+
+/// Copy the rows the viewport shows as plain text, one line per row with
+/// soft wraps kept as separate lines and blank rows at the end left out,
+/// while holding Shared.mutex. Comparing
+/// two copies shows how far a program moved what it draws, so a program that
+/// is inside a synchronized update (mode 2026) gets MidUpdate instead of a
+/// half-drawn copy. The caller owns the returned sentinel slice and must
+/// release it through freeSelectedText.
+pub fn viewportRows(self: *TerminalSurface) ViewportRowsError![:0]const u8 {
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
+    const term = &self.shared.terminal;
+    if (term.modes.get(.synchronized_output)) return error.MidUpdate;
+    const screen = term.screens.active;
+    var builder: std.Io.Writer.Allocating = .init(self.alloc);
+    defer builder.deinit();
+    if (screen.pages.getBottomRight(.viewport)) |bottom_right| {
+        screen.dumpString(&builder.writer, .{
+            .tl = screen.pages.getTopLeft(.viewport),
+            .br = bottom_right,
+            .unwrap = false,
+        }) catch return error.OutOfMemory;
+    }
+    return builder.toOwnedSliceSentinel(0);
+}
+
 /// Filter modifiers for native text translation. The original modifiers must
 /// still be passed to `key` so terminal encoding can apply Alt semantics.
 pub fn keyTranslationMods(
@@ -2712,6 +2739,33 @@ test "terminal surface word selection is local and refreshes after reflow" {
     try testing.expectEqual(@as(f64, 40), snapshot.end.x_px);
     try testing.expectEqual(@as(f64, 20), snapshot.end.y_px);
     try testing.expectEqual(@as(usize, 0), sink.calls);
+}
+
+test "terminal surface viewport rows are one line per row of the active screen" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 8,
+        .rows = 3,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+
+    testFeed(shared, "one\r\ntwo\r\nabcdefghij");
+    const primary = try surface.viewportRows();
+    defer surface.freeSelectedText(primary);
+    try testing.expectEqualStrings("two\nabcdefgh\nij", primary);
+
+    testFeed(shared, "\x1b[?1049h\x1b[2;1Halt");
+    const alternate = try surface.viewportRows();
+    defer surface.freeSelectedText(alternate);
+    try testing.expectEqualStrings("\nalt", alternate);
+
+    testFeed(shared, "\x1b[?2026h\x1b[1;1Hhalf");
+    try testing.expectError(error.MidUpdate, surface.viewportRows());
+    testFeed(shared, "\x1b[?2026l");
+    const complete = try surface.viewportRows();
+    defer surface.freeSelectedText(complete);
+    try testing.expectEqualStrings("half\nalt", complete);
 }
 
 test "terminal surface link selection preserves no-match and target ownership" {
