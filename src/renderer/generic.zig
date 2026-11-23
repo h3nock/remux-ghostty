@@ -18,6 +18,7 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
+const remux_frame_rows = @import("../remux/frame_rows.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -2025,6 +2026,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
             }
+
+            // Remux: the frame's rows travel with it to the layer that shows it.
+            if (@hasField(@TypeOf(frame.target), "frame_rows")) frame.target.frame_rows = remux_frame_rows.ofRenderer(self);
 
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);

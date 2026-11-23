@@ -243,9 +243,9 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
+        self.layer.setSurfaceSync(target.surface, target.frame_rows);
     } else {
-        try self.layer.setSurface(target.surface);
+        try self.layer.setSurface(target.surface, target.frame_rows);
     }
 }
 

@@ -8,6 +8,7 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const frame_rows = @import("../../remux/frame_rows.zig");
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
@@ -50,7 +51,7 @@ pub fn release(self: *IOSurfaceLayer) void {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, rows: frame_rows.FrameRows) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -63,6 +64,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .rows = rows,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -84,13 +86,15 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface, rows: frame_rows.FrameRows) void {
+    frame_rows.publish(self.layer, rows);
     self.layer.setProperty("contents", surface);
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    rows: frame_rows.FrameRows,
 }, .{}, void);
 
 fn setSurfaceCallback(
@@ -119,6 +123,7 @@ fn setSurfaceCallback(
         return;
     }
 
+    frame_rows.publish(layer, block.rows);
     layer.setProperty("contents", surface);
 }
 
