@@ -820,6 +820,22 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return .sent;
     }
 
+    export fn ghostty_terminal_surface_read_viewport_rows(
+        surface: ?*Surface,
+        out_ptr: ?*Text,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = emptyText();
+        const text = value.core.viewportRows() catch |err| return switch (err) {
+            error.MidUpdate => .consumed_no_output,
+            error.OutOfMemory => .out_of_memory,
+        };
+        out.text = text.ptr;
+        out.text_len = text.len;
+        return .sent;
+    }
+
     export fn ghostty_terminal_surface_free_text(
         surface: ?*Surface,
         text_ptr: ?*Text,
