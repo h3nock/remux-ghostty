@@ -1429,7 +1429,7 @@ fn scrollWithPointer(
         self.commitScrollPointerLocked(pointer);
         // A wheel report at another cell than the last reported motion leaves
         // that cell stale: forget it, so a move back to it still reports.
-        if (pointer != null and admission.result == .sent and
+        if (snapshot.route == .remote_mouse and admission.result == .sent and
             !std.meta.eql(self.interaction.last_reported_cell, admission.last_cell))
         {
             self.interaction.last_reported_cell = null;
@@ -3545,6 +3545,22 @@ test "terminal surface scroll at a pointer takes its modifiers and leaves motion
     try testing.expectEqual(InputResult.sent, surface.pointerPosition(15, 45, .{}));
     try testing.expectEqual(@as(usize, 1), sink.calls);
     try testing.expectEqualStrings("\x1b[<35;2;3M", sink.data[0..sink.len]);
+
+    // Also when a plain scroll completes the step a positioned one began there.
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
+    try testing.expectEqual(
+        InputResult.consumed_no_output,
+        surface.scrollAt(0, 10, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
+    );
+    sink.len = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 10, .{ .precision = true }));
+    try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
+    sink.calls = 0;
+    sink.len = 0;
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[<35;1;1M", sink.data[0..sink.len]);
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(15, 45, .{}));
 
     // A scroll that is invalid leaves the pointer where it was, whether its
     // delta can't be normalized or its reports wouldn't fit one payload.
