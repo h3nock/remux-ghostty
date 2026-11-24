@@ -1414,9 +1414,9 @@ fn scrollWithPointer(
         .remote_mouse => self.admitRemoteScroll(&snapshot),
         .viewport => unreachable,
     };
-    // An invalid scroll changes nothing. A valid one the program's side
-    // refuses still moves the pointer and starts its gesture, so the old
-    // remainder is gone. Wheel reports never become the cell that dedupes
+    // An invalid scroll leaves the pointer and the remainder as they were. A
+    // valid one the program's side refuses still moves the pointer and starts
+    // its gesture, so the old remainder is gone. Wheel reports never become the cell that dedupes
     // motion reports.
     if (admission.result != .invalid_input) {
         var selection_changed = false;
@@ -1583,7 +1583,6 @@ fn admitRepeated(
     self: *TerminalSurface,
     chunks: [2]RepeatedChunk,
 ) InputResult {
-    const sink = self.write_sink orelse return .unavailable;
     var len: usize = 0;
     for (chunks) |chunk| {
         const chunk_len = std.math.mul(usize, chunk.bytes.len, chunk.count) catch
@@ -1591,6 +1590,7 @@ fn admitRepeated(
         len = std.math.add(usize, len, chunk_len) catch return .invalid_input;
     }
     if (len == 0) return .consumed_no_output;
+    const sink = self.write_sink orelse return .unavailable;
 
     var stack: [256]u8 = undefined;
     var heap: ?[]u8 = null;
@@ -3492,6 +3492,31 @@ test "terminal surface scroll at a pointer position reports there without motion
         InputResult.invalid_input,
         surface.scrollAt(0, 20, .{ .precision = true }, std.math.nan(f64), 5, .{}),
     );
+}
+
+test "terminal surface oversized scroll is invalid also without a writer" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.flags.mouse_event = .any;
+    shared.terminal.flags.mouse_format = .sgr;
+    shared.mutex.unlock(global.io());
+
+    try testing.expectEqual(InputResult.unavailable, surface.pointerPosition(5, 5, .{}));
+    try testing.expectEqual(
+        InputResult.invalid_input,
+        surface.scrollAt(0, 1e20, .{ .precision = true }, 15, 45, .{}),
+    );
+    surface.shared.mutex.lockUncancelable(global.io());
+    defer surface.shared.mutex.unlock(global.io());
+    try testing.expectEqual(@as(f64, 5), surface.interaction.pointer.?.x);
 }
 
 test "terminal surface scroll at a pointer takes its modifiers and leaves motion reporting alone" {

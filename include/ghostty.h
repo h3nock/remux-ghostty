@@ -2069,8 +2069,10 @@ ghostty_terminal_surface_mouse_button(
 
 // Negative deltas are down/left and positive deltas are up/right. Precise input
 // is accumulated until it reaches a cell; non-precision input follows Ghostty's
-// platform wheel-tick behavior. Alternate-screen cursor input and remote wheel
-// reports each use at most one complete write_cb payload.
+// platform wheel-tick behavior. Momentum BEGAN marks a gesture's first event,
+// which starts from whole cells: what an earlier gesture left over is dropped.
+// Alternate-screen cursor input and remote wheel reports each use at most one
+// complete write_cb payload.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_mouse_scroll(
     ghostty_terminal_surface_t,
@@ -2108,11 +2110,13 @@ GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_read_selection(
     ghostty_terminal_surface_t,
     ghostty_text_s*);
-// Copies the rows the viewport shows as plain text, one line per whole row of
-// the grid, through the terminal-surface allocator. Rows at the end that hold
-// no written cells are left out; written spaces are kept. SENT means out contains owned text; release
-// it exactly once with terminal_surface_free_text. CONSUMED_NO_OUTPUT means
-// the program is inside a synchronized update and the rows are half drawn.
+// Copies the rows of the terminal's viewport as plain text, one line per whole
+// row of the grid, through the terminal-surface allocator. The viewport is the
+// terminal's grid, which can be taller than what the surface draws while the
+// two are resized. Rows at the end that hold no written cells are left out;
+// written spaces are kept. SENT means out contains owned text; release it
+// exactly once with terminal_surface_free_text. CONSUMED_NO_OUTPUT means the
+// program is inside a synchronized update and the rows are half drawn.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_read_viewport_rows(
     ghostty_terminal_surface_t,
