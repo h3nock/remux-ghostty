@@ -1382,14 +1382,18 @@ fn scrollWithPointer(
                 }
             }
         },
-        .alternate_screen_cursor => self.clearRemoteStateLocked(),
-        .remote_mouse => self.cancelLocalGestureLocked(),
+        .alternate_screen_cursor, .remote_mouse => {},
     }
 
     if (snapshot.route != .viewport and
         snapshot.x.delta == 0 and
         snapshot.y.delta == 0)
     {
+        switch (snapshot.route) {
+            .alternate_screen_cursor => self.clearRemoteStateLocked(),
+            .remote_mouse => self.cancelLocalGestureLocked(),
+            .viewport => unreachable,
+        }
         self.commitScrollPointerLocked(pointer);
         self.interaction.pending_scroll_x = snapshot.x.pending;
         self.interaction.pending_scroll_y = snapshot.y.pending;
@@ -1412,12 +1416,24 @@ fn scrollWithPointer(
     };
     // An invalid scroll changes nothing. A valid one the program's side
     // refuses still moves the pointer and starts its gesture, so the old
-    // remainder is gone. Wheel reports move no pointer, so they leave the
-    // cell that dedupes motion reports alone.
+    // remainder is gone. Wheel reports never become the cell that dedupes
+    // motion reports.
     if (admission.result != .invalid_input) {
         var selection_changed = false;
         self.shared.mutex.lockUncancelable(global.io());
+        switch (snapshot.route) {
+            .alternate_screen_cursor => self.clearRemoteStateLocked(),
+            .remote_mouse => self.cancelLocalGestureLocked(),
+            .viewport => unreachable,
+        }
         self.commitScrollPointerLocked(pointer);
+        // A wheel report at another cell than the last reported motion leaves
+        // that cell stale: forget it, so a move back to it still reports.
+        if (pointer != null and admission.result == .sent and
+            !std.meta.eql(self.interaction.last_reported_cell, admission.last_cell))
+        {
+            self.interaction.last_reported_cell = null;
+        }
         if (admission.result == .sent or admission.result == .consumed_no_output) {
             self.interaction.pending_scroll_x = snapshot.x.pending;
             self.interaction.pending_scroll_y = snapshot.y.pending;
@@ -1646,14 +1662,19 @@ pub fn viewportRows(self: *TerminalSurface) ViewportRowsError![:0]const u8 {
     defer builder.deinit();
     if (screen.pages.getBottomRight(.viewport)) |bottom_right| {
         // After a reflow the viewport pin can sit mid-row; the copy starts at
-        // the row's first column, as the renderer draws it.
+        // the row's first column, as the renderer draws it. The pins are
+        // already ordered, so the formatter takes them as they are rather than
+        // ordering a selection, which walks the history from its start.
         var top_left = screen.pages.getTopLeft(.viewport);
         top_left.x = 0;
-        screen.dumpString(&builder.writer, .{
-            .tl = top_left,
-            .br = bottom_right,
+        var formatter: terminal.formatter.PageListFormatter = .init(&screen.pages, .{
+            .emit = .plain,
             .unwrap = false,
-        }) catch return error.OutOfMemory;
+            .trim = false,
+        });
+        formatter.top_left = top_left;
+        formatter.bottom_right = bottom_right;
+        formatter.format(&builder.writer) catch return error.OutOfMemory;
     }
     return builder.toOwnedSliceSentinel(0);
 }
@@ -3497,6 +3518,24 @@ test "terminal surface scroll at a pointer takes its modifiers and leaves motion
         surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
     );
     try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
+
+    // A move back to the last motion's cell after a positioned scroll there
+    // elsewhere still reports.
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
+    sink.len = 0;
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
+    );
+    sink.calls = 0;
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{}));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[<35;1;1M", sink.data[0..sink.len]);
+    sink.len = 0;
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
+    );
 
     // Wheel reports moved no pointer, so a real move to their cell still reports,
     // also after a plain scroll there.
