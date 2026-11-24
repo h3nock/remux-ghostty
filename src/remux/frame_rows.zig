@@ -143,11 +143,17 @@ pub fn publish(layer: anytype, rows: FrameRows) void {
     const objc = @import("objc");
     const NSData = objc.getClass("NSData") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
+    // Most frames don't change the rows: leave the value, so an embedder observing it hears only of changes.
+    const key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*:0]const u8, layer_key)});
+    const current = layer.msgSend(objc.Object, "valueForKey:", .{key.value});
+    if (current.value != null and current.msgSend(c_ulong, "length", .{}) == @sizeOf(FrameRows)) {
+        const bytes = current.msgSend(?*const anyopaque, "bytes", .{});
+        if (bytes) |b| if (std.mem.eql(u8, @as([*]const u8, @ptrCast(b))[0..@sizeOf(FrameRows)], std.mem.asBytes(&rows))) return;
+    }
     const data = NSData.msgSend(objc.Object, "dataWithBytes:length:", .{
         @as(*const anyopaque, @ptrCast(&rows)),
         @as(c_ulong, @sizeOf(FrameRows)),
     });
-    const key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*:0]const u8, layer_key)});
     layer.msgSend(void, "setValue:forKey:", .{ data.value, key.value });
 }
 
