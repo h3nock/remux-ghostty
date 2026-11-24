@@ -2078,6 +2078,19 @@ ghostty_terminal_surface_mouse_scroll(
     double,
     ghostty_input_scroll_mods_t);
 
+// The same scroll with the pointer at (x, y), the last two arguments, in the
+// coordinates ghostty_terminal_surface_mouse_pos takes. The position becomes
+// the pointer's, but no motion is reported for it: a touch scroll carries the
+// finger's cell in each wheel report without moving a pointer.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_scroll_at(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_input_scroll_mods_t,
+    double,
+    double);
+
 // Pressure is a local selection affordance only; it is never reported to a
 // terminal application.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
