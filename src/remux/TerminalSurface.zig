@@ -1262,11 +1262,12 @@ pub fn scroll(
     return self.scrollWithPointer(xoff, yoff, scroll_mods, null);
 }
 
-/// Scroll with the pointer at (x, y). The position becomes the pointer's, as
-/// with pointerPosition, but no motion is reported for it: a touch scroll
-/// carries the finger's cell in each wheel report without moving a pointer,
-/// so a program that scrolls only the region under the pointer follows the
-/// finger, and no hover or motion handling runs on the way.
+/// Scroll with the pointer at (x, y) and the keyboard modifiers `mods`. Both
+/// become the pointer's, as with pointerPosition, but no motion is reported
+/// for the move: a touch scroll carries the finger's cell in each wheel
+/// report without moving a pointer, so a program that scrolls only the
+/// region under the pointer follows the finger, and no hover or motion
+/// handling runs on the way.
 pub fn scrollAt(
     self: *TerminalSurface,
     xoff: f64,
@@ -1274,22 +1275,28 @@ pub fn scrollAt(
     scroll_mods: input.ScrollMods,
     x: f64,
     y: f64,
+    mods: input.Mods,
 ) InputResult {
     if (!self.validPointerCoordinates(x, y)) {
         return .invalid_input;
     }
     return self.scrollWithPointer(xoff, yoff, scroll_mods, .{
-        .x = @floatCast(x),
-        .y = @floatCast(y),
+        .pos = .{ .x = @floatCast(x), .y = @floatCast(y) },
+        .mods = mods,
     });
 }
+
+const ScrollPointer = struct {
+    pos: input.mouse_encode.Event.Pos,
+    mods: input.Mods,
+};
 
 fn scrollWithPointer(
     self: *TerminalSurface,
     xoff: f64,
     yoff: f64,
     scroll_mods: input.ScrollMods,
-    pointer: ?input.mouse_encode.Event.Pos,
+    pointer: ?ScrollPointer,
 ) InputResult {
     if (!std.math.isFinite(xoff) or !std.math.isFinite(yoff)) {
         return .invalid_input;
@@ -1299,7 +1306,6 @@ fn scrollWithPointer(
     var snapshot: ScrollSnapshot = undefined;
     self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
-    if (pointer) |pos| self.interaction.pointer = pos;
     // A gesture's first event carries momentum `.began`. It starts from whole cells: travel left over from an
     // earlier gesture would otherwise delay this gesture's first step, or cancel it when the direction reverses.
     const gesture_began = scroll_mods.momentum == .began;
@@ -1334,6 +1340,16 @@ fn scrollWithPointer(
         self.shared.mutex.unlock(global.io());
         return .invalid_input;
     };
+    // Valid from here: the gesture's start and its pointer take effect even if
+    // the program's side refuses this first report.
+    if (gesture_began) {
+        self.interaction.pending_scroll_x = 0;
+        self.interaction.pending_scroll_y = 0;
+    }
+    if (pointer) |given| {
+        self.interaction.pointer = given.pos;
+        self.interaction.mods = given.mods.binding();
+    }
     const interaction_state = self.normalizeAndSnapshotInteractionLocked();
 
     snapshot = .{
@@ -1409,7 +1425,9 @@ fn scrollWithPointer(
         self.shared.mutex.lockUncancelable(global.io());
         self.interaction.pending_scroll_x = snapshot.x.pending;
         self.interaction.pending_scroll_y = snapshot.y.pending;
-        if (snapshot.route == .remote_mouse and admission.result == .sent) {
+        // The last reported cell dedupes motion reports; a wheel report at a
+        // given pointer moved no pointer, so the next real motion still reports.
+        if (snapshot.route == .remote_mouse and admission.result == .sent and pointer == null) {
             self.interaction.last_reported_cell = admission.last_cell;
         }
         if (snapshot.route == .remote_mouse or snapshot.y.delta != 0) {
@@ -1612,8 +1630,8 @@ pub fn freeSelectedText(
 pub const ViewportRowsError = error{ MidUpdate, OutOfMemory };
 
 /// Copy the rows the viewport shows as plain text while holding
-/// Shared.mutex: one line per row, soft wraps kept as separate lines, blank
-/// rows at the end left out. Comparing two copies shows how far a program
+/// Shared.mutex: one line per whole row of the grid, soft wraps kept as
+/// separate lines, blank rows at the end left out. Comparing two copies shows how far a program
 /// moved what it draws, so inside a synchronized update (mode 2026) this
 /// returns MidUpdate rather than a half-drawn copy. The caller owns the
 /// returned sentinel slice and releases it through freeSelectedText.
@@ -1626,8 +1644,12 @@ pub fn viewportRows(self: *TerminalSurface) ViewportRowsError![:0]const u8 {
     var builder: std.Io.Writer.Allocating = .init(self.alloc);
     defer builder.deinit();
     if (screen.pages.getBottomRight(.viewport)) |bottom_right| {
+        // After a reflow the viewport pin can sit mid-row; the copy starts at
+        // the row's first column, as the renderer draws it.
+        var top_left = screen.pages.getTopLeft(.viewport);
+        top_left.x = 0;
         screen.dumpString(&builder.writer, .{
-            .tl = screen.pages.getTopLeft(.viewport),
+            .tl = top_left,
             .br = bottom_right,
             .unwrap = false,
         }) catch return error.OutOfMemory;
@@ -3433,7 +3455,7 @@ test "terminal surface scroll at a pointer position reports there without motion
     sink.len = 0;
     try testing.expectEqual(
         InputResult.sent,
-        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45),
+        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
     );
     try testing.expectEqual(@as(usize, 1), sink.calls);
     try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
@@ -3446,6 +3468,104 @@ test "terminal surface scroll at a pointer position reports there without motion
 
     try testing.expectEqual(
         InputResult.invalid_input,
-        surface.scrollAt(0, 20, .{ .precision = true }, std.math.nan(f64), 5),
+        surface.scrollAt(0, 20, .{ .precision = true }, std.math.nan(f64), 5, .{}),
     );
+}
+
+test "terminal surface scroll at a pointer takes its modifiers and leaves motion reporting alone" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.flags.mouse_event = .any;
+    shared.terminal.flags.mouse_format = .sgr;
+    shared.mutex.unlock(global.io());
+
+    // A Ctrl-held move leaves Ctrl on the pointer; the scroll's own modifiers replace it.
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(5, 5, .{ .ctrl = true }));
+    sink.len = 0;
+    try testing.expectEqual(
+        InputResult.sent,
+        surface.scrollAt(0, 20, .{ .precision = true, .momentum = .began }, 15, 45, .{}),
+    );
+    try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
+
+    // The wheel report moved no pointer, so a real move to its cell still reports.
+    sink.calls = 0;
+    sink.len = 0;
+    try testing.expectEqual(InputResult.sent, surface.pointerPosition(15, 45, .{}));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("\x1b[<35;2;3M", sink.data[0..sink.len]);
+
+    // A scroll that is refused leaves the pointer where it was.
+    sink.len = 0;
+    try testing.expectEqual(
+        InputResult.invalid_input,
+        surface.scrollAt(0, 1e300, .{ .precision = true }, 5, 5, .{}),
+    );
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 20, .{ .precision = true, .momentum = .began }));
+    try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
+}
+
+test "terminal surface scroll gesture start clears the old remainder even when its first report is refused" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 100,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.flags.mouse_event = .normal;
+    shared.terminal.flags.mouse_format = .sgr;
+    shared.mutex.unlock(global.io());
+    try testing.expectEqual(InputResult.consumed_no_output, surface.pointerPosition(5, 5, .{}));
+
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, 15, .{ .precision = true }));
+    sink.accept = false;
+    try testing.expectEqual(
+        InputResult.not_accepted,
+        surface.scroll(0, -20, .{ .precision = true, .momentum = .began }),
+    );
+    sink.accept = true;
+    sink.calls = 0;
+    sink.len = 0;
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, -20, .{ .precision = true }));
+    try testing.expectEqualStrings("\x1b[<65;1;1M", sink.data[0..sink.len]);
+}
+
+test "terminal surface viewport rows start at the row's first column after a reflow" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 4,
+        .rows = 1,
+        .max_scrollback_bytes = 1000,
+    });
+    defer shared.release();
+    var surface = testSurface(testing.allocator, shared, null);
+
+    testFeed(shared, "abcdefgh\r\nxy");
+    shared.mutex.lockUncancelable(global.io());
+    shared.terminal.scrollViewport(.{ .delta = -1 });
+    shared.mutex.unlock(global.io());
+    const before = try surface.viewportRows();
+    defer surface.freeSelectedText(before);
+    try testing.expectEqualStrings("efgh", before);
+
+    shared.mutex.lockUncancelable(global.io());
+    try shared.terminal.resize(testing.allocator, .{ .cols = 8, .rows = 1 });
+    shared.mutex.unlock(global.io());
+    const after = try surface.viewportRows();
+    defer surface.freeSelectedText(after);
+    try testing.expectEqualStrings("abcdefgh", after);
 }

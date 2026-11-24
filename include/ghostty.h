@@ -2078,9 +2078,9 @@ ghostty_terminal_surface_mouse_scroll(
     double,
     ghostty_input_scroll_mods_t);
 
-// The same scroll with the pointer at (x, y), the last two arguments, in the
-// coordinates ghostty_terminal_surface_mouse_pos takes. The position becomes
-// the pointer's, but no motion is reported for it: a touch scroll carries the
+// The same scroll with the pointer at (x, y) and the keyboard modifiers given
+// after it, as ghostty_terminal_surface_mouse_pos takes them. Both become the
+// pointer's, but no motion is reported for the move: a touch scroll carries the
 // finger's cell in each wheel report without moving a pointer.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_mouse_scroll_at(
@@ -2089,7 +2089,8 @@ ghostty_terminal_surface_mouse_scroll_at(
     double,
     ghostty_input_scroll_mods_t,
     double,
-    double);
+    double,
+    ghostty_input_mods_e);
 
 // Pressure is a local selection affordance only; it is never reported to a
 // terminal application.
@@ -2107,8 +2108,9 @@ GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_read_selection(
     ghostty_terminal_surface_t,
     ghostty_text_s*);
-// Copies the rows the viewport shows as plain text, one line per row, through
-// the terminal-surface allocator. SENT means out contains owned text; release
+// Copies the rows the viewport shows as plain text, one line per whole row of
+// the grid with blank rows at the end left out, through the terminal-surface
+// allocator. SENT means out contains owned text; release
 // it exactly once with terminal_surface_free_text. CONSUMED_NO_OUTPUT means
 // the program is inside a synchronized update and the rows are half drawn.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
