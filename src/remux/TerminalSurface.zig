@@ -1286,6 +1286,16 @@ pub fn scrollAt(
     });
 }
 
+/// A scroll gesture begins: travel an earlier gesture left short of a cell is
+/// dropped, so the gesture's first step comes after a whole cell of its own
+/// travel, in its own direction. A coast continues its drag's gesture.
+pub fn beginScrollGesture(self: *TerminalSurface) void {
+    self.shared.mutex.lockUncancelable(global.io());
+    defer self.shared.mutex.unlock(global.io());
+    self.interaction.pending_scroll_x = 0;
+    self.interaction.pending_scroll_y = 0;
+}
+
 const ScrollPointer = struct {
     pos: input.mouse_encode.Event.Pos,
     mods: input.Mods,
@@ -1306,12 +1316,9 @@ fn scrollWithPointer(
     var snapshot: ScrollSnapshot = undefined;
     self.shared.mutex.lockUncancelable(global.io());
     const term = &self.shared.terminal;
-    // A gesture's first event carries momentum `.began`. It starts from whole cells: travel left over from an
-    // earlier gesture would otherwise delay this gesture's first step, or cancel it when the direction reverses.
-    const gesture_began = scroll_mods.momentum == .began;
     const x = normalizeScrollAxis(
         xoff,
-        if (gesture_began) 0 else self.interaction.pending_scroll_x,
+        self.interaction.pending_scroll_x,
         self.size.cell.width,
         if (scroll_mods.precision) 1 else 0,
         scroll_mods.precision,
@@ -1332,7 +1339,7 @@ fn scrollWithPointer(
         yoff;
     const y = normalizeScrollAxis(
         normalized_yoff,
-        if (gesture_began) 0 else self.interaction.pending_scroll_y,
+        self.interaction.pending_scroll_y,
         self.size.cell.height,
         y_multiplier,
         scroll_mods.precision,
@@ -1415,9 +1422,8 @@ fn scrollWithPointer(
         .viewport => unreachable,
     };
     // An invalid scroll leaves the pointer and the remainder as they were. A
-    // valid one the program's side refuses still moves the pointer and starts
-    // its gesture, so the old remainder is gone. Wheel reports never become the cell that dedupes
-    // motion reports.
+    // valid one the program's side refuses still moves the pointer. Wheel
+    // reports never become the cell that dedupes motion reports.
     if (admission.result != .invalid_input) {
         var selection_changed = false;
         self.shared.mutex.lockUncancelable(global.io());
@@ -1440,9 +1446,6 @@ fn scrollWithPointer(
             if (snapshot.route == .remote_mouse or snapshot.y.delta != 0) {
                 selection_changed = self.clearSelectionLocked();
             }
-        } else if (gesture_began) {
-            self.interaction.pending_scroll_x = 0;
-            self.interaction.pending_scroll_y = 0;
         }
         self.shared.mutex.unlock(global.io());
         if (selection_changed) self.committedStateChanged();
@@ -3361,9 +3364,10 @@ test "terminal surface scroll routing concatenation and remainders" {
         surface.scroll(0, 15, .{ .precision = true }),
     );
     try testing.expectEqual(@as(f64, 15), surface.interaction.pending_scroll_y);
+    surface.beginScrollGesture();
     try testing.expectEqual(
         InputResult.sent,
-        surface.scroll(0, -20, .{ .precision = true, .momentum = .began }),
+        surface.scroll(0, -20, .{ .precision = true }),
     );
     try testing.expectEqual(@as(f64, 0), surface.interaction.pending_scroll_y);
     try testing.expectEqual(@as(usize, 1), sink.calls);
@@ -3602,7 +3606,7 @@ test "terminal surface scroll at a pointer takes its modifiers and leaves motion
     try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
 }
 
-test "terminal surface scroll gesture start clears the old remainder even when its first report is refused" {
+test "terminal surface scroll gesture start drops the old remainder and a coast keeps it" {
     const testing = std.testing;
     const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 10,
@@ -3619,14 +3623,17 @@ test "terminal surface scroll gesture start clears the old remainder even when i
     shared.mutex.unlock(global.io());
     try testing.expectEqual(InputResult.consumed_no_output, surface.pointerPosition(5, 5, .{}));
 
+    // A drag of three quarters of a cell, then the coast's first quarter: one step.
     try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, 15, .{ .precision = true }));
-    sink.accept = false;
     try testing.expectEqual(
-        InputResult.not_accepted,
-        surface.scroll(0, -20, .{ .precision = true, .momentum = .began }),
+        InputResult.sent,
+        surface.scroll(0, 5, .{ .precision = true, .momentum = .began }),
     );
-    sink.accept = true;
-    sink.calls = 0;
+    try testing.expectEqualStrings("\x1b[<64;1;1M", sink.data[0..sink.len]);
+
+    // A new gesture back the other way starts from whole cells.
+    try testing.expectEqual(InputResult.consumed_no_output, surface.scroll(0, 15, .{ .precision = true }));
+    surface.beginScrollGesture();
     sink.len = 0;
     try testing.expectEqual(InputResult.sent, surface.scroll(0, -20, .{ .precision = true }));
     try testing.expectEqualStrings("\x1b[<65;1;1M", sink.data[0..sink.len]);

@@ -2068,9 +2068,8 @@ ghostty_terminal_surface_mouse_button(
     ghostty_input_mods_e);
 
 // Negative deltas are down/left and positive deltas are up/right. Precise input
-// is accumulated until it reaches a cell; non-precision input follows Ghostty's
-// platform wheel-tick behavior. Momentum BEGAN marks a gesture's first event,
-// which starts from whole cells: what an earlier gesture left over is dropped.
+// is accumulated until it reaches a cell, across a drag and its coast;
+// non-precision input follows Ghostty's platform wheel-tick behavior.
 // Alternate-screen cursor input and remote wheel reports each use at most one
 // complete write_cb payload.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
@@ -2079,6 +2078,12 @@ ghostty_terminal_surface_mouse_scroll(
     double,
     double,
     ghostty_input_scroll_mods_t);
+
+// A scroll gesture begins, such as a touch's drag: precise travel an earlier
+// gesture left short of a cell is dropped, so the first step needs a whole
+// cell of this gesture's own travel. A coast continues its drag's gesture.
+GHOSTTY_API void ghostty_terminal_surface_mouse_scroll_begin(
+    ghostty_terminal_surface_t);
 
 // The same scroll with the pointer at (x, y) and the keyboard modifiers given
 // after it, as ghostty_terminal_surface_mouse_pos takes them. Both become the
