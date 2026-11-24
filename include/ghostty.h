@@ -2068,15 +2068,36 @@ ghostty_terminal_surface_mouse_button(
     ghostty_input_mods_e);
 
 // Negative deltas are down/left and positive deltas are up/right. Precise input
-// is accumulated until it reaches a cell; non-precision input follows Ghostty's
-// platform wheel-tick behavior. Alternate-screen cursor input and remote wheel
-// reports each use at most one complete write_cb payload.
+// is accumulated until it reaches a cell, across a drag and its coast;
+// non-precision input follows Ghostty's platform wheel-tick behavior.
+// Alternate-screen cursor input and remote wheel reports each use at most one
+// complete write_cb payload.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_mouse_scroll(
     ghostty_terminal_surface_t,
     double,
     double,
     ghostty_input_scroll_mods_t);
+
+// A scroll gesture begins, such as a touch's drag: precise travel an earlier
+// gesture left short of a cell is dropped, so the first step needs a whole
+// cell of this gesture's own travel. A coast continues its drag's gesture.
+GHOSTTY_API void ghostty_terminal_surface_mouse_scroll_begin(
+    ghostty_terminal_surface_t);
+
+// The same scroll with the pointer at (x, y) and the keyboard modifiers given
+// after it, as ghostty_terminal_surface_mouse_pos takes them. Both become the
+// pointer's, but no motion is reported for the move: a touch scroll carries the
+// finger's cell in each wheel report without moving a pointer.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_mouse_scroll_at(
+    ghostty_terminal_surface_t,
+    double,
+    double,
+    ghostty_input_scroll_mods_t,
+    double,
+    double,
+    ghostty_input_mods_e);
 
 // Pressure is a local selection affordance only; it is never reported to a
 // terminal application.
@@ -2092,6 +2113,17 @@ ghostty_terminal_surface_mouse_pressure(
 // freeing the owning terminal surface.
 GHOSTTY_API ghostty_terminal_surface_input_result_e
 ghostty_terminal_surface_read_selection(
+    ghostty_terminal_surface_t,
+    ghostty_text_s*);
+// Copies the rows of the terminal's viewport as plain text, one line per whole
+// row of the grid, through the terminal-surface allocator. The viewport is the
+// terminal's grid, which can be taller than what the surface draws while the
+// two are resized. Rows at the end that hold no written cells are left out;
+// written spaces are kept. SENT means out contains owned text; release it
+// exactly once with terminal_surface_free_text. CONSUMED_NO_OUTPUT means the
+// program is inside a synchronized update and the rows are half drawn.
+GHOSTTY_API ghostty_terminal_surface_input_result_e
+ghostty_terminal_surface_read_viewport_rows(
     ghostty_terminal_surface_t,
     ghostty_text_s*);
 GHOSTTY_API ghostty_terminal_surface_input_result_e

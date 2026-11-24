@@ -794,6 +794,26 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return value.core.scroll(x, y, mods);
     }
 
+    export fn ghostty_terminal_surface_mouse_scroll_begin(surface: ?*Surface) void {
+        const value = surface orelse return;
+        value.core.beginScrollGesture();
+    }
+
+    export fn ghostty_terminal_surface_mouse_scroll_at(
+        surface: ?*Surface,
+        x: f64,
+        y: f64,
+        scroll_mods_raw: c_int,
+        pointer_x: f64,
+        pointer_y: f64,
+        mods_raw: c_int,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const scroll_mods = scrollMods(scroll_mods_raw) orelse return .invalid_input;
+        const mods = inputMods(mods_raw) orelse return .invalid_input;
+        return value.core.scrollAt(x, y, scroll_mods, pointer_x, pointer_y, mods);
+    }
+
     export fn ghostty_terminal_surface_mouse_pressure(
         surface: ?*Surface,
         stage_raw: u32,
@@ -813,6 +833,22 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         out.* = emptyText();
         const text = value.core.selectedText() catch |err| return switch (err) {
             error.NoSelection => .consumed_no_output,
+            error.OutOfMemory => .out_of_memory,
+        };
+        out.text = text.ptr;
+        out.text_len = text.len;
+        return .sent;
+    }
+
+    export fn ghostty_terminal_surface_read_viewport_rows(
+        surface: ?*Surface,
+        out_ptr: ?*Text,
+    ) InputResult {
+        const value = surface orelse return .invalid_input;
+        const out = out_ptr orelse return .invalid_input;
+        out.* = emptyText();
+        const text = value.core.viewportRows() catch |err| return switch (err) {
+            error.MidUpdate => .consumed_no_output,
             error.OutOfMemory => .out_of_memory,
         };
         out.text = text.ptr;
