@@ -2109,8 +2109,8 @@ ghostty_terminal_surface_read_selection(
     ghostty_terminal_surface_t,
     ghostty_text_s*);
 // Copies the rows the viewport shows as plain text, one line per whole row of
-// the grid with blank rows at the end left out, through the terminal-surface
-// allocator. SENT means out contains owned text; release
+// the grid, through the terminal-surface allocator. Rows at the end that hold
+// no written cells are left out; written spaces are kept. SENT means out contains owned text; release
 // it exactly once with terminal_surface_free_text. CONSUMED_NO_OUTPUT means
 // the program is inside a synchronized update and the rows are half drawn.
 GHOSTTY_API ghostty_terminal_surface_input_result_e

@@ -1340,24 +1340,14 @@ fn scrollWithPointer(
         self.shared.mutex.unlock(global.io());
         return .invalid_input;
     };
-    // Valid from here: the gesture's start and its pointer take effect even if
-    // the program's side refuses this first report.
-    if (gesture_began) {
-        self.interaction.pending_scroll_x = 0;
-        self.interaction.pending_scroll_y = 0;
-    }
-    if (pointer) |given| {
-        self.interaction.pointer = given.pos;
-        self.interaction.mods = given.mods.binding();
-    }
     const interaction_state = self.normalizeAndSnapshotInteractionLocked();
 
     snapshot = .{
         .route = interaction_state.route,
         .x = x,
         .y = y,
-        .pointer = self.interaction.pointer,
-        .mods = self.interaction.mods,
+        .pointer = if (pointer) |given| given.pos else self.interaction.pointer,
+        .mods = if (pointer) |given| given.mods.binding() else self.interaction.mods,
         .opts = .fromTerminal(term, self.size),
         .last_cell = self.interaction.last_reported_cell,
         .any_button_pressed = self.interaction.reported_pressed.count() != 0,
@@ -1367,6 +1357,7 @@ fn scrollWithPointer(
     switch (snapshot.route) {
         .viewport => {
             self.clearRemoteStateLocked();
+            self.commitScrollPointerLocked(pointer);
             self.interaction.pending_scroll_x = x.pending;
             self.interaction.pending_scroll_y = y.pending;
             if (y.delta != 0) {
@@ -1399,6 +1390,7 @@ fn scrollWithPointer(
         snapshot.x.delta == 0 and
         snapshot.y.delta == 0)
     {
+        self.commitScrollPointerLocked(pointer);
         self.interaction.pending_scroll_x = snapshot.x.pending;
         self.interaction.pending_scroll_y = snapshot.y.pending;
         self.shared.mutex.unlock(global.io());
@@ -1418,25 +1410,34 @@ fn scrollWithPointer(
         .remote_mouse => self.admitRemoteScroll(&snapshot),
         .viewport => unreachable,
     };
-    if (admission.result == .sent or
-        admission.result == .consumed_no_output)
-    {
+    // An invalid scroll changes nothing. A valid one the program's side
+    // refuses still moves the pointer and starts its gesture, so the old
+    // remainder is gone. Wheel reports move no pointer, so they leave the
+    // cell that dedupes motion reports alone.
+    if (admission.result != .invalid_input) {
         var selection_changed = false;
         self.shared.mutex.lockUncancelable(global.io());
-        self.interaction.pending_scroll_x = snapshot.x.pending;
-        self.interaction.pending_scroll_y = snapshot.y.pending;
-        // The last reported cell dedupes motion reports; a wheel report at a
-        // given pointer moved no pointer, so the next real motion still reports.
-        if (snapshot.route == .remote_mouse and admission.result == .sent and pointer == null) {
-            self.interaction.last_reported_cell = admission.last_cell;
-        }
-        if (snapshot.route == .remote_mouse or snapshot.y.delta != 0) {
-            selection_changed = self.clearSelectionLocked();
+        self.commitScrollPointerLocked(pointer);
+        if (admission.result == .sent or admission.result == .consumed_no_output) {
+            self.interaction.pending_scroll_x = snapshot.x.pending;
+            self.interaction.pending_scroll_y = snapshot.y.pending;
+            if (snapshot.route == .remote_mouse or snapshot.y.delta != 0) {
+                selection_changed = self.clearSelectionLocked();
+            }
+        } else if (gesture_began) {
+            self.interaction.pending_scroll_x = 0;
+            self.interaction.pending_scroll_y = 0;
         }
         self.shared.mutex.unlock(global.io());
         if (selection_changed) self.committedStateChanged();
     }
     return admission.result;
+}
+
+fn commitScrollPointerLocked(self: *TerminalSurface, pointer: ?ScrollPointer) void {
+    const given = pointer orelse return;
+    self.interaction.pointer = given.pos;
+    self.interaction.mods = given.mods.binding();
 }
 
 fn normalizeScrollAxis(
@@ -1631,7 +1632,7 @@ pub const ViewportRowsError = error{ MidUpdate, OutOfMemory };
 
 /// Copy the rows the viewport shows as plain text while holding
 /// Shared.mutex: one line per whole row of the grid, soft wraps kept as
-/// separate lines, blank rows at the end left out. Comparing two copies shows how far a program
+/// separate lines, rows at the end with no written cells left out. Comparing two copies shows how far a program
 /// moved what it draws, so inside a synchronized update (mode 2026) this
 /// returns MidUpdate rather than a half-drawn copy. The caller owns the
 /// returned sentinel slice and releases it through freeSelectedText.
@@ -3497,18 +3498,25 @@ test "terminal surface scroll at a pointer takes its modifiers and leaves motion
     );
     try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
 
-    // The wheel report moved no pointer, so a real move to its cell still reports.
+    // Wheel reports moved no pointer, so a real move to their cell still reports,
+    // also after a plain scroll there.
+    try testing.expectEqual(InputResult.sent, surface.scroll(0, 20, .{ .precision = true }));
     sink.calls = 0;
     sink.len = 0;
     try testing.expectEqual(InputResult.sent, surface.pointerPosition(15, 45, .{}));
     try testing.expectEqual(@as(usize, 1), sink.calls);
     try testing.expectEqualStrings("\x1b[<35;2;3M", sink.data[0..sink.len]);
 
-    // A scroll that is refused leaves the pointer where it was.
+    // A scroll that is invalid leaves the pointer where it was, whether its
+    // delta can't be normalized or its reports wouldn't fit one payload.
     sink.len = 0;
     try testing.expectEqual(
         InputResult.invalid_input,
         surface.scrollAt(0, 1e300, .{ .precision = true }, 5, 5, .{}),
+    );
+    try testing.expectEqual(
+        InputResult.invalid_input,
+        surface.scrollAt(0, 1e20, .{ .precision = true }, 5, 5, .{}),
     );
     try testing.expectEqual(InputResult.sent, surface.scroll(0, 20, .{ .precision = true, .momentum = .began }));
     try testing.expectEqualStrings("\x1b[<64;2;3M", sink.data[0..sink.len]);
