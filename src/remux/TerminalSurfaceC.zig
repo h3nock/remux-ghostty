@@ -99,6 +99,8 @@ pub const Config = extern struct {
     height_px: u32 = 0,
     visible: bool = true,
     focused: bool = true,
+    plain_legacy_keys: bool = false,
+    shift_enter_line_feed: bool = false,
 };
 
 pub const SurfaceSize = extern struct {
@@ -466,6 +468,8 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
                 app.keyboardLayout().detectOptionAsAlt(),
             .visible = config.visible,
             .focused = config.focused,
+            .plain_legacy_keys = config.plain_legacy_keys,
+            .shift_enter_line_feed = config.shift_enter_line_feed,
         });
         return surface;
     }

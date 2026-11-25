@@ -26,6 +26,9 @@ size: rendererpkg.Size,
 shared: *Shared,
 write_sink: ?WriteSink,
 macos_option_as_alt: input.OptionAsAlt,
+/// See `plainLegacyKey`. Fixed at creation by the host.
+plain_legacy_keys: bool,
+shift_enter_line_feed: bool,
 vt_kam_allowed: bool,
 selection_clear_on_typing: bool,
 scroll_to_bottom_on_keystroke: bool,
@@ -183,6 +186,8 @@ pub const Options = struct {
     macos_option_as_alt: input.OptionAsAlt = .false,
     visible: bool = true,
     focused: bool = true,
+    plain_legacy_keys: bool = false,
+    shift_enter_line_feed: bool = false,
 };
 
 pub const UpdateConfigOptions = struct {
@@ -222,6 +227,8 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .shared = shared,
         .write_sink = opts.write_sink,
         .macos_option_as_alt = opts.macos_option_as_alt,
+        .plain_legacy_keys = opts.plain_legacy_keys,
+        .shift_enter_line_feed = opts.shift_enter_line_feed,
         .vt_kam_allowed = opts.config.@"vt-kam-allowed",
         .selection_clear_on_typing = opts.config.@"selection-clear-on-typing",
         .scroll_to_bottom_on_keystroke = opts.config.@"scroll-to-bottom".keystroke,
@@ -1718,6 +1725,18 @@ pub fn key(
 
     const sink = self.write_sink orelse return .unavailable;
 
+    if (self.plain_legacy_keys and
+        encoding_opts.kitty_flags.int() == 0 and
+        !encoding_opts.modify_other_keys_state_2)
+    {
+        var plain: [4]u8 = undefined;
+        if (plainLegacyKey(event, self.shift_enter_line_feed, &plain)) |encoded| {
+            if (!sink.write(encoded)) return .not_accepted;
+            self.acceptedKey(event.key);
+            return .sent;
+        }
+    }
+
     // This matches the established process-surface fast path and contains
     // ordinary legacy and Kitty key encodings without allocation.
     var stack: [38]u8 = undefined;
@@ -1732,6 +1751,56 @@ pub fn key(
 
     self.acceptedKey(event.key);
     return .sent;
+}
+
+/// What a plain terminal writes (xterm's defaults, which tmux also sends to a
+/// pane) for the modified keys that Ghostty's legacy encoding gives fixterms
+/// forms: Ctrl or Shift with Escape, Tab or Enter, and Ctrl+Shift+letter. Alt
+/// still puts ESC first. Null where the ordinary encoder already agrees.
+fn plainLegacyKey(
+    event: input.KeyEvent,
+    shift_enter_line_feed: bool,
+    buf: *[4]u8,
+) ?[]const u8 {
+    if (event.action != .press and event.action != .repeat) return null;
+    if (event.composing) return null;
+    const mods = event.mods;
+    if (mods.super or !(mods.ctrl or mods.shift)) return null;
+
+    var len: usize = 0;
+    if (mods.alt) {
+        buf[0] = 0x1B;
+        len = 1;
+    }
+    switch (event.key) {
+        .escape => {
+            buf[len] = 0x1B;
+            len += 1;
+        },
+        .tab => if (mods.shift) {
+            @memcpy(buf[len..][0..3], "\x1B[Z");
+            len += 3;
+        } else {
+            buf[len] = '\t';
+            len += 1;
+        },
+        .enter => {
+            buf[len] = if (mods.shift and !mods.ctrl and shift_enter_line_feed) '\n' else '\r';
+            len += 1;
+        },
+        else => {
+            if (!(mods.ctrl and mods.shift)) return null;
+            const letter: u21 = letter: {
+                const cp = event.unshifted_codepoint;
+                if (cp >= 'a' and cp <= 'z') break :letter cp;
+                if (cp >= 'A' and cp <= 'Z') break :letter cp + 0x20;
+                return null;
+            };
+            buf[len] = @intCast(letter - 'a' + 1);
+            len += 1;
+        },
+    }
+    return buf[0..len];
 }
 
 fn keyLong(
@@ -1942,6 +2011,8 @@ fn testSurface(
         .shared = shared,
         .write_sink = write_sink,
         .macos_option_as_alt = .false,
+        .plain_legacy_keys = false,
+        .shift_enter_line_feed = false,
         .vt_kam_allowed = false,
         .selection_clear_on_typing = true,
         .scroll_to_bottom_on_keystroke = true,
@@ -2157,6 +2228,82 @@ test "terminal surface key admission contract" {
     try testing.expectEqualStrings(long, sink.data[0..sink.len]);
     try testing.expectEqual(@as(usize, 1), tracking.allocations);
     try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+}
+
+test "terminal surface plain legacy keys" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    const Case = struct { key: input.Key, mods: input.Mods, utf8: []const u8 = "", unshifted: u21 = 0, want: []const u8 };
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const shift: input.Mods = .{ .shift = true };
+    const alt_shift: input.Mods = .{ .alt = true, .shift = true };
+    const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
+    const ctrl_alt_shift: input.Mods = .{ .ctrl = true, .alt = true, .shift = true };
+
+    // Off, the ordinary encoder's fixterms forms stand.
+    try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .escape, .mods = ctrl }));
+    try testing.expectEqualStrings("\x1b[27;5;27~", sink.data[0..sink.len]);
+
+    surface.plain_legacy_keys = true;
+    surface.shift_enter_line_feed = true;
+    surface.macos_option_as_alt = .true;
+    const cases = [_]Case{
+        .{ .key = .escape, .mods = ctrl, .want = "\x1b" },
+        .{ .key = .escape, .mods = shift, .want = "\x1b" },
+        .{ .key = .escape, .mods = alt_shift, .want = "\x1b\x1b" },
+        .{ .key = .tab, .mods = ctrl, .want = "\t" },
+        .{ .key = .tab, .mods = shift, .want = "\x1b[Z" },
+        .{ .key = .tab, .mods = ctrl_shift, .want = "\x1b[Z" },
+        .{ .key = .enter, .mods = shift, .want = "\n" },
+        .{ .key = .enter, .mods = ctrl, .want = "\r" },
+        .{ .key = .enter, .mods = alt_shift, .want = "\x1b\n" },
+        .{ .key = .key_c, .mods = ctrl_shift, .utf8 = "C", .unshifted = 'c', .want = "\x03" },
+        .{ .key = .key_c, .mods = ctrl_alt_shift, .utf8 = "C", .unshifted = 'c', .want = "\x1b\x03" },
+        // Keys the ordinary encoder already sends plainly.
+        .{ .key = .key_c, .mods = ctrl, .utf8 = "c", .unshifted = 'c', .want = "\x03" },
+        .{ .key = .enter, .mods = .{}, .want = "\r" },
+        .{ .key = .enter, .mods = .{ .alt = true }, .want = "\x1b\r" },
+        .{ .key = .key_p, .mods = .{ .alt = true }, .utf8 = "p", .unshifted = 'p', .want = "\x1bp" },
+        .{ .key = .key_p, .mods = alt_shift, .utf8 = "P", .unshifted = 'p', .want = "\x1bP" },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(InputResult.sent, surface.key(.{
+            .key = c.key,
+            .mods = c.mods,
+            .utf8 = c.utf8,
+            .unshifted_codepoint = c.unshifted,
+        }));
+        try testing.expectEqualStrings(c.want, sink.data[0..sink.len]);
+    }
+
+    // Shift+Enter is CR unless the host asks for LF.
+    surface.shift_enter_line_feed = false;
+    try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .enter, .mods = shift }));
+    try testing.expectEqualStrings("\r", sink.data[0..sink.len]);
+
+    // A program that asked for a keyboard protocol gets that protocol.
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.screens.active.kitty_keyboard.push(.{ .disambiguate = true });
+    }
+    try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .escape, .mods = ctrl }));
+    try testing.expectEqualStrings("\x1b[27;5u", sink.data[0..sink.len]);
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.screens.active.kitty_keyboard.push(.disabled);
+        shared.terminal.flags.modify_other_keys_2 = true;
+    }
+    try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .escape, .mods = ctrl }));
+    try testing.expectEqualStrings("\x1b[27;5;27~", sink.data[0..sink.len]);
 }
 
 test "terminal surface committed text admission contract" {

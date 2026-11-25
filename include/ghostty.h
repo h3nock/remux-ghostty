@@ -1567,6 +1567,14 @@ typedef struct {
   uint32_t height_px;
   bool visible;
   bool focused;
+  // While the program has requested neither the Kitty keyboard protocol nor
+  // modifyOtherKeys 2, encode Ctrl or Shift with Escape, Tab and Enter, and
+  // Ctrl+Shift+letter, as a plain terminal does (xterm's defaults, which tmux
+  // also sends) instead of the fixterms forms. For hosts that may not see every
+  // keyboard mode a program set, such as a tmux client attaching late.
+  bool plain_legacy_keys;
+  // With plain_legacy_keys, Shift+Enter sends LF instead of CR.
+  bool shift_enter_line_feed;
 } ghostty_terminal_surface_config_s;
 
 // Returns the default producer configuration: 80 columns, 24 rows, and 10,000
