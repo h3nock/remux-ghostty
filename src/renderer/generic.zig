@@ -18,6 +18,7 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
+const remux_frame_rows = @import("../remux/frame_rows.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -351,6 +352,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The rows drawn from `terminal_state`: its viewport rows, plus
         /// its overscan row below while scrolled by part of a row.
         render_rows: terminal.size.CellCountInt = 0,
+
+        /// Remux: the cursor as of the cells last rebuilt (frame_rows.zig).
+        remux_cursor: remux_frame_rows.Cursor = .{},
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -2026,6 +2030,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
             }
 
+            // Remux: the frame's rows travel with it to the layer that shows it.
+            if (@hasField(@TypeOf(frame.target), "frame_rows")) frame.target.frame_rows = remux_frame_rows.ofRenderer(self);
+
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
@@ -2885,6 +2892,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.cells.clear(y);
                 };
             }
+
+            self.remux_cursor = .of(state, preedit != null);
 
             // Setup our cursor rendering information.
             cursor: {
