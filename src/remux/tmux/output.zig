@@ -164,6 +164,9 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// The modifyOtherKeys level tmux holds for the pane: `VT10x`, `Ext 1` or
+    /// `Ext 2`. Empty before tmux 3.5.
+    pane_key_mode,
     /// Current command reported by tmux for the pane process.
     pane_current_command,
     /// Current working directory reported by tmux for the pane process.
@@ -250,6 +253,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_key_mode,
             .pane_current_command,
             .pane_current_path,
             .version,
@@ -296,6 +300,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_key_mode,
             .pane_current_command,
             .pane_current_path,
             .version,
