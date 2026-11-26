@@ -1769,12 +1769,8 @@ fn plainLegacyEvent(event: input.KeyEvent, shift_enter_line_feed: bool) input.Ke
             if (event.mods.shift) plain.mods.alt = false;
         },
         .enter => {
-            // Text on the key is an input method's commit, which the encoder
-            // sends in place of the key.
-            const text = event.utf8.len > 0 and
-                !(event.utf8.len == 1 and std.ascii.isControl(event.utf8[0]));
             const line_feed = shift_enter_line_feed and
-                event.mods.shift and !event.mods.ctrl and !text;
+                event.mods.shift and !event.mods.ctrl and !carriesText(event.utf8);
             plain.mods.shift = false;
             plain.mods.ctrl = line_feed;
             if (line_feed) {
@@ -1786,6 +1782,13 @@ fn plainLegacyEvent(event: input.KeyEvent, shift_enter_line_feed: bool) input.Ke
         else => {},
     }
     return plain;
+}
+
+/// Text on an Enter key is an input method's commit, which the encoder sends
+/// in place of the key; a lone control character is the key's own. This is the
+/// encoder's `isControlUtf8` rule, pinned by a test against the encoder.
+fn carriesText(utf8: []const u8) bool {
+    return utf8.len > 0 and !(utf8.len == 1 and std.ascii.isControl(utf8[0]));
 }
 
 fn keyLong(
@@ -2313,6 +2316,17 @@ test "terminal surface plain legacy keys" {
         shared.terminal.flags.modify_other_keys_2 = true;
     }
     try expectKeys(&surface, &sink, &.{.{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5;27~" }});
+}
+
+test "terminal surface text check matches the encoder's" {
+    const testing = std.testing;
+    for ([_][]const u8{ "", "\r", "\n", "\x1b", "\x7f", "a", "한", "ab" }) |utf8| {
+        var buf: [16]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try input.key_encode.encode(&writer, .{ .key = .enter, .utf8 = utf8 }, .{});
+        const sends_text = !std.mem.eql(u8, writer.buffered(), "\r");
+        try testing.expectEqual(sends_text, carriesText(utf8));
+    }
 }
 
 test "terminal surface committed text admission contract" {
