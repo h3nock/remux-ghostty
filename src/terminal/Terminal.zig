@@ -113,9 +113,8 @@ flags: packed struct {
     // this to false and we act in mode 1 by default.
     modify_other_keys_2: bool = false,
 
-    // Remux: set via ESC[>4;1m (and CSI > n, which the parser reads as that
-    // level). Keys are encoded the same as by default, but a host that sends
-    // plain keys when nothing was asked for needs to know.
+    // Remux: set via ESC[>4;1m. Keys are encoded the same as by default, but a
+    // host that sends plain keys when nothing was asked for needs to know.
     modify_other_keys_1: bool = false,
 
     /// The mouse event mode and format. These are set to the last

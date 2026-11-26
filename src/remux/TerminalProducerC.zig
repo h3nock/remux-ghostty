@@ -337,10 +337,13 @@ test "terminal producer records the modifyOtherKeys level" {
     try testing.expect(flags.modify_other_keys_1 and !flags.modify_other_keys_2);
     try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;2m"));
     try testing.expect(!flags.modify_other_keys_1 and flags.modify_other_keys_2);
-    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m\x1b[>4m"));
-    try testing.expect(!flags.modify_other_keys_1 and !flags.modify_other_keys_2);
-    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m\x1b[!p"));
-    try testing.expect(!flags.modify_other_keys_1);
+    // Each way a program turns it off, and both resets.
+    for ([_][]const u8{ "\x1b[>4m", "\x1b[>4;0m", "\x1b[>4;m", "\x1b[>m", "\x1b[>4n", "\x1b[!p", "\x1bc" }) |off| {
+        try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m"));
+        try testing.expect(flags.modify_other_keys_1);
+        try testing.expectEqual(Result.ok, producer.feed(off));
+        try testing.expect(!flags.modify_other_keys_1 and !flags.modify_other_keys_2);
+    }
 }
 
 test "terminal producer preserves parser state across feeds" {

@@ -1568,10 +1568,9 @@ typedef struct {
   bool visible;
   bool focused;
   // While the program has requested neither the Kitty keyboard protocol nor
-  // modifyOtherKeys, encode Ctrl or Shift with Escape, Tab and Enter, and
-  // Ctrl+Shift+letter, as a plain terminal does (xterm's defaults, which tmux
-  // also sends) instead of the fixterms forms. At modifyOtherKeys level 1, only
-  // Ctrl+Shift+letter. For hosts that may not see every keyboard mode a program
+  // modifyOtherKeys, encode Ctrl or Shift with Escape, Tab and Enter as a plain
+  // terminal does (xterm's defaults, which tmux also sends) instead of the
+  // fixterms forms. For hosts that may not see every keyboard mode a program
   // set, such as a tmux client attaching late.
   bool plain_legacy_keys;
   // With plain_legacy_keys, Shift+Enter sends LF instead of CR.
