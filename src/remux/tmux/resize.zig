@@ -334,8 +334,8 @@ pub fn apply(alloc: Allocator, t: *Terminal, p: *const Plan) Terminal.ResizeErro
 
 /// tmux deletes the rows below the cursor whatever they hold, and Ghostty's
 /// shrink trims trailing rows without text, so the deleted rows are cleared
-/// first. The rest of the shrink moves rows from the top into history in
-/// both.
+/// first. The rest of the shrink moves rows off the top in both: into
+/// history, or gone on a screen without one, such as the alternate screen.
 fn applyShrink(
     alloc: Allocator,
     t: *Terminal,
@@ -353,12 +353,19 @@ fn applyShrink(
         above.rowAndCell().row.wrap = false;
     }
 
-    const total = screen.pages.total_rows;
+    // Ghostty doesn't trim a row that holds a tracked pin, such as a
+    // selection's end, and moves another row off the top instead, so the
+    // last row tmux keeps must end up the mirror's last. The first row can't
+    // show this: erasing rows moves their pins to the first row left.
+    const last = try screen.pages.trackPin(
+        screen.pages.pin(.{ .active = .{ .y = t.rows - 1 - move.delete_below } }).?,
+    );
+    defer screen.pages.untrackPin(last);
     try t.resize(alloc, .{ .cols = cols, .rows = move.rows });
 
-    // Ghostty doesn't trim a row that holds a tracked pin, such as a
-    // selection's end.
-    return screen.pages.total_rows == total - move.delete_below;
+    if (last.garbage) return false;
+    const bottom = screen.pages.pointFromPin(.active, last.*) orelse return false;
+    return bottom.active.y == move.rows - 1;
 }
 
 /// Ghostty brings history back only when the cursor is on the last row, and
@@ -654,6 +661,50 @@ test "apply: a selection on a deleted row needs a recapture" {
     try screen.select(Selection.init(pin, pin, false));
 
     const p = (try plan(testing.allocator, testSample(10, 1, 0), testSample(6, 1, 0))).?;
+    try testing.expect(!try apply(testing.allocator, &t, &p));
+}
+
+fn alternateSample(height: usize, cursor_y: usize) Sample {
+    var sample = testSample(height, cursor_y, 0);
+    sample.alternate = true;
+    return sample;
+}
+
+const alternate_rows = "\x1b[?1049h" ++
+    "L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9";
+
+test "apply: an alternate-screen shrink drops the rows it pushes off the top" {
+    // L0..L9 on the alternate screen, cursor on row 8. The expected rows are
+    // what tmux 3.5a shows for the same bytes and sizes.
+    var t = try testTerminal(10, alternate_rows ++ "\x1b[9;1H");
+    defer t.deinit(testing.allocator);
+
+    const p = (try plan(testing.allocator, alternateSample(10, 8), alternateSample(6, 5))).?;
+    try testing.expectEqual(Move{ .rows = 6, .delete_below = 1, .pull = 0 }, p.moves[0]);
+    try testing.expect(canApply(&t, &p));
+    try testing.expect(try apply(testing.allocator, &t, &p));
+    try expectDump(&t, "", "L3\nL4\nL5\nL6\nL7\nL8");
+    try testing.expect(cursorMatches(&t, 0, 5));
+}
+
+test "apply: an alternate-screen shrink below a high cursor deletes only rows below it" {
+    var t = try testTerminal(10, alternate_rows ++ "\x1b[3;1H");
+    defer t.deinit(testing.allocator);
+
+    const p = (try plan(testing.allocator, alternateSample(10, 2), alternateSample(6, 2))).?;
+    try testing.expect(try apply(testing.allocator, &t, &p));
+    try expectDump(&t, "", "L0\nL1\nL2\nL3\nL4\nL5");
+    try testing.expect(cursorMatches(&t, 0, 2));
+}
+
+test "apply: a selection on a deleted alternate-screen row needs a recapture" {
+    var t = try testTerminal(10, alternate_rows ++ "\x1b[9;1H");
+    defer t.deinit(testing.allocator);
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .y = 9 } }).?;
+    try screen.select(Selection.init(pin, pin, false));
+
+    const p = (try plan(testing.allocator, alternateSample(10, 8), alternateSample(6, 5))).?;
     try testing.expect(!try apply(testing.allocator, &t, &p));
 }
 
