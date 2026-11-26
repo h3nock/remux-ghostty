@@ -342,8 +342,9 @@ types:
           expr: _.to_i <= 2
       - id: modify_other_keys_2
         type: u1
+        doc: 1 is modifyOtherKeys level 2; 2 is level 1 (Remux).
         valid:
-          max: 1
+          max: 2
       - id: mouse_event
         type: u1
         enum: mouse_event

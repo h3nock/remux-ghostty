@@ -708,6 +708,7 @@ pub const Handler = struct {
             .kitty_keyboard_set_not => self.terminal.screens.active.kitty_keyboard.set(.not, value.flags),
             .modify_key_format => {
                 self.terminal.flags.modify_other_keys_2 = false;
+                self.terminal.flags.modify_other_keys_1 = value == .other_keys_numeric_except;
                 switch (value) {
                     .other_keys_numeric => self.terminal.flags.modify_other_keys_2 = true,
                     else => {},

@@ -2128,6 +2128,8 @@ pub fn Stream(comptime H: type) type {
 
                                         // We only support the numeric form.
                                         .other_keys_none => switch (input.params[1]) {
+                                            // Remux: level 1, recorded in flags.modify_other_keys_1.
+                                            1 => format = .other_keys_numeric_except,
                                             2 => format = .other_keys_numeric,
                                             else => {},
                                         },
@@ -2198,7 +2200,9 @@ pub fn Stream(comptime H: type) type {
                                 // control what exactly is being disabled. However, we
                                 // only support reverting back to modify other keys in
                                 // numeric except format.
-                                self.handler.vt(.modify_key_format, .other_keys_numeric_except);
+                                // Remux: report it off instead, since
+                                // .other_keys_numeric_except now means level 1.
+                                self.handler.vt(.modify_key_format, .other_keys_none);
                             },
 
                             else => log.warn(

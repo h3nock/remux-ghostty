@@ -26,6 +26,9 @@ size: rendererpkg.Size,
 shared: *Shared,
 write_sink: ?WriteSink,
 macos_option_as_alt: input.OptionAsAlt,
+/// See `plainLegacyEvent`. Fixed at creation by the host.
+plain_legacy_keys: bool,
+shift_enter_line_feed: bool,
 vt_kam_allowed: bool,
 selection_clear_on_typing: bool,
 scroll_to_bottom_on_keystroke: bool,
@@ -183,6 +186,8 @@ pub const Options = struct {
     macos_option_as_alt: input.OptionAsAlt = .false,
     visible: bool = true,
     focused: bool = true,
+    plain_legacy_keys: bool = false,
+    shift_enter_line_feed: bool = false,
 };
 
 pub const UpdateConfigOptions = struct {
@@ -222,6 +227,8 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .shared = shared,
         .write_sink = opts.write_sink,
         .macos_option_as_alt = opts.macos_option_as_alt,
+        .plain_legacy_keys = opts.plain_legacy_keys,
+        .shift_enter_line_feed = opts.shift_enter_line_feed,
         .vt_kam_allowed = opts.config.@"vt-kam-allowed",
         .selection_clear_on_typing = opts.config.@"selection-clear-on-typing",
         .scroll_to_bottom_on_keystroke = opts.config.@"scroll-to-bottom".keystroke,
@@ -1699,6 +1706,7 @@ pub fn key(
     self: *TerminalSurface,
     event: input.KeyEvent,
 ) InputResult {
+    var plain = false;
     const encoding_opts: input.key_encode.Options = opts: {
         self.shared.mutex.lockUncancelable(global.io());
         defer self.shared.mutex.unlock(global.io());
@@ -1713,17 +1721,25 @@ pub fn key(
             &self.shared.terminal,
         );
         opts.macos_option_as_alt = self.macos_option_as_alt;
+        plain = self.plain_legacy_keys and
+            opts.kitty_flags.int() == 0 and
+            !opts.modify_other_keys_state_2 and
+            !self.shared.terminal.flags.modify_other_keys_1;
         break :opts opts;
     };
 
     const sink = self.write_sink orelse return .unavailable;
+    const encoded_event = if (plain)
+        plainLegacyEvent(event, self.shift_enter_line_feed)
+    else
+        event;
 
     // This matches the established process-surface fast path and contains
     // ordinary legacy and Kitty key encodings without allocation.
     var stack: [38]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&stack);
-    input.key_encode.encode(&writer, event, encoding_opts) catch |err| switch (err) {
-        error.WriteFailed => return self.keyLong(sink, event, encoding_opts),
+    input.key_encode.encode(&writer, encoded_event, encoding_opts) catch |err| switch (err) {
+        error.WriteFailed => return self.keyLong(sink, encoded_event, encoding_opts),
     };
 
     const encoded = writer.buffered();
@@ -1732,6 +1748,47 @@ pub fn key(
 
     self.acceptedKey(event.key);
     return .sent;
+}
+
+/// The key as a plain terminal sees it, for a pane that asked for no keyboard
+/// protocol. xterm and tmux have no form for Ctrl or Shift on Escape and
+/// Enter, or for Ctrl on Tab, and back-tab has one form whatever else is held,
+/// so those modifiers are dropped and the ordinary encoder writes the rest,
+/// Alt's ESC and committed text included. With `shift_enter_line_feed`,
+/// Shift+Enter is the line feed key, Ctrl+J.
+fn plainLegacyEvent(event: input.KeyEvent, shift_enter_line_feed: bool) input.KeyEvent {
+    var plain = event;
+    if (event.mods.super) return plain;
+    switch (event.key) {
+        .escape => {
+            plain.mods.ctrl = false;
+            plain.mods.shift = false;
+        },
+        .tab => {
+            plain.mods.ctrl = false;
+            if (event.mods.shift) plain.mods.alt = false;
+        },
+        .enter => {
+            const line_feed = shift_enter_line_feed and
+                event.mods.shift and !event.mods.ctrl and !carriesText(event.utf8);
+            plain.mods.shift = false;
+            plain.mods.ctrl = line_feed;
+            if (line_feed) {
+                plain.key = .key_j;
+                plain.utf8 = "";
+                plain.unshifted_codepoint = 'j';
+            }
+        },
+        else => {},
+    }
+    return plain;
+}
+
+/// Text on an Enter key is an input method's commit, which the encoder sends
+/// in place of the key; a lone control character is the key's own. This is the
+/// encoder's `isControlUtf8` rule, pinned by a test against the encoder.
+fn carriesText(utf8: []const u8) bool {
+    return utf8.len > 0 and !(utf8.len == 1 and std.ascii.isControl(utf8[0]));
 }
 
 fn keyLong(
@@ -1942,6 +1999,8 @@ fn testSurface(
         .shared = shared,
         .write_sink = write_sink,
         .macos_option_as_alt = .false,
+        .plain_legacy_keys = false,
+        .shift_enter_line_feed = false,
         .vt_kam_allowed = false,
         .selection_clear_on_typing = true,
         .scroll_to_bottom_on_keystroke = true,
@@ -2157,6 +2216,117 @@ test "terminal surface key admission contract" {
     try testing.expectEqualStrings(long, sink.data[0..sink.len]);
     try testing.expectEqual(@as(usize, 1), tracking.allocations);
     try testing.expectEqual(@as(usize, 1), tracking.deallocations);
+}
+
+test "terminal surface plain legacy keys" {
+    const testing = std.testing;
+    const shared = try Shared.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    const Case = struct { key: input.Key, mods: input.Mods = .{}, utf8: []const u8 = "", want: []const u8 };
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const shift: input.Mods = .{ .shift = true };
+    const alt: input.Mods = .{ .alt = true };
+    const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
+    const ctrl_alt: input.Mods = .{ .ctrl = true, .alt = true };
+    const alt_shift: input.Mods = .{ .alt = true, .shift = true };
+    const expectKeys = struct {
+        fn run(s: *TerminalSurface, sk: *TestSink, cases: []const Case) !void {
+            for (cases) |c| {
+                try testing.expectEqual(InputResult.sent, s.key(.{ .key = c.key, .mods = c.mods, .utf8 = c.utf8 }));
+                try testing.expectEqualStrings(c.want, sk.data[0..sk.len]);
+            }
+        }
+    }.run;
+    const setLevel1 = struct {
+        fn run(sh: *Shared, on: bool) void {
+            sh.mutex.lockUncancelable(global.io());
+            defer sh.mutex.unlock(global.io());
+            sh.terminal.flags.modify_other_keys_1 = on;
+        }
+    }.run;
+
+    // Off, the ordinary encoder's fixterms forms stand.
+    try expectKeys(&surface, &sink, &.{
+        .{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5;27~" },
+        .{ .key = .enter, .mods = shift, .want = "\x1b[27;2;13~" },
+    });
+
+    surface.plain_legacy_keys = true;
+    surface.shift_enter_line_feed = true;
+    surface.macos_option_as_alt = .true;
+    try expectKeys(&surface, &sink, &.{
+        .{ .key = .escape, .mods = ctrl, .want = "\x1b" },
+        .{ .key = .escape, .mods = shift, .want = "\x1b" },
+        .{ .key = .escape, .mods = ctrl_alt, .want = "\x1b\x1b" },
+        .{ .key = .tab, .mods = ctrl, .want = "\t" },
+        .{ .key = .tab, .mods = shift, .want = "\x1b[Z" },
+        .{ .key = .tab, .mods = ctrl_shift, .want = "\x1b[Z" },
+        .{ .key = .tab, .mods = alt_shift, .want = "\x1b[Z" },
+        .{ .key = .tab, .mods = ctrl_alt, .want = "\x1b\t" },
+        .{ .key = .enter, .mods = shift, .want = "\n" },
+        .{ .key = .enter, .mods = alt_shift, .want = "\x1b\n" },
+        .{ .key = .enter, .mods = ctrl, .want = "\r" },
+        .{ .key = .enter, .mods = ctrl_shift, .want = "\r" },
+        .{ .key = .enter, .mods = alt, .want = "\x1b\r" },
+        // An input method's commit on the key is sent as before.
+        .{ .key = .enter, .mods = shift, .utf8 = "한", .want = "한" },
+        .{ .key = .escape, .mods = ctrl, .utf8 = "한", .want = "한" },
+    });
+    try testing.expectEqual(InputResult.not_accepted, surface.key(.{
+        .action = .release,
+        .key = .enter,
+        .mods = shift,
+    }));
+
+    surface.shift_enter_line_feed = false;
+    try expectKeys(&surface, &sink, &.{
+        .{ .key = .enter, .mods = shift, .want = "\r" },
+        .{ .key = .enter, .mods = alt_shift, .want = "\x1b\r" },
+    });
+
+    // At modifyOtherKeys level 1 the encoder's forms are that level's, as tmux
+    // sends them to such a pane.
+    setLevel1(shared, true);
+    try expectKeys(&surface, &sink, &.{
+        .{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5;27~" },
+        .{ .key = .escape, .mods = shift, .want = "\x1b[27;2;27~" },
+        .{ .key = .tab, .mods = ctrl, .want = "\x1b[27;5;9~" },
+        .{ .key = .enter, .mods = shift, .want = "\x1b[27;2;13~" },
+        .{ .key = .enter, .mods = ctrl, .want = "\x1b[27;5;13~" },
+    });
+    setLevel1(shared, false);
+
+    // A program that asked for a keyboard protocol gets that protocol.
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.screens.active.kitty_keyboard.push(.{ .disambiguate = true });
+    }
+    try expectKeys(&surface, &sink, &.{.{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5u" }});
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.screens.active.kitty_keyboard.push(.disabled);
+        shared.terminal.flags.modify_other_keys_2 = true;
+    }
+    try expectKeys(&surface, &sink, &.{.{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5;27~" }});
+}
+
+test "terminal surface text check matches the encoder's" {
+    const testing = std.testing;
+    for ([_][]const u8{ "", "\r", "\n", "\x1b", "\x7f", "a", "한", "ab" }) |utf8| {
+        var buf: [16]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try input.key_encode.encode(&writer, .{ .key = .enter, .utf8 = utf8 }, .{});
+        const sends_text = !std.mem.eql(u8, writer.buffered(), "\r");
+        try testing.expectEqual(sends_text, carriesText(utf8));
+    }
 }
 
 test "terminal surface committed text admission contract" {
