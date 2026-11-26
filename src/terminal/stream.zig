@@ -2128,6 +2128,8 @@ pub fn Stream(comptime H: type) type {
 
                                         // We only support the numeric form.
                                         .other_keys_none => switch (input.params[1]) {
+                                            // Remux: level 1, recorded in flags.modify_other_keys_1.
+                                            1 => format = .other_keys_numeric_except,
                                             2 => format = .other_keys_numeric,
                                             else => {},
                                         },

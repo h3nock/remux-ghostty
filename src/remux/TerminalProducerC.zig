@@ -327,6 +327,22 @@ test "terminal producer C defaults and validation" {
     ghostty_terminal_release(null);
 }
 
+test "terminal producer records the modifyOtherKeys level" {
+    const testing = std.testing;
+    const producer = try Producer.init(testing.allocator, .{ .columns = 10, .rows = 2 });
+    defer producer.deinit();
+    const flags = &producer.terminal.terminal.flags;
+
+    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m"));
+    try testing.expect(flags.modify_other_keys_1 and !flags.modify_other_keys_2);
+    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;2m"));
+    try testing.expect(!flags.modify_other_keys_1 and flags.modify_other_keys_2);
+    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m\x1b[>4m"));
+    try testing.expect(!flags.modify_other_keys_1 and !flags.modify_other_keys_2);
+    try testing.expectEqual(Result.ok, producer.feed("\x1b[>4;1m\x1b[!p"));
+    try testing.expect(!flags.modify_other_keys_1);
+}
+
 test "terminal producer preserves parser state across feeds" {
     const testing = std.testing;
     const producer = try Producer.init(testing.allocator, .{

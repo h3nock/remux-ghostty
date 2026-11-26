@@ -113,6 +113,11 @@ flags: packed struct {
     // this to false and we act in mode 1 by default.
     modify_other_keys_2: bool = false,
 
+    // Remux: set via ESC[>4;1m (and CSI > n, which the parser reads as that
+    // level). Keys are encoded the same as by default, but a host that sends
+    // plain keys when nothing was asked for needs to know.
+    modify_other_keys_1: bool = false,
+
     /// The mouse event mode and format. These are set to the last
     /// set mode in modes. You can't get the right event/format to use
     /// based on modes alone because modes don't show you what order
@@ -5152,6 +5157,7 @@ pub fn softReset(self: *Terminal) void {
 
     self.status_display = .main;
     self.flags.modify_other_keys_2 = false;
+    self.flags.modify_other_keys_1 = false;
     self.flags.xt_checksum = self.default_xt_checksum;
     self.setCursorStyle(.default);
 

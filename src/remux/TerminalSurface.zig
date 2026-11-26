@@ -1706,6 +1706,7 @@ pub fn key(
     self: *TerminalSurface,
     event: input.KeyEvent,
 ) InputResult {
+    var modify_other_keys_1 = false;
     const encoding_opts: input.key_encode.Options = opts: {
         self.shared.mutex.lockUncancelable(global.io());
         defer self.shared.mutex.unlock(global.io());
@@ -1720,6 +1721,7 @@ pub fn key(
             &self.shared.terminal,
         );
         opts.macos_option_as_alt = self.macos_option_as_alt;
+        modify_other_keys_1 = self.shared.terminal.flags.modify_other_keys_1;
         break :opts opts;
     };
 
@@ -1730,7 +1732,10 @@ pub fn key(
         !encoding_opts.modify_other_keys_state_2)
     {
         var plain: [4]u8 = undefined;
-        if (plainLegacyKey(event, self.shift_enter_line_feed, &plain)) |encoded| {
+        if (plainLegacyKey(event, .{
+            .modify_other_keys_1 = modify_other_keys_1,
+            .shift_enter_line_feed = self.shift_enter_line_feed,
+        }, &plain)) |encoded| {
             if (!sink.write(encoded)) return .not_accepted;
             self.acceptedKey(event.key);
             return .sent;
@@ -1753,19 +1758,31 @@ pub fn key(
     return .sent;
 }
 
+const PlainLegacyOptions = struct {
+    /// The pane asked for modifyOtherKeys level 1, whose forms for Escape, Tab
+    /// and Enter are the ones the ordinary encoder sends.
+    modify_other_keys_1: bool,
+    shift_enter_line_feed: bool,
+};
+
 /// What a plain terminal writes (xterm's defaults, which tmux also sends to a
 /// pane) for the modified keys that Ghostty's legacy encoding gives fixterms
 /// forms: Ctrl or Shift with Escape, Tab or Enter, and Ctrl+Shift+letter. Alt
 /// still puts ESC first. Null where the ordinary encoder already agrees.
 fn plainLegacyKey(
     event: input.KeyEvent,
-    shift_enter_line_feed: bool,
+    opts: PlainLegacyOptions,
     buf: *[4]u8,
 ) ?[]const u8 {
     if (event.action != .press and event.action != .repeat) return null;
     if (event.composing) return null;
     const mods = event.mods;
     if (mods.super or !(mods.ctrl or mods.shift)) return null;
+
+    switch (event.key) {
+        .escape, .tab, .enter => if (opts.modify_other_keys_1) return null,
+        else => {},
+    }
 
     var len: usize = 0;
     if (mods.alt) {
@@ -1785,7 +1802,7 @@ fn plainLegacyKey(
             len += 1;
         },
         .enter => {
-            buf[len] = if (mods.shift and !mods.ctrl and shift_enter_line_feed) '\n' else '\r';
+            buf[len] = if (mods.shift and !mods.ctrl and opts.shift_enter_line_feed) '\n' else '\r';
             len += 1;
         },
         else => {
@@ -2287,6 +2304,36 @@ test "terminal surface plain legacy keys" {
     surface.shift_enter_line_feed = false;
     try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .enter, .mods = shift }));
     try testing.expectEqualStrings("\r", sink.data[0..sink.len]);
+
+    // At modifyOtherKeys level 1, Escape, Tab and Enter take that level's
+    // forms, as tmux sends them to such a pane; Ctrl+Shift+letter stays plain.
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.flags.modify_other_keys_1 = true;
+    }
+    const level_1 = [_]Case{
+        .{ .key = .escape, .mods = ctrl, .want = "\x1b[27;5;27~" },
+        .{ .key = .escape, .mods = shift, .want = "\x1b[27;2;27~" },
+        .{ .key = .tab, .mods = ctrl, .want = "\x1b[27;5;9~" },
+        .{ .key = .enter, .mods = shift, .want = "\x1b[27;2;13~" },
+        .{ .key = .enter, .mods = ctrl, .want = "\x1b[27;5;13~" },
+        .{ .key = .key_c, .mods = ctrl_shift, .utf8 = "C", .unshifted = 'c', .want = "\x03" },
+    };
+    for (level_1) |c| {
+        try testing.expectEqual(InputResult.sent, surface.key(.{
+            .key = c.key,
+            .mods = c.mods,
+            .utf8 = c.utf8,
+            .unshifted_codepoint = c.unshifted,
+        }));
+        try testing.expectEqualStrings(c.want, sink.data[0..sink.len]);
+    }
+    {
+        shared.mutex.lockUncancelable(global.io());
+        defer shared.mutex.unlock(global.io());
+        shared.terminal.flags.modify_other_keys_1 = false;
+    }
 
     // A program that asked for a keyboard protocol gets that protocol.
     {
