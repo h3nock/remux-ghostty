@@ -346,6 +346,32 @@ test "terminal producer records the modifyOtherKeys level" {
     }
 }
 
+test "terminal producer modifyOtherKeys level survives a snapshot" {
+    const testing = std.testing;
+    const snapshot = @import("../terminal/snapshot/main.zig");
+    for ([_]struct { feed: []const u8, level_1: bool, level_2: bool }{
+        .{ .feed = "", .level_1 = false, .level_2 = false },
+        .{ .feed = "\x1b[>4;1m", .level_1 = true, .level_2 = false },
+        .{ .feed = "\x1b[>4;2m", .level_1 = false, .level_2 = true },
+    }) |c| {
+        const producer = try Producer.init(testing.allocator, .{ .columns = 10, .rows = 2 });
+        defer producer.deinit();
+        try testing.expectEqual(Result.ok, producer.feed(c.feed));
+
+        var destination: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer destination.deinit();
+        var stream: snapshot.record.Writer = .init(testing.allocator, &destination.writer);
+        defer stream.deinit();
+        try snapshot.terminal.encode(&producer.terminal.terminal, &stream);
+
+        var source: std.Io.Reader = .fixed(destination.written());
+        var restored = try snapshot.terminal.decode(&source, testing.io, testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(c.level_1, restored.flags.modify_other_keys_1);
+        try testing.expectEqual(c.level_2, restored.flags.modify_other_keys_2);
+    }
+}
+
 test "terminal producer preserves parser state across feeds" {
     const testing = std.testing;
     const producer = try Producer.init(testing.allocator, .{

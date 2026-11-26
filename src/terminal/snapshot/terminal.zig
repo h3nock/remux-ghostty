@@ -339,6 +339,9 @@ pub const Header = struct {
     // Terminal input, semantic redraw, and pointer behavior.
     shell_redraw: terminal_osc.semantic_prompt.Redraw,
     modify_other_keys_2: bool,
+    // Remux: stored as 2 in modify_other_keys_2's byte, which earlier
+    // snapshots never use and earlier readers take as off.
+    modify_other_keys_1: bool = false,
     mouse_event: terminal_mouse.Event,
     mouse_format: terminal_mouse.Format,
     mouse_shift_capture: ?bool,
@@ -391,6 +394,7 @@ pub const Header = struct {
             // Terminal input, semantic redraw, and pointer behavior.
             .shell_redraw = terminal.flags.shell_redraws_prompt,
             .modify_other_keys_2 = terminal.flags.modify_other_keys_2,
+            .modify_other_keys_1 = terminal.flags.modify_other_keys_1,
             .mouse_event = terminal.flags.mouse_event,
             .mouse_format = terminal.flags.mouse_format,
             .mouse_shift_capture = switch (terminal.flags.mouse_shift_capture) {
@@ -464,7 +468,9 @@ pub const Header = struct {
 
         // Terminal input, semantic redraw, and pointer behavior.
         try writer.writeByte(@intCast(@intFromEnum(self.shell_redraw)));
-        try writer.writeByte(@intFromBool(self.modify_other_keys_2));
+        try writer.writeByte(if (self.modify_other_keys_2)
+            1
+        else if (self.modify_other_keys_1) 2 else 0);
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_event)));
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_format)));
         try writer.writeByte(encodeOptionalBool(self.mouse_shift_capture));
@@ -555,11 +561,13 @@ pub const Header = struct {
             terminal_osc.semantic_prompt.Redraw,
             try reader.takeByte(),
         ) orelse .true;
-        const modify_other_keys_2 = switch (try reader.takeByte()) {
+        const modify_other_keys = try reader.takeByte();
+        const modify_other_keys_2 = switch (modify_other_keys) {
             0 => false,
             1 => true,
             else => false,
         };
+        const modify_other_keys_1 = modify_other_keys == 2;
         const mouse_event = enumFromInt(
             terminal_mouse.Event,
             try reader.takeByte(),
@@ -663,6 +671,7 @@ pub const Header = struct {
 
             .shell_redraw = shell_redraw,
             .modify_other_keys_2 = modify_other_keys_2,
+            .modify_other_keys_1 = modify_other_keys_1,
             .mouse_event = mouse_event,
             .mouse_format = mouse_format,
             .mouse_shift_capture = mouse_shift_capture,
@@ -1033,6 +1042,7 @@ pub fn decode(
     };
     result.flags.shell_redraws_prompt = header.shell_redraw;
     result.flags.modify_other_keys_2 = header.modify_other_keys_2;
+    result.flags.modify_other_keys_1 = header.modify_other_keys_1;
     result.flags.mouse_event = header.mouse_event;
     result.flags.mouse_format = header.mouse_format;
     result.flags.mouse_shift_capture = if (header.mouse_shift_capture) |value|
