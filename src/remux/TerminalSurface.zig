@@ -2267,6 +2267,13 @@ test "terminal surface plain legacy keys" {
     // Off, the ordinary encoder's fixterms forms stand.
     try testing.expectEqual(InputResult.sent, surface.key(.{ .key = .escape, .mods = ctrl }));
     try testing.expectEqualStrings("\x1b[27;5;27~", sink.data[0..sink.len]);
+    try testing.expectEqual(InputResult.sent, surface.key(.{
+        .key = .key_c,
+        .mods = ctrl_shift,
+        .utf8 = "C",
+        .unshifted_codepoint = 'c',
+    }));
+    try testing.expectEqualStrings("\x1b[99;6u", sink.data[0..sink.len]);
 
     surface.plain_legacy_keys = true;
     surface.shift_enter_line_feed = true;
