@@ -2820,11 +2820,15 @@ pub const Viewer = struct {
         // tmux reports neither focus reporting nor bracketed paste, so
         // those two modes stay as the pane's own output last set them.
 
-        // A modifyOtherKeys level the program set before this client saw the
-        // pane's output. Only a level is evidence: with `extended-keys off`
-        // tmux ignores the request and reports VT10x whatever the program
-        // asked, and a server before 3.5 reports nothing.
-        if (std.mem.eql(u8, data.pane_key_mode, "Ext 2")) {
+        // The program's modifyOtherKeys level as tmux holds it, which this
+        // client may not have seen the program set or reset. Empty is no
+        // evidence (tmux isn't tracking the mode, the pane shows a mode's
+        // screen, or the server predates 3.5), so the pane keeps what its own
+        // output showed.
+        if (std.mem.eql(u8, data.pane_key_mode, "VT10x")) {
+            t.flags.modify_other_keys_2 = false;
+            t.flags.modify_other_keys_1 = false;
+        } else if (std.mem.eql(u8, data.pane_key_mode, "Ext 2")) {
             t.flags.modify_other_keys_2 = true;
             t.flags.modify_other_keys_1 = false;
         } else if (std.mem.eql(u8, data.pane_key_mode, "Ext 1")) {
@@ -4293,10 +4297,13 @@ test "pane state seeds the modifyOtherKeys level tmux reports" {
         .{ .mode = "", .level_1 = false, .level_2 = false },
         .{ .mode = "Ext 1", .level_1 = true, .level_2 = false },
         .{ .mode = "Ext 2", .level_1 = false, .level_2 = true },
-        // No level is no evidence: the mirror keeps what it holds.
-        .{ .mode = "VT10x", .level_1 = false, .level_2 = true },
+        // Empty, or a value this client doesn't know, is no evidence: the
+        // mirror keeps what it holds.
         .{ .mode = "", .level_1 = false, .level_2 = true },
         .{ .mode = "Ext 3", .level_1 = false, .level_2 = true },
+        // tmux knows the program holds no level, as after a reset this
+        // client didn't see.
+        .{ .mode = "VT10x", .level_1 = false, .level_2 = false },
         .{ .mode = "Ext 1", .level_1 = true, .level_2 = false },
     }) |case| {
         _ = try viewer.receivedPaneState(null, try testPaneState(&state_buffer, .{
@@ -4307,13 +4314,13 @@ test "pane state seeds the modifyOtherKeys level tmux reports" {
     }
 
     // A re-read keeps a level the pane's own output set while tmux, with
-    // extended-keys off, reports none; and takes a level tmux reports.
+    // extended-keys off, doesn't know it; and takes a level tmux reports.
     terminal.flags.modify_other_keys_1 = false;
     terminal.flags.modify_other_keys_2 = false;
     pane.stream.nextSlice("\x1b[>4;2m");
     try testing.expect(terminal.flags.modify_other_keys_2);
     pane.phase = .refreshing;
-    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{}));
+    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "" }));
     _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expect(terminal.flags.modify_other_keys_2);
 
@@ -4323,6 +4330,13 @@ test "pane state seeds the modifyOtherKeys level tmux reports" {
     _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "Ext 2" }));
     _ = try viewer.receivedPanePending(1, .{ .captured = "" });
     try testing.expect(terminal.flags.modify_other_keys_2);
+
+    // The program's reset is lost while the pane is paused for a recapture,
+    // and tmux, which tracks the mode, reports none.
+    pane.phase = .refreshing;
+    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "VT10x" }));
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
+    try testing.expect(!terminal.flags.modify_other_keys_2 and !terminal.flags.modify_other_keys_1);
 }
 
 test "pane refresh preserves parser-only mouse modes" {
