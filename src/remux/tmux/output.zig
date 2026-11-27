@@ -91,7 +91,7 @@ pub fn format(
 ) std.Io.Writer.Error!void {
     for (vars, 0..) |variable, i| {
         if (i != 0) try writer.writeByte(delimiter);
-        try writer.print("#{{{t}}}", .{variable});
+        try writer.writeAll(variable.query());
     }
 }
 
@@ -164,6 +164,11 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// The modifyOtherKeys level tmux holds for the pane's program: `VT10x`,
+    /// `Ext 1` or `Ext 2`. The query is guarded (see `query`), so the value is
+    /// empty when tmux doesn't know it: with `extended-keys off`, while the pane
+    /// shows a mode such as copy mode, or before tmux 3.5.
+    pane_key_mode,
     /// Current command reported by tmux for the pane process.
     pane_current_command,
     /// Current working directory reported by tmux for the pane process.
@@ -250,6 +255,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_key_mode,
             .pane_current_command,
             .pane_current_path,
             .version,
@@ -261,6 +267,16 @@ pub const Variable = enum {
     }
 
     /// The type of the parsed value for this variable type.
+    /// The text tmux expands for this variable in a format.
+    pub fn query(self: Variable) []const u8 {
+        return switch (self) {
+            // tmux's level is the program's only while tmux tracks the mode and
+            // the pane shows the program rather than a mode's screen.
+            .pane_key_mode => "#{?pane_in_mode,,#{?#{==:#{extended-keys},off},,#{pane_key_mode}}}",
+            inline else => |tag| "#{" ++ @tagName(tag) ++ "}",
+        };
+    }
+
     pub fn Type(comptime self: Variable) type {
         return switch (self) {
             .alternate_on,
@@ -296,6 +312,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
+            .pane_key_mode,
             .pane_current_command,
             .pane_current_path,
             .version,

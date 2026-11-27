@@ -2820,6 +2820,22 @@ pub const Viewer = struct {
         // tmux reports neither focus reporting nor bracketed paste, so
         // those two modes stay as the pane's own output last set them.
 
+        // The program's modifyOtherKeys level as tmux holds it, which this
+        // client may not have seen the program set or reset. Empty is no
+        // evidence (tmux isn't tracking the mode, the pane shows a mode's
+        // screen, or the server predates 3.5), so the pane keeps what its own
+        // output showed.
+        if (std.mem.eql(u8, data.pane_key_mode, "VT10x")) {
+            t.flags.modify_other_keys_2 = false;
+            t.flags.modify_other_keys_1 = false;
+        } else if (std.mem.eql(u8, data.pane_key_mode, "Ext 2")) {
+            t.flags.modify_other_keys_2 = true;
+            t.flags.modify_other_keys_1 = false;
+        } else if (std.mem.eql(u8, data.pane_key_mode, "Ext 1")) {
+            t.flags.modify_other_keys_2 = false;
+            t.flags.modify_other_keys_1 = true;
+        }
+
         // Scroll region (tmux uses 0-based values)
         scroll: {
             const scroll_top = std.math.cast(
@@ -3819,6 +3835,7 @@ const Format = struct {
             .scroll_region_lower,
             // Tab stops
             .pane_tabs,
+            .pane_key_mode,
             .pane_current_command,
             .pane_current_path,
         },
@@ -3919,6 +3936,7 @@ const TestPaneState = struct {
     mouse_sgr: bool = false,
     scroll_region_upper: usize = 0,
     scroll_region_lower: usize = 2,
+    pane_key_mode: []const u8 = "VT10x",
 };
 
 fn testPaneState(
@@ -3928,7 +3946,7 @@ fn testPaneState(
     return std.fmt.bufPrint(
         buffer,
         "%{d};10;3;0;{d};1;block;;0;{d};4294967295;4294967295;" ++
-            "0;1;0;0;0;{d};{d};{d};{d};{d};0;{d};{d};;{s};{s}",
+            "0;1;0;0;0;{d};{d};{d};{d};{d};0;{d};{d};;{s};{s};{s}",
         .{
             state.pane_id,
             state.cursor_y,
@@ -3940,6 +3958,7 @@ fn testPaneState(
             @intFromBool(state.mouse_sgr),
             state.scroll_region_upper,
             state.scroll_region_lower,
+            state.pane_key_mode,
             state.pane_current_command,
             state.pane_current_path,
         },
@@ -4263,6 +4282,63 @@ test "pane state ignores out of bounds scroll regions" {
     try testing.expectEqual(terminal.rows - 1, terminal.screens.active.cursor.y);
 }
 
+test "pane state seeds the modifyOtherKeys level tmux reports" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    const pane = try addTestPane(&viewer);
+    const terminal = &pane.terminal_owner.terminal;
+    var state_buffer: [256]u8 = undefined;
+
+    const Case = struct { mode: []const u8, level_1: bool, level_2: bool };
+    // In order: each line applies to the terminal the one before left.
+    for ([_]Case{
+        .{ .mode = "VT10x", .level_1 = false, .level_2 = false },
+        .{ .mode = "", .level_1 = false, .level_2 = false },
+        .{ .mode = "Ext 1", .level_1 = true, .level_2 = false },
+        .{ .mode = "Ext 2", .level_1 = false, .level_2 = true },
+        // Empty, or a value this client doesn't know, is no evidence: the
+        // mirror keeps what it holds.
+        .{ .mode = "", .level_1 = false, .level_2 = true },
+        .{ .mode = "Ext 3", .level_1 = false, .level_2 = true },
+        // tmux knows the program holds no level, as after a reset this
+        // client didn't see.
+        .{ .mode = "VT10x", .level_1 = false, .level_2 = false },
+        .{ .mode = "Ext 1", .level_1 = true, .level_2 = false },
+    }) |case| {
+        _ = try viewer.receivedPaneState(null, try testPaneState(&state_buffer, .{
+            .pane_key_mode = case.mode,
+        }));
+        try testing.expectEqual(case.level_1, terminal.flags.modify_other_keys_1);
+        try testing.expectEqual(case.level_2, terminal.flags.modify_other_keys_2);
+    }
+
+    // A re-read keeps a level the pane's own output set while tmux, with
+    // extended-keys off, doesn't know it; and takes a level tmux reports.
+    terminal.flags.modify_other_keys_1 = false;
+    terminal.flags.modify_other_keys_2 = false;
+    pane.stream.nextSlice("\x1b[>4;2m");
+    try testing.expect(terminal.flags.modify_other_keys_2);
+    pane.phase = .refreshing;
+    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "" }));
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
+    try testing.expect(terminal.flags.modify_other_keys_2);
+
+    pane.stream.nextSlice("\x1b[>4m");
+    try testing.expect(!terminal.flags.modify_other_keys_2);
+    pane.phase = .refreshing;
+    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "Ext 2" }));
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
+    try testing.expect(terminal.flags.modify_other_keys_2);
+
+    // The program's reset is lost while the pane is paused for a recapture,
+    // and tmux, which tracks the mode, reports none.
+    pane.phase = .refreshing;
+    _ = try viewer.receivedPaneState(1, try testPaneState(&state_buffer, .{ .pane_key_mode = "VT10x" }));
+    _ = try viewer.receivedPanePending(1, .{ .captured = "" });
+    try testing.expect(!terminal.flags.modify_other_keys_2 and !terminal.flags.modify_other_keys_1);
+}
+
 test "pane refresh preserves parser-only mouse modes" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -4569,8 +4645,8 @@ test "session changed resets state" {
         // before injecting the notification below.
         .{
             .input = .{ .tmux = .{ .block_end = testClientBlock(
-                \\%0;83;20;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;19;8,16;0;shell
-                \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16;1;editor
+                \\%0;83;20;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;19;8,16;VT10x;0;shell
+                \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16;VT10x;1;editor
                 ,
             ) } },
         },
@@ -4766,8 +4842,8 @@ test "initial flow" {
     });
 
     const pane_state =
-        \\%0;83;20;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;1;0;19;8,16;zsh;/Users/test/shell;one
-        \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16;nvim;/Users/test/editor
+        \\%0;83;20;8;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;1;0;19;8,16;VT10x;zsh;/Users/test/shell;one
+        \\%1;83;23;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;22;8,16;VT10x;nvim;/Users/test/editor
     ;
     const first_responses = [_][]const u8{
         pane_state,
@@ -5846,7 +5922,7 @@ test "alternate pane hydration restores canonical screens" {
 
     _ = try viewer.receivedPaneState(
         null,
-        "%7;20;4;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;1;1;3;8,16;nvim;/work/editor",
+        "%7;20;4;5;2;1;bar;;1;1;3;1;0;1;0;0;1;0;0;0;0;0;1;1;3;8,16;VT10x;nvim;/work/editor",
     );
     try testing.expectEqual(5, pane.cursor.?.x);
     try testing.expectEqual(2, pane.cursor.?.y);
@@ -6052,14 +6128,14 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
     // either already-refreshing terminal.
     _ = try viewer.receivedPaneState(
         null,
-        "%1;5;1;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;;0;one",
+        "%1;5;1;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;;VT10x;0;one",
     );
     try testing.expectEqual(10, pane_1.terminal_owner.terminal.cols);
     try testing.expectEqual(11, pane_2.terminal_owner.terminal.cols);
 
     _ = try viewer.receivedPaneState(
         1,
-        "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;8;0;one",
+        "%1;12;3;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;8;VT10x;0;one",
     );
 
     // The shown terminal changes only once the whole snapshot is in.
@@ -6092,7 +6168,7 @@ test "targeted pane refresh preserves protocol state and isolates concurrent gro
 
     _ = try viewer.receivedPaneState(
         2,
-        "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;3;8;1;two",
+        "%2;14;4;0;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;3;8;VT10x;1;two",
     );
     try testing.expect(try viewer.receivedPanePending(2, .{ .captured = "" }));
     try testing.expectEqual(14, pane_2.terminal_owner.terminal.cols);
@@ -6502,7 +6578,7 @@ test "paused recapture replays output that postdates the snapshot" {
 
     // Output after it postdates the snapshot, even if it arrives first.
     testOutput(&viewer, 1, "LATE");
-    _ = testComplete(&viewer, "%1;20;3;4;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(&viewer, "%1;20;3;4;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;VT10x;zsh;/tmp");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "SNAP");
@@ -6535,7 +6611,7 @@ test "a recapture keeps the modes tmux doesn't report as the pane's output set t
 
     try viewer.refreshPane(1, TestAcceptPause{});
     _ = testComplete(&viewer, "");
-    _ = testComplete(&viewer, "%1;20;3;6;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(&viewer, "%1;20;3;6;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;VT10x;zsh;/tmp");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "prompt");
@@ -6555,7 +6631,7 @@ const TestAcceptPause = struct {
 };
 
 const test_alternate_state =
-    "%1;20;3;0;0;1;block;;0;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;2;;vim;/tmp";
+    "%1;20;3;0;0;1;block;;0;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;2;;VT10x;vim;/tmp";
 
 /// Recapture pane 1 (3 rows) while its program is on the alternate screen,
 /// up to the snapshot, and return the pane.
@@ -6631,7 +6707,7 @@ test "pane state restores a cursor waiting to wrap" {
         pub fn submitPaneRefresh(_: @This(), _: []const []const u8) !void {}
     };
     try viewer.refreshPane(1, Accept{});
-    _ = testComplete(&viewer, "%1;20;3;20;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(&viewer, "%1;20;3;20;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;VT10x;zsh;/tmp");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "");
     _ = testComplete(&viewer, "XXXXXXXXXXXXXXXXXXXX\r\nZ");
@@ -6664,7 +6740,7 @@ fn testAttach(
 /// A pane's list-panes line with its cursor at the top left and no history.
 inline fn testStateLine(comptime pane_id: usize, comptime cols: usize, comptime rows: usize) []const u8 {
     return comptime std.fmt.comptimePrint(
-        "%{d};{d};{d};0;0;1;block;;0;0;0;0;0;1;0;0;0;0;0;0;0;0;0;0;{d};;zsh;/tmp",
+        "%{d};{d};{d};0;0;1;block;;0;0;0;0;0;1;0;0;0;0;0;0;0;0;0;0;{d};;VT10x;zsh;/tmp",
         .{ pane_id, cols, rows, rows - 1 },
     );
 }
@@ -7353,7 +7429,7 @@ fn testRecaptureWith(viewer: *Viewer, bytes: []const u8, screen: []const u8) !*V
     const pane = try testResizePane(viewer, 1, 3, bytes);
     try viewer.refreshPane(1, TestAcceptPause{});
     _ = testComplete(viewer, "");
-    _ = testComplete(viewer, "%1;20;3;3;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;zsh;/tmp");
+    _ = testComplete(viewer, "%1;20;3;3;0;1;block;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;2;;VT10x;zsh;/tmp");
     for ([_][]const u8{ "", "", screen, "", "" }) |reply| _ = testComplete(viewer, reply);
     try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
     return pane;
