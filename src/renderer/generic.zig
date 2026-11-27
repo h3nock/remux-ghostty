@@ -48,25 +48,6 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
-/// Return the grid represented by the current CPU cell contents, excluding
-/// the optional fractional-scroll row only when those contents are known to
-/// match the current render state. During an asynchronous resize, the cell
-/// contents remain the source of truth for padding geometry.
-fn visibleRenderGrid(
-    cells_size: renderer.GridSize,
-    state: *const terminal.RenderState,
-    render_rows: terminal.size.CellCountInt,
-) renderer.GridSize {
-    var result = cells_size;
-    if (result.columns == state.cols and
-        result.rows == render_rows and
-        render_rows > state.rows)
-    {
-        result.rows = state.rows;
-    }
-    return result;
-}
-
 const ScreenSizeUniformInputs = struct {
     screen: renderer.ScreenSize,
     padding: renderer.Padding,
@@ -74,17 +55,17 @@ const ScreenSizeUniformInputs = struct {
     visible_grid: renderer.GridSize,
 };
 
+/// During an asynchronous resize, the grid the cells hold, not the screen
+/// size, is the source of truth for padding geometry.
 fn screenSizeUniformInputs(
     size: renderer.Size,
-    cells_size: renderer.GridSize,
-    state: *const terminal.RenderState,
-    render_rows: terminal.size.CellCountInt,
+    cells_grid: renderer.GridSize,
 ) ScreenSizeUniformInputs {
     return .{
         .screen = size.screen,
         .padding = size.padding,
         .cell = size.cell,
-        .visible_grid = visibleRenderGrid(cells_size, state, render_rows),
+        .visible_grid = cells_grid,
     };
 }
 
@@ -352,6 +333,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The rows drawn from `terminal_state`: its viewport rows, plus
         /// its overscan row below while scrolled by part of a row.
         render_rows: terminal.size.CellCountInt = 0,
+
+        /// The grid the cells were last built for: the terminal's columns
+        /// and viewport rows, without the overscan row. It changes with the
+        /// cells under the draw mutex, while `updateFrame` changes
+        /// `terminal_state` and `render_rows` before it takes that mutex, so
+        /// a draw reads this to know the grid its cells hold.
+        cells_grid: renderer.GridSize = .{},
 
         /// Remux: the cursor as of the cells last rebuilt (frame_rows.zig).
         remux_cursor: remux_frame_rows.Cursor = .{},
@@ -1968,12 +1956,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             if (!std.meta.eql(
                 self.screen_size_uniform_inputs,
-                screenSizeUniformInputs(
-                    self.size,
-                    self.cells.size,
-                    &self.terminal_state,
-                    self.render_rows,
-                ),
+                screenSizeUniformInputs(self.size, self.cells_grid),
             )) self.updateScreenSizeUniforms();
 
             // If this frame's target isn't the correct size, or the target
@@ -2400,12 +2383,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Caller must hold the draw mutex.
         fn updateScreenSizeUniforms(self: *Self) void {
-            const inputs = screenSizeUniformInputs(
-                self.size,
-                self.cells.size,
-                &self.terminal_state,
-                self.render_rows,
-            );
+            const inputs = screenSizeUniformInputs(self.size, self.cells_grid);
             const terminal_size = inputs.screen.subPadding(inputs.padding);
 
             // Blank space around the grid.
@@ -2785,6 +2763,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // our background cells will be out of place.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
+            self.cells_grid = .{ .columns = state.cols, .rows = state.rows };
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
@@ -3841,28 +3820,6 @@ inline fn emitScrollbar(
     if (event_sink.scrollbar(scrollbar)) dirty.* = false;
 }
 
-test "visible render grid preserves asynchronous cell geometry" {
-    const testing = std.testing;
-
-    var state: terminal.RenderState = .empty;
-    state.rows = 24;
-    state.cols = 80;
-
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 25 }, &state, 25),
-    );
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 100, .rows = 30 },
-        visibleRenderGrid(.{ .columns = 100, .rows = 30 }, &state, 25),
-    );
-
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state, state.rows),
-    );
-}
-
 test "screen-size uniform inputs track asynchronous grid catch-up" {
     const testing = std.testing;
 
@@ -3871,16 +3828,9 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
         .cell = .{ .width = 10, .height = 20 },
         .padding = .{},
     };
-    var state: terminal.RenderState = .empty;
-    state.rows = 22;
-    state.cols = 80;
 
-    const before = screenSizeUniformInputs(
-        size,
-        .{ .columns = 80, .rows = 22 },
-        &state,
-        22,
-    );
+    // The screen grew to 36 rows; the cells still hold 22.
+    const before = screenSizeUniformInputs(size, .{ .columns = 80, .rows = 22 });
     const before_padding = before.screen.blankPadding(
         before.padding,
         before.visible_grid,
@@ -3888,13 +3838,8 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     );
     try testing.expectEqual(@as(u32, 280), before_padding.bottom);
 
-    state.rows = 36;
-    const after = screenSizeUniformInputs(
-        size,
-        .{ .columns = 80, .rows = 36 },
-        &state,
-        36,
-    );
+    // The cells caught up.
+    const after = screenSizeUniformInputs(size, .{ .columns = 80, .rows = 36 });
     const after_padding = after.screen.blankPadding(
         after.padding,
         after.visible_grid,
@@ -3902,25 +3847,6 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     );
     try testing.expect(!std.meta.eql(before, after));
     try testing.expectEqual(@as(u32, 0), after_padding.bottom);
-
-    try testing.expect(std.meta.eql(
-        after,
-        screenSizeUniformInputs(
-            size,
-            .{ .columns = 80, .rows = 36 },
-            &state,
-            36,
-        ),
-    ));
-    try testing.expect(std.meta.eql(
-        after,
-        screenSizeUniformInputs(
-            size,
-            .{ .columns = 80, .rows = 37 },
-            &state,
-            37,
-        ),
-    ));
 }
 
 test "cursor in the overscan row below the viewport matches RenderState's" {
