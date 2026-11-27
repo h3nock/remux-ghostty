@@ -19,6 +19,7 @@ const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const remux_frame_rows = @import("../remux/frame_rows.zig");
+const remux_grid = @import("../remux/backend_sized_grid.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -335,11 +336,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         render_rows: terminal.size.CellCountInt = 0,
 
         /// The grid the cells were last built for: the terminal's columns
-        /// and viewport rows, without the overscan row. It changes with the
-        /// cells under the draw mutex, while `updateFrame` changes
+        /// and viewport rows, without the overscan row; empty before the
+        /// first build. Only the render thread's `updateFrame` writes it,
+        /// with the cells under the draw mutex, while it changes
         /// `terminal_state` and `render_rows` before it takes that mutex, so
         /// a draw reads this to know the grid its cells hold.
         cells_grid: renderer.GridSize = .{},
+
+        /// See `renderer.Options.backend_sized_grid`.
+        backend_sized_grid: bool,
+
+        /// Remux: whether a frame was requested and no draw on the render
+        /// thread has submitted one since. While it stands, a hidden surface
+        /// draws and a draw submits even if nothing changed. Set and cleared
+        /// on the render thread; a terminal producer reads it to wake a
+        /// hidden surface whose request stands.
+        frame_requested: std.atomic.Value(bool) = .init(false),
 
         /// Remux: the cursor as of the cells last rebuilt (frame_rows.zig).
         remux_cursor: remux_frame_rows.Cursor = .{},
@@ -816,6 +828,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .event_sink = options.event_sink,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
+                .backend_sized_grid = options.backend_sized_grid,
                 .focused = true,
                 .visible = true,
                 .scrollbar = .zero,
@@ -1876,6 +1889,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread exits; displayRealized rebuilds the swap chain.
             if (!self.display_realized) return false;
 
+            // Where a backend sizes the grid, keep the last frame while the
+            // drawable holds another grid than the cells
+            // (remux/backend_sized_grid.zig). This comes before the draw
+            // consumes `cells_rebuilt` or a frame request, so the first draw
+            // that fits presents.
+            if (self.backend_sized_grid and !remux_grid.drawableHolds(
+                .{ .width = surface_size.width, .height = surface_size.height },
+                self.size.padding,
+                self.size.cell,
+                self.cells_grid,
+            )) return false;
+
             // Get our swap chain, rebuilding it if it was released
             // while we were hidden. Rebuilding is deferred to draw
             // time because resource creation must happen somewhere
@@ -1904,6 +1929,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.animationWake() != null or
+                self.frame_requested.load(.monotonic) or
                 sync;
 
             if (!needs_redraw) {
@@ -2019,6 +2045,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
+            // From here the frame is submitted, which answers a standing
+            // request. Only the render thread draws without `sync`.
+            if (!sync) self.frame_requested.store(false, .monotonic);
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
