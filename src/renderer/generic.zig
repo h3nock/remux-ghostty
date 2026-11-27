@@ -1488,6 +1488,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
             };
 
+            // Whether a synchronized-output block keeps the last frame
+            // (remux/backend_sized_grid.zig). This may read the drawable's
+            // size, so it is asked before the terminal is locked.
+            const sync_keeps_frame = !self.backend_sized_grid or remux_grid.syncKeepsFrame(
+                &self.api,
+                self.frame_requested.load(.monotonic),
+                self.cells_grid,
+                self.size.padding,
+                self.size.cell,
+            );
+
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
                 // NOTE: This code needs be updated to 0.16.0 before you
@@ -1504,7 +1515,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer state.unlockDemand(global.io());
 
                 // If we're in a synchronized output state, we pause all rendering.
-                if (state.terminal.modes.get(.synchronized_output)) {
+                if (state.terminal.modes.get(.synchronized_output) and
+                    sync_keeps_frame)
+                {
                     log.debug("synchronized output started, skipping render", .{});
                     return;
                 }

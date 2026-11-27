@@ -23,6 +23,23 @@ pub fn drawableHolds(
     return grid.equals(drawable.grid());
 }
 
+/// Whether a synchronized-output block can keep the last frame. A frame shows only cells built for the drawable's
+/// grid, so there is none to keep before the first build, or for a requested frame while the drawable holds another
+/// grid; the cells are then built as the terminal is, even inside a block. `api.surfaceSize()` gives the drawable's
+/// size and is read only when the answer depends on it.
+pub fn syncKeepsFrame(
+    api: anytype,
+    requested: bool,
+    cells_grid: size.GridSize,
+    padding: size.Padding,
+    cell: size.CellSize,
+) bool {
+    if (cells_grid.equals(.{})) return false;
+    if (!requested) return true;
+    const surface = api.surfaceSize() catch return true;
+    return drawableHolds(.{ .width = surface.width, .height = surface.height }, padding, cell, cells_grid);
+}
+
 // 24x53 px cells, as a tmux pane's mirror shrinking from 41 rows to 25.
 const test_cell: size.CellSize = .{ .width = 24, .height = 53 };
 const tall: size.ScreenSize = .{ .width = 1200, .height = 2173 };
@@ -46,4 +63,37 @@ test "a drawable holds the grid it was sized for" {
 
     // Before any cells are built.
     try std.testing.expect(!drawableHolds(tall, .{}, test_cell, .{}));
+}
+
+const TestApi = struct {
+    screen: ?size.ScreenSize,
+    reads: usize = 0,
+
+    fn surfaceSize(self: *TestApi) !struct { width: u32, height: u32 } {
+        self.reads += 1;
+        const screen = self.screen orelse return error.NoSurface;
+        return .{ .width = screen.width, .height = screen.height };
+    }
+};
+
+test "a synchronized-output block keeps a frame the drawable can show" {
+    // Built cells, no request: the block keeps them without asking the drawable.
+    var api: TestApi = .{ .screen = short };
+    try std.testing.expect(syncKeepsFrame(&api, false, grid_41, .{}, test_cell));
+    try std.testing.expectEqual(0, api.reads);
+
+    // A request whose cells still fit keeps them.
+    try std.testing.expect(syncKeepsFrame(&api, true, grid_25, .{}, test_cell));
+
+    // A request while the drawable holds another grid builds through the block.
+    try std.testing.expect(!syncKeepsFrame(&api, true, grid_41, .{}, test_cell));
+
+    // Before the first build there is no frame to keep, requested or not, whatever the drawable.
+    var none: TestApi = .{ .screen = null };
+    try std.testing.expect(!syncKeepsFrame(&none, false, .{}, .{}, test_cell));
+    try std.testing.expect(!syncKeepsFrame(&none, true, .{}, .{}, test_cell));
+    try std.testing.expectEqual(0, none.reads);
+
+    // Without a drawable size the block keeps what it has.
+    try std.testing.expect(syncKeepsFrame(&none, true, grid_41, .{}, test_cell));
 }
