@@ -343,6 +343,13 @@ fn applyShrink(
     move: Move,
 ) Terminal.ResizeError!bool {
     const screen = t.screens.active;
+
+    // On a screen without history, erased rows move their pins to the first
+    // row left. With one row left that is also the last, so the check below
+    // can't tell the row tmux keeps from a pin moved there when Ghostty keeps
+    // a deleted row instead.
+    if (screen.no_scrollback and move.rows == 1 and move.delete_below > 0) return false;
+
     if (move.delete_below > 0) {
         assert(move.delete_below < t.rows - screen.cursor.y);
         const top = t.rows - move.delete_below;
@@ -706,6 +713,31 @@ test "apply: a selection on a deleted alternate-screen row needs a recapture" {
 
     const p = (try plan(testing.allocator, alternateSample(10, 8), alternateSample(6, 5))).?;
     try testing.expect(!try apply(testing.allocator, &t, &p));
+}
+
+test "apply: a one-row alternate-screen shrink below the cursor needs a recapture" {
+    // A, B, C with the cursor on B and a selection on C. tmux keeps B.
+    // Ghostty keeps C, which the selection holds, and moves B's pin onto it.
+    var t = try testTerminal(3, "\x1b[?1049hA\r\nB\r\nC\x1b[2;1H");
+    defer t.deinit(testing.allocator);
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .y = 2 } }).?;
+    try screen.select(Selection.init(pin, pin, false));
+
+    const p = (try plan(testing.allocator, alternateSample(3, 1), alternateSample(1, 0))).?;
+    try testing.expectEqual(Move{ .rows = 1, .delete_below = 1, .pull = 0 }, p.moves[0]);
+    try testing.expect(!try apply(testing.allocator, &t, &p));
+}
+
+test "apply: a one-row alternate-screen shrink with the cursor on the last row" {
+    var t = try testTerminal(3, "\x1b[?1049hA\r\nB\r\nC");
+    defer t.deinit(testing.allocator);
+
+    const p = (try plan(testing.allocator, alternateSample(3, 2), alternateSample(1, 0))).?;
+    try testing.expectEqual(Move{ .rows = 1, .delete_below = 0, .pull = 0 }, p.moves[0]);
+    try testing.expect(try apply(testing.allocator, &t, &p));
+    try expectDump(&t, "", "C");
+    try testing.expect(cursorMatches(&t, 1, 0));
 }
 
 test "apply: grow pulls back exactly the plan's rows with the cursor above a footer" {
