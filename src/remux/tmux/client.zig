@@ -136,7 +136,7 @@ pub const ControlClient = struct {
     };
     pub const Error = channel_pkg.Channel.EnqueueError ||
         channel_pkg.Channel.FeedError ||
-        error{ ClientFailed, InvalidInput, PaneUnknown, WindowUnknown };
+        error{ ClientFailed, InvalidInput, PaneUnknown, WindowUnknown, Unsupported };
 
     pub fn init(
         io: std.Io,
@@ -165,8 +165,8 @@ pub const ControlClient = struct {
     /// Bytes awaiting transport. The slice is invalidated by the next `feed`,
     /// `enqueueCommand`, `enqueueCommandGroup`, `sendPaneInput`,
     /// `sendPaneInputTracked`, `pastePane`, `refreshPane`,
-    /// `refreshWindowPaneMetadata`, `setClientSize`, or `consumeOutbound`
-    /// call.
+    /// `refreshWindowPaneMetadata`, `setClientSize`, `setWindowSize`,
+    /// `clearWindowSize`, or `consumeOutbound` call.
     pub fn outboundBytes(self: *const ControlClient) []const u8 {
         if (self.state != .active) return &.{};
         return self.channel.outboundBytes();
@@ -276,25 +276,50 @@ pub const ControlClient = struct {
         client_size: Viewer.ClientSize,
     ) Error!void {
         try self.validateCommandAdmission();
-
-        const Submitter = struct {
-            channel: *channel_pkg.Channel,
-
-            pub fn submitClientResize(
-                value: @This(),
-                members: []const []const u8,
-            ) channel_pkg.Channel.EnqueueError!void {
-                try value.channel.enqueueCommandGroupFrom(
-                    .viewer,
-                    members,
-                    null,
-                );
-            }
-        };
-        try self.viewer.setClientSize(client_size, Submitter{
+        try self.viewer.setClientSize(client_size, ResizeSubmitter{
             .channel = &self.channel,
         });
     }
+
+    /// Size one window with tmux's own window size, which tmux keeps for
+    /// it whatever the client's size until it's cleared; a size on another
+    /// window is cleared in the same write. Each pane's mirror follows the
+    /// resize as it does a client resize. While a resize or recapture is in
+    /// flight only the newest request is kept and sent afterwards. From
+    /// tmux 3.3.
+    pub fn setWindowSize(
+        self: *ControlClient,
+        window_id: usize,
+        window_size: Viewer.ClientSize,
+    ) Error!void {
+        try self.validateCommandAdmission();
+        try self.viewer.setWindowSize(window_id, window_size, ResizeSubmitter{
+            .channel = &self.channel,
+        });
+    }
+
+    /// Clear the window size `setWindowSize` set.
+    pub fn clearWindowSize(self: *ControlClient) Error!void {
+        try self.validateCommandAdmission();
+        try self.viewer.clearWindowSize(ResizeSubmitter{
+            .channel = &self.channel,
+        });
+    }
+
+    const ResizeSubmitter = struct {
+        channel: *channel_pkg.Channel,
+
+        pub fn submitClientResize(
+            value: @This(),
+            members: []const []const u8,
+        ) channel_pkg.Channel.EnqueueError!void {
+            try value.channel.enqueueCommandGroupFrom(
+                .viewer,
+                members,
+                null,
+            );
+        }
+    };
 
     /// Refresh current command and path metadata for every pane in one window.
     /// This enqueues one list-panes command and does not capture or rehydrate

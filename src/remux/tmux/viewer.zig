@@ -301,6 +301,18 @@ pub const Viewer = struct {
     resize_inflight: ?ResizeInflight = null,
     resize_pending: ?ClientSize = null,
 
+    /// The resize sent behind `resize_inflight` in the same write: a window
+    /// size moving to another window is cleared and set in two groups, so
+    /// each still brackets one tmux resize, for one round trip.
+    resize_next: ?ResizeInflight = null,
+
+    /// The window size the host asked for last, and the one tmux last
+    /// accepted. tmux keeps a window's size until it's cleared, also after
+    /// the client moves to another session, so `window_size_applied` is
+    /// carried across a session change.
+    window_size_wanted: ?WindowSize = null,
+    window_size_applied: ?WindowSize = null,
+
     /// A `hydration_recheck` is queued and hasn't been answered.
     hydration_recheck_queued: bool = false,
 
@@ -366,6 +378,12 @@ pub const Viewer = struct {
     pub const ClientSize = struct {
         columns: size.CellCountInt,
         rows: size.CellCountInt,
+    };
+
+    /// One window's size, which tmux uses for it instead of the client's.
+    pub const WindowSize = struct {
+        window_id: usize,
+        size: ClientSize,
     };
 
     pub const Options = struct {
@@ -800,6 +818,7 @@ pub const Viewer = struct {
         }
         self.untracked_utf8.deinit(self.alloc);
         if (self.resize_inflight) |*inflight| inflight.deinit(self.alloc);
+        if (self.resize_next) |*inflight| inflight.deinit(self.alloc);
         if (self.session_name.len > 0) {
             self.alloc.free(self.session_name);
         }
@@ -903,7 +922,90 @@ pub const Viewer = struct {
         if (self.sent_command_count != self.command_queue.len()) {
             return error.NotReady;
         }
+        try self.submitResize(.{ .resize_client = client_size }, submitter);
+        self.resize_pending = null;
+    }
 
+    /// Size one window with `refresh-client -C @window:size`, which tmux
+    /// keeps for that window until it's cleared, whatever the client's
+    /// size. One window is sized at a time: a size on another window is
+    /// cleared in the same write. Each resize is sampled and followed as a
+    /// client resize is. While a resize or a recapture is in flight only
+    /// the newest request is kept, and it's sent once they finish, after a
+    /// pending client size. A request tmux refuses isn't sent again.
+    /// `submitter.submitClientResize` must synchronously enqueue each
+    /// supplied command group.
+    pub fn setWindowSize(
+        self: *Viewer,
+        window_id: usize,
+        window_size: ClientSize,
+        submitter: anytype,
+    ) !void {
+        if (window_size.columns == 0 or window_size.rows == 0) return error.InvalidInput;
+        try self.windowSizeReady();
+        for (self.windows.items) |window| {
+            if (window.id == window_id) break;
+        } else return error.WindowUnknown;
+        try self.wantWindowSize(.{ .window_id = window_id, .size = window_size }, submitter);
+    }
+
+    /// Clear the size `setWindowSize` set, by its window's id, also after
+    /// the client moved to another session.
+    pub fn clearWindowSize(self: *Viewer, submitter: anytype) !void {
+        try self.windowSizeReady();
+        try self.wantWindowSize(null, submitter);
+    }
+
+    /// `refresh-client -C @window:size` exists from tmux 3.3.
+    fn windowSizeReady(self: *const Viewer) error{ NotReady, Unsupported }!void {
+        if (self.state != .command_queue or self.tmux_version.len == 0) return error.NotReady;
+        if (!self.isAtLeastTmux(3, 3)) return error.Unsupported;
+    }
+
+    fn wantWindowSize(self: *Viewer, wanted: ?WindowSize, submitter: anytype) !void {
+        if (self.resize_inflight != null or self.recaptureInFlight()) {
+            self.window_size_wanted = wanted;
+            return;
+        }
+        if (self.sent_command_count != self.command_queue.len()) {
+            return error.NotReady;
+        }
+
+        // If a move's set can't be submitted after its clear was, the
+        // earlier request stays, and the clear's reply sends it again.
+        const prior = self.window_size_wanted;
+        self.window_size_wanted = wanted;
+        errdefer self.window_size_wanted = prior;
+        var storage: [2]Command.WindowResize = undefined;
+        for (self.windowResizes(&storage)) |window_resize| {
+            try self.submitResize(.{ .resize_window = window_resize }, submitter);
+        }
+    }
+
+    /// The window resizes that make tmux's window size the one asked for:
+    /// none, a set, a clear, or on a move to another window a clear and
+    /// then a set.
+    fn windowResizes(
+        self: *const Viewer,
+        storage: *[2]Command.WindowResize,
+    ) []const Command.WindowResize {
+        const wanted = self.window_size_wanted;
+        const applied = self.window_size_applied;
+        if (std.meta.eql(wanted, applied)) return storage[0..0];
+        var count: usize = 0;
+        if (applied) |old| if (wanted == null or wanted.?.window_id != old.window_id) {
+            storage[count] = .{ .window_id = old.window_id, .size = null };
+            count += 1;
+        };
+        if (wanted) |new| {
+            storage[count] = .{ .window_id = new.window_id, .size = new.size };
+            count += 1;
+        }
+        return storage[0..count];
+    }
+
+    /// Send a resize group around `middle` now.
+    fn submitResize(self: *Viewer, middle: Command, submitter: anytype) !void {
         var inflight = try self.beginResize();
         errdefer inflight.deinit(self.alloc);
         const count = resize_samples_len + inflight.screens.len;
@@ -912,33 +1014,33 @@ pub const Viewer = struct {
         const members = try arena.allocator().alloc([]const u8, count);
         for (members, 0..) |*member, i| {
             var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-            resizeCommand(client_size, inflight.screens, i).formatCommand(&builder.writer) catch
+            resizeCommand(middle, inflight.screens, i).formatCommand(&builder.writer) catch
                 return error.OutOfMemory;
             member.* = builder.writer.buffered();
         }
 
         try self.command_queue.ensureUnusedCapacity(self.alloc, count);
         try submitter.submitClientResize(members);
-        self.appendResize(client_size, inflight);
+        self.appendResize(middle, inflight);
         self.sent_command_count += count;
-        self.resize_pending = null;
     }
 
     /// The samples and the resize between them.
     const resize_samples_len = 3;
 
-    /// Member `index` of a client resize: every pane sampled before and
-    /// after it, then the screens the resize captures. In the same command
-    /// line each is tmux's screen at the after sample, and a capture that
-    /// fails can't make tmux skip the sample.
+    /// Member `index` of a resize group around `middle`, a client or window
+    /// resize: every pane sampled before and after it, then the screens the
+    /// resize captures. In the same command line each is tmux's screen at
+    /// the after sample, and a capture that fails can't make tmux skip the
+    /// sample.
     fn resizeCommand(
-        client_size: ClientSize,
+        middle: Command,
         screens: []const ResizeInflight.ScreenCapture,
         index: usize,
     ) Command {
         return switch (index) {
             0 => .resize_sample_before,
-            1 => .{ .resize_client = client_size },
+            1 => middle,
             2 => .resize_sample_after,
             else => .{ .resize_screen = screens[index - resize_samples_len].capture },
         };
@@ -965,14 +1067,19 @@ pub const Viewer = struct {
         return inflight;
     }
 
-    /// Queue a client resize, with room for its commands reserved.
-    fn appendResize(self: *Viewer, client_size: ClientSize, inflight: ResizeInflight) void {
+    /// Queue a resize group, with room for its commands reserved.
+    fn appendResize(self: *Viewer, middle: Command, inflight: ResizeInflight) void {
         const count = resize_samples_len + inflight.screens.len;
         for (0..count) |i| self.command_queue.appendAssumeCapacity(.{
-            .command = resizeCommand(client_size, inflight.screens, i),
+            .command = resizeCommand(middle, inflight.screens, i),
             .group_end = i + 1 == count,
         });
-        self.resize_inflight = inflight;
+        if (self.resize_inflight == null) {
+            self.resize_inflight = inflight;
+        } else {
+            assert(self.resize_next == null);
+            self.resize_next = inflight;
+        }
     }
 
     /// The window's live zoomed pane, if its layout cell's width isn't the
@@ -991,20 +1098,25 @@ pub const Viewer = struct {
         return pane_id;
     }
 
-    /// Queue a client resize from inside an input. It's emitted with that
+    /// Queue a resize group from inside an input. It's emitted with that
     /// input's other commands.
-    fn queueResize(self: *Viewer, client_size: ClientSize) Allocator.Error!void {
+    fn queueResize(self: *Viewer, middle: Command) Allocator.Error!void {
         var inflight = try self.beginResize();
         errdefer inflight.deinit(self.alloc);
         try self.command_queue.ensureUnusedCapacity(self.alloc, resize_samples_len + inflight.screens.len);
-        self.appendResize(client_size, inflight);
+        self.appendResize(middle, inflight);
     }
 
     fn flushPendingResize(self: *Viewer) Allocator.Error!void {
         if (self.resize_inflight != null or self.recaptureInFlight()) return;
-        const pending = self.resize_pending orelse return;
-        self.resize_pending = null;
-        try self.queueResize(pending);
+        if (self.resize_pending) |pending| {
+            self.resize_pending = null;
+            return self.queueResize(.{ .resize_client = pending });
+        }
+        var storage: [2]Command.WindowResize = undefined;
+        for (self.windowResizes(&storage)) |window_resize| {
+            try self.queueResize(.{ .resize_window = window_resize });
+        }
     }
 
     fn recaptureInFlight(self: *const Viewer) bool {
@@ -1085,7 +1197,7 @@ pub const Viewer = struct {
 
     /// `refresh-client -A` exists from tmux 3.2.
     fn supportsPanePause(self: *const Viewer) bool {
-        return self.isAtLeastTmux32();
+        return self.isAtLeastTmux(3, 2);
     }
 
     /// From tmux 3.2 the command an `if-shell` runs is answered in a block
@@ -1093,12 +1205,12 @@ pub const Viewer = struct {
     /// Before that the block is marked as the server's, which no command
     /// waits for.
     pub fn answersCommandsIfShellRuns(self: *const Viewer) bool {
-        return self.isAtLeastTmux32();
+        return self.isAtLeastTmux(3, 2);
     }
 
-    fn isAtLeastTmux32(self: *const Viewer) bool {
+    fn isAtLeastTmux(self: *const Viewer, major: usize, minor: usize) bool {
         const version = parseTmuxVersion(self.tmux_version) orelse return false;
-        return version.major > 3 or (version.major == 3 and version.minor >= 2);
+        return version.major > major or (version.major == major and version.minor >= minor);
     }
 
     /// Refresh the lightweight metadata for every pane in one known window.
@@ -1913,7 +2025,8 @@ pub const Viewer = struct {
         after_content: ?[]const u8,
     ) !void {
         var inflight = self.resize_inflight orelse return;
-        self.resize_inflight = null;
+        self.resize_inflight = self.resize_next;
+        self.resize_next = null;
         defer inflight.deinit(self.alloc);
 
         if (after_content) |content| if (!inflight.failed) {
@@ -2120,6 +2233,10 @@ pub const Viewer = struct {
         // Transfer preserved version to replacement
         replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
 
+        // Nothing is asked for in the new session, so the topology reply
+        // clears the size tmux still keeps for a window of the old one.
+        replacement.window_size_applied = self.window_size_applied;
+
         // Save arena state back before swap
         replacement.action_arena = arena.state;
 
@@ -2279,6 +2396,8 @@ pub const Viewer = struct {
 
             .client_size, .resize_client => {},
 
+            .resize_window => |window_resize| self.window_size_applied = window_resize.applied(),
+
             .resize_sample_before => if (self.resize_inflight) |*inflight| {
                 inflight.before = parseResizeSamples(
                     inflight.arena.allocator(),
@@ -2372,6 +2491,16 @@ pub const Viewer = struct {
             // after sample always reports the outcome.
             .resize_sample_before, .resize_client => {
                 if (self.resize_inflight) |*inflight| inflight.failed = true;
+                return null;
+            },
+            .resize_window => |window_resize| {
+                if (self.resize_inflight) |*inflight| inflight.failed = true;
+
+                // Nothing sends the refused request again. One asked for
+                // since it was sent still goes out.
+                if (std.meta.eql(self.window_size_wanted, window_resize.applied())) {
+                    self.window_size_wanted = self.window_size_applied;
+                }
                 return null;
             },
             .resize_sample_after => {
@@ -3166,6 +3295,9 @@ pub const Viewer = struct {
         if (self.resize_inflight) |*inflight| {
             try inflight.output_panes.put(self.alloc, out.pane_id, {});
         }
+        if (self.resize_next) |*inflight| {
+            try inflight.output_panes.put(self.alloc, out.pane_id, {});
+        }
 
         const entry = self.panes.getEntry(out.pane_id) orelse {
             var carry = self.untracked_utf8.get(out.pane_id) orelse Utf8Carry{};
@@ -3610,6 +3742,9 @@ const Command = union(enum) {
     resize_client: Viewer.ClientSize,
     resize_sample_after,
 
+    /// A window resize, sampled as a client resize is.
+    resize_window: WindowResize,
+
     /// The screen of a pane that a client resize narrows and widens again,
     /// captured after its after sample.
     resize_screen: CaptureScreen,
@@ -3640,6 +3775,19 @@ const Command = union(enum) {
         styled: bool,
     };
 
+    const WindowResize = struct {
+        window_id: usize,
+
+        /// Null clears the window's size.
+        size: ?Viewer.ClientSize,
+
+        /// The window size tmux keeps once it has run this.
+        fn applied(self: WindowResize) ?Viewer.WindowSize {
+            const window_size = self.size orelse return null;
+            return .{ .window_id = self.window_id, .size = window_size };
+        }
+    };
+
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
@@ -3655,6 +3803,7 @@ const Command = union(enum) {
             .resize_sample_before,
             .resize_client,
             .resize_sample_after,
+            .resize_window,
             .resize_screen,
             .pane_pause,
             .pane_continue,
@@ -3692,6 +3841,7 @@ const Command = union(enum) {
             .resize_sample_before,
             .resize_client,
             .resize_sample_after,
+            .resize_window,
             .resize_screen,
             .hydration_recheck,
             .user,
@@ -3774,6 +3924,11 @@ const Command = union(enum) {
                 "refresh-client -C {d}x{d}",
                 .{ client_size.columns, client_size.rows },
             ),
+
+            .resize_window => |window_resize| if (window_resize.size) |window_size| try writer.print(
+                "refresh-client -C @{d}:{d}x{d}",
+                .{ window_resize.window_id, window_size.columns, window_size.rows },
+            ) else try writer.print("refresh-client -C @{d}:", .{window_resize.window_id}),
 
             .resize_sample_before, .resize_sample_after => try writer.writeAll(std.fmt.comptimePrint(
                 "list-panes -s -F '{s}'",
@@ -7367,6 +7522,272 @@ test "a current top/bottom or single-pane window sends today's resize whatever t
         try testing.expectEqual(25, hidden.terminal_owner.terminal.rows);
         try testing.expect(testCommandWith(testSelectWindow(&viewer, 0), "refresh-client -A '%0:pause'") != null);
     }
+}
+
+/// Writes each group a resize submits, as it goes to tmux.
+const TestResizeWire = struct {
+    wire: *std.Io.Writer.Allocating,
+
+    pub fn submitClientResize(self: @This(), members: []const []const u8) !void {
+        try (Viewer.CommandGroup{ .members = members }).write(&self.wire.writer);
+    }
+};
+
+const TestNoSubmit = struct {
+    pub fn submitClientResize(_: @This(), _: []const []const u8) !void {
+        return error.TestUnexpectedSubmit;
+    }
+};
+
+/// A resize group around `middle`, as it goes to tmux.
+inline fn testResizeLine(comptime middle: []const u8) []const u8 {
+    return comptime test_resize_sample ++ " ; refresh-client -C " ++ middle ++ " ; " ++ test_resize_sample ++ "\n";
+}
+
+/// Windows 1, the current one, and 2, each with one 20-column pane of the
+/// same id whose cursor is at (1,0).
+fn testTwoWindows(viewer: *Viewer) !void {
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    try viewer.windows.append(testing.allocator, try testResizeWindow(2, "9edf,20x10,0,0,2", false));
+    _ = try testResizePane(viewer, 1, 10, "a");
+    _ = try testResizePane(viewer, 2, 10, "b");
+}
+
+/// `testTwoWindows`' samples: pane 1 then pane 2, at these rows.
+const test_one_6 = "%1;20;6;1;0;0;0;f15e,20x6,0,0,1;\n";
+const test_one_8 = "%1;20;8;1;0;0;0;f95e,20x8,0,0,1;\n";
+const test_one_10 = "%1;20;10;1;0;0;0;9ede,20x10,0,0,1;\n";
+const test_two_6 = "%2;20;6;1;0;0;0;f15f,20x6,0,0,2;";
+const test_two_8 = "%2;20;8;1;0;0;0;f95f,20x8,0,0,2;";
+const test_two_10 = "%2;20;10;1;0;0;0;9edf,20x10,0,0,2;";
+
+/// Panes 1 and 2 are live, in place and at these rows.
+fn expectTwoWindowRows(viewer: *const Viewer, rows: [2]size.CellCountInt) !void {
+    for (rows, 1..) |expected, id| {
+        const pane = viewer.panes.get(id).?;
+        try testing.expectEqual(Viewer.Pane.Phase.live, pane.phase);
+        try testing.expect(!pane.stale);
+        try testing.expectEqual(expected, pane.terminal_owner.terminal.rows);
+    }
+}
+
+test "a window size is set, resized, moved and cleared, each in a sampled group" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    try testTwoWindows(&viewer);
+    var wire: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer wire.deinit();
+    const submit: TestResizeWire = .{ .wire = &wire };
+
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 6 }, submit);
+    try testing.expectEqualStrings(testResizeLine("@1:20x6"), wire.written());
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_10 ++ test_two_10, test_one_6 ++ test_two_10, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 6, 10 });
+
+    wire.clearRetainingCapacity();
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 8 }, submit);
+    try testing.expectEqualStrings(testResizeLine("@1:20x8"), wire.written());
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_6 ++ test_two_10, test_one_8 ++ test_two_10, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 8, 10 });
+
+    // Another window: the first is cleared in the same write, each in a
+    // group of its own, and each reply is followed in turn.
+    wire.clearRetainingCapacity();
+    try viewer.setWindowSize(2, .{ .columns = 20, .rows = 6 }, submit);
+    try testing.expectEqualStrings(testResizeLine("@1:") ++ testResizeLine("@2:20x6"), wire.written());
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_8 ++ test_two_10, test_one_10 ++ test_two_10, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 10, 10 });
+    try testing.expect(viewer.resize_inflight != null);
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_10 ++ test_two_10, test_one_10 ++ test_two_6, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 10, 6 });
+    try testing.expectEqual(
+        Viewer.WindowSize{ .window_id = 2, .size = .{ .columns = 20, .rows = 6 } },
+        viewer.window_size_applied.?,
+    );
+
+    // The size tmux already has isn't sent again.
+    wire.clearRetainingCapacity();
+    try viewer.setWindowSize(2, .{ .columns = 20, .rows = 6 }, submit);
+    try testing.expectEqualStrings("", wire.written());
+
+    try viewer.clearWindowSize(submit);
+    try testing.expectEqualStrings(testResizeLine("@2:"), wire.written());
+    try expectNoCommand(testCompleteResize(&viewer, test_one_10 ++ test_two_6, test_one_10 ++ test_two_10, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 10, 10 });
+    try testing.expect(viewer.window_size_applied == null);
+
+    wire.clearRetainingCapacity();
+    try viewer.clearWindowSize(submit);
+    try testing.expectEqualStrings("", wire.written());
+    try testing.expect(viewer.resize_inflight == null);
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "a window size tmux refuses isn't sent again, and one asked for since still is" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    try testTwoWindows(&viewer);
+    var wire: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer wire.deinit();
+    const submit: TestResizeWire = .{ .wire = &wire };
+
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 6 }, submit);
+    _ = testComplete(&viewer, test_one_10 ++ test_two_10);
+    _ = viewer.next(.{ .command_complete = .failure });
+    try expectNoCommand(viewer.next(.{ .command_complete = .skipped }));
+    try testing.expect(viewer.window_size_wanted == null);
+    try testing.expect(viewer.resize_inflight == null);
+    try expectTwoWindowRows(&viewer, .{ 10, 10 });
+
+    wire.clearRetainingCapacity();
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 6 }, submit);
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 8 }, submit);
+    try testing.expectEqualStrings(testResizeLine("@1:20x6"), wire.written());
+    _ = testComplete(&viewer, test_one_10 ++ test_two_10);
+    _ = viewer.next(.{ .command_complete = .failure });
+    const after_refusal = viewer.next(.{ .command_complete = .skipped });
+    try testing.expect(testCommandWith(after_refusal, "refresh-client -C @1:20x8") != null);
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_10 ++ test_two_10, test_one_8 ++ test_two_10, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 8, 10 });
+
+    // A move whose clear is refused: its set still counts, and nothing
+    // moves the size back.
+    wire.clearRetainingCapacity();
+    try viewer.setWindowSize(2, .{ .columns = 20, .rows = 6 }, submit);
+    try testing.expectEqualStrings(testResizeLine("@1:") ++ testResizeLine("@2:20x6"), wire.written());
+    _ = testComplete(&viewer, test_one_8 ++ test_two_10);
+    _ = viewer.next(.{ .command_complete = .failure });
+    _ = viewer.next(.{ .command_complete = .skipped });
+    try expectNoCommand(testCompleteResize(&viewer, test_one_8 ++ test_two_10, test_one_8 ++ test_two_6, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 8, 6 });
+    const moved: Viewer.WindowSize = .{ .window_id = 2, .size = .{ .columns = 20, .rows = 6 } };
+    try testing.expectEqual(moved, viewer.window_size_applied.?);
+    try testing.expectEqual(moved, viewer.window_size_wanted.?);
+}
+
+test "a window size asked for during a resize goes out after it, behind a pending client size" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    try testTwoWindows(&viewer);
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 10 }, TestAcceptResize{});
+    try viewer.setClientSize(.{ .columns = 20, .rows = 8 }, TestNoSubmit{});
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 6 }, TestNoSubmit{});
+    const unchanged = test_one_10 ++ test_two_10;
+    const client = testCompleteResize(&viewer, unchanged, unchanged, &.{});
+    try testing.expect(testCommandWith(client, "refresh-client -C 20x8") != null);
+    try testing.expect(testCommandWith(client, "refresh-client -C @1:20x6") == null);
+
+    const window = testCompleteResize(&viewer, unchanged, test_one_8 ++ test_two_8, &.{});
+    try testing.expect(testCommandWith(window, "refresh-client -C @1:20x6") != null);
+    try expectNoRecapture(testCompleteResize(&viewer, test_one_8 ++ test_two_8, test_one_6 ++ test_two_8, &.{}));
+    try expectTwoWindowRows(&viewer, .{ 6, 8 });
+}
+
+test "a window size moved during a resize goes out after it in one write, and both groups watch for reordered output" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    try testTwoWindows(&viewer);
+    try viewer.setWindowSize(1, .{ .columns = 20, .rows = 6 }, TestAcceptResize{});
+    _ = testCompleteResize(&viewer, test_one_10 ++ test_two_10, test_one_6 ++ test_two_10, &.{});
+
+    try viewer.setClientSize(.{ .columns = 20, .rows = 10 }, TestAcceptResize{});
+    try viewer.setWindowSize(2, .{ .columns = 20, .rows = 6 }, TestNoSubmit{});
+    const client = testCompleteResize(&viewer, test_one_6 ++ test_two_10, test_one_6 ++ test_two_10, &.{});
+    var wire: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer wire.deinit();
+    for (client) |action| switch (action) {
+        .command => |group| try group.write(&wire.writer),
+        else => {},
+    };
+    try testing.expectEqualStrings(testResizeLine("@1:") ++ testResizeLine("@2:20x6"), wire.written());
+
+    // Two panes print before either reply, so the set's reply may also
+    // have passed output.
+    testOutput(&viewer, 1, "\x1b[0m");
+    testOutput(&viewer, 2, "\x1b[0m");
+    _ = testCompleteResize(&viewer, test_one_6 ++ test_two_10, test_one_10 ++ test_two_10, &.{});
+    _ = testCompleteResize(&viewer, test_one_10 ++ test_two_10, test_one_10 ++ test_two_6, &.{});
+    const hidden = viewer.panes.get(2).?;
+    try testing.expect(hidden.stale);
+    try testing.expectEqual(6, hidden.terminal_owner.terminal.rows);
+}
+
+test "a window size needs tmux 3.3, a known window and both dimensions" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    const window_size: Viewer.ClientSize = .{ .columns = 20, .rows = 6 };
+    try testing.expectError(error.NotReady, viewer.setWindowSize(1, window_size, TestNoSubmit{}));
+    try testing.expectError(error.NotReady, viewer.clearWindowSize(TestNoSubmit{}));
+
+    // tmux's version hasn't been answered.
+    viewer.state = .command_queue;
+    try testing.expectError(error.NotReady, viewer.setWindowSize(1, window_size, TestNoSubmit{}));
+    try testing.expectError(error.NotReady, viewer.clearWindowSize(TestNoSubmit{}));
+
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.2a");
+    try testing.expectError(error.Unsupported, viewer.setWindowSize(1, window_size, TestNoSubmit{}));
+    try testing.expectError(error.Unsupported, viewer.clearWindowSize(TestNoSubmit{}));
+
+    testing.allocator.free(viewer.tmux_version);
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.3");
+    try testing.expectError(error.WindowUnknown, viewer.setWindowSize(1, window_size, TestNoSubmit{}));
+    try viewer.windows.append(testing.allocator, try testResizeWindow(1, "9ede,20x10,0,0,1", true));
+    _ = try testResizePane(&viewer, 1, 10, "a");
+    try testing.expectError(error.InvalidInput, viewer.setWindowSize(1, .{ .columns = 0, .rows = 6 }, TestNoSubmit{}));
+    try testing.expectError(error.InvalidInput, viewer.setWindowSize(1, .{ .columns = 20, .rows = 0 }, TestNoSubmit{}));
+    try viewer.clearWindowSize(TestNoSubmit{});
+    try viewer.setWindowSize(1, window_size, TestAcceptResize{});
+    try testing.expect(viewer.resize_inflight != null);
+}
+
+test "after a session change the old session's window size is cleared by id, then a new one is set" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    try testAttach(&viewer, "3.5a", "$1 @0 1 %0 50 41 a99d,50x41,0,0,0 a99d,50x41,0,0,0 zero", testStateLine(0, 50, 41));
+    try viewer.setWindowSize(0, .{ .columns = 50, .rows = 25 }, TestAcceptResize{});
+    _ = testCompleteResize(&viewer, "%0;50;41;0;0;0;0;a99d,50x41,0,0,0;", "%0;50;25;0;0;0;0;b59d,50x25,0,0,0;", &.{});
+
+    // `tmux switch-client` run in a pane moves the client to another
+    // session, and tmux keeps window 0's size.
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 2, .name = "other" } } });
+    const listed = testComplete(&viewer, "$2 @1 1 %1 50 41 a99e,50x41,0,0,1 a99e,50x41,0,0,1 one");
+    try testing.expect(testCommandWith(listed, "refresh-client -C @0:") != null);
+
+    // A size for the new session's window waits for the clear.
+    try viewer.setWindowSize(1, .{ .columns = 50, .rows = 25 }, TestNoSubmit{});
+    _ = testComplete(&viewer, testStateLine(1, 50, 41));
+    for (0..4) |_| _ = testComplete(&viewer, "");
+    const sample = "%1;50;41;0;0;0;0;a99e,50x41,0,0,1;";
+    const cleared = testCompleteResize(&viewer, sample, sample, &.{});
+    try testing.expect(testCommandWith(cleared, "refresh-client -C @1:50x25") != null);
+    try testing.expect(viewer.window_size_applied == null);
+}
+
+test "a one-pane window on the alternate screen follows a window size set and cleared without a recapture" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+    viewer.state = .command_queue;
+    viewer.tmux_version = try testing.allocator.dupe(u8, "3.5a");
+    try viewer.windows.append(testing.allocator, try testResizeWindow(0, test_zoomed_layouts[0], true));
+    const pane = try testLivePane(&viewer, 0, 50, 41, testRows(0, 49, "\r\n") ++ "\x1b[?1049h\x1b[HALT");
+    const tall = "%0;50;41;3;0;10;1;a99d,50x41,0,0,0;";
+    const short = "%0;50;25;3;0;10;1;b59d,50x25,0,0,0;";
+
+    try viewer.setWindowSize(0, .{ .columns = 50, .rows = 25 }, TestAcceptResize{});
+    try expectNoRecapture(testCompleteResize(&viewer, tall, short, &.{}));
+    try testing.expect(!pane.stale);
+    try testing.expectEqual(25, pane.terminal_owner.terminal.rows);
+    try expectScreen(pane, "", "ALT");
+
+    try viewer.clearWindowSize(TestAcceptResize{});
+    try expectNoRecapture(testCompleteResize(&viewer, short, tall, &.{}));
+    try testing.expect(!pane.stale);
+    try testing.expectEqual(41, pane.terminal_owner.terminal.rows);
+    try expectScreen(pane, "", "ALT");
+    try testing.expect(resize.cursorMatches(&pane.terminal_owner.terminal, 3, 0));
 }
 
 fn testCell(pane: *Viewer.Pane, x: size.CellCountInt, y: size.CellCountInt) @import("../../terminal/PageList.zig").Pin {
