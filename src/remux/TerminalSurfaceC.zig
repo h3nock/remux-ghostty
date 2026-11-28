@@ -127,6 +127,7 @@ pub const InteractionState = extern struct {
     route: ScrollRoute,
     mouse_captured: bool,
     has_selection: bool,
+    alternate_screen: bool,
 };
 
 pub const SelectionEndpoint = TerminalSurface.SelectionEndpoint;
@@ -215,6 +216,7 @@ fn interactionStateC(state: TerminalSurface.InteractionState) InteractionState {
         .route = state.route,
         .mouse_captured = state.mouse_captured,
         .has_selection = state.has_selection,
+        .alternate_screen = state.alternate_screen,
     };
 }
 
