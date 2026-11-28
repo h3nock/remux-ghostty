@@ -2,10 +2,13 @@
 //! environment names what it needs, starts its own tmux server on a private
 //! socket, and kills it afterwards, also on failure.
 //!
-//! Both need:
+//! Each needs:
 //!
 //! - REMUX_TMUX_LIVE_BIN: the tmux binary, or a program that takes tmux's
 //!   arguments and runs one, in a container say.
+//!
+//! Resizes and pastes also need:
+//!
 //! - REMUX_TMUX_LIVE_DIR: a directory for the files the panes' programs
 //!   write, at the same path for those programs as for the test.
 //!
@@ -27,6 +30,14 @@
 //!
 //! - REMUX_TMUX_LIVE_PASTE_REPORT: the path of the report it writes, with
 //!   the commands the client wrote and the bytes each pane's program read.
+//!
+//! Window sizes: the client sizes one window, moves the size to other
+//! windows and clears it. After each step tmux must show only the sized
+//! window at its own size, every pane's mirror must equal tmux's pane, and
+//! a one-pane window on the alternate screen must follow without a
+//! recapture. From tmux 3.3. It also needs:
+//!
+//! - REMUX_TMUX_LIVE_WINDOW_SIZE_REPORT: the path of the report it writes.
 
 const std = @import("std");
 const testing = std.testing;
@@ -1051,6 +1062,171 @@ test "tmux client pastes reach a real tmux's panes ahead of the input after them
             try live.print("ERROR {s} {s}: {s}", .{ version, case.name, @errorName(err) });
         };
     }
+    try live.print("mismatches={d} errors={d}", .{ live.mismatches, live.errors });
+    try testing.expectEqual(0, live.mismatches);
+    try testing.expectEqual(0, live.errors);
+}
+
+/// One step of the window size run: a window sized to 50 columns and
+/// `rows`, or the size cleared, and every window's size in tmux after it.
+const WindowSizeStep = struct {
+    name: []const u8,
+    window: ?usize,
+    rows: u16 = 0,
+    expected: []const u8,
+};
+
+const window_size_steps = [_]WindowSizeStep{
+    .{ .name = "set on the current window", .window = 0, .rows = 25, .expected = "@0 50x25\n@1 50x41\n@2 50x41" },
+    .{ .name = "cleared", .window = null, .expected = "@0 50x41\n@1 50x41\n@2 50x41" },
+    .{ .name = "set again", .window = 0, .rows = 25, .expected = "@0 50x25\n@1 50x41\n@2 50x41" },
+    .{ .name = "moved to a hidden window", .window = 1, .rows = 30, .expected = "@0 50x41\n@1 50x30\n@2 50x41" },
+    .{ .name = "moved to a split window", .window = 2, .rows = 25, .expected = "@0 50x41\n@1 50x41\n@2 50x25" },
+    .{ .name = "cleared at the end", .window = null, .expected = "@0 50x41\n@1 50x41\n@2 50x41" },
+};
+
+/// Window 0 holds a program on the alternate screen, window 1 a program
+/// with history, and window 2 a top/bottom split of two such programs.
+/// Returns whether every step was as expected.
+fn windowSizeRun(live: *Live, version: []const u8) !bool {
+    live.runs += 1;
+    var socket_buffer: [64]u8 = undefined;
+    live.socket = try std.fmt.bufPrint(&socket_buffer, "remux-window-size-live-{d}", .{std.c.getpid()});
+    defer live.tmux(&.{"kill-server"}) catch {};
+
+    try live.tmux(&.{ "new-session", "-d", "-s", "s", "-x", "50", "-y", "41", "printf '\\033[?1049h\\033[HALT'; exec sleep 100000" });
+    try live.tmux(&.{ "new-window", "-d", "-t", "s:1", "seq 1 60; exec sleep 100000" });
+    try live.tmux(&.{ "new-window", "-d", "-t", "s:2", "seq 101 130; exec sleep 100000" });
+    try live.tmux(&.{ "split-window", "-d", "-v", "-t", "s:2", "seq 201 230; exec sleep 100000" });
+    const pane_count = 4;
+    for (0..pane_count) |id| {
+        var target_buffer: [8]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buffer, "%{d}", .{id});
+        for (0..200) |_| {
+            const ready = try live.output(&.{ "display-message", "-p", "-t", target, "#{?#{||:#{alternate_on},#{history_size}},1,0}" });
+            defer testing.allocator.free(ready);
+            if (std.mem.eql(u8, ready, "1")) break;
+            try sleepMs(25);
+        } else return error.PaneProgramDidNotStart;
+    }
+
+    var run: Run = .{
+        .live = live,
+        .child = try std.process.spawn(testing.io, .{
+            .argv = &.{ live.bin, "-L", live.socket, "-f", "/dev/null", "-C", "attach", "-t", "s" },
+            .environ_map = &live.env,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }),
+        .client = undefined,
+        .buffer = undefined,
+        .zoom = &.{},
+    };
+    defer run.child.kill(testing.io);
+    run.buffer = try testing.allocator.alloc(u8, 1 << 16);
+    run.client = ControlClient.init(testing.io, testing.allocator, .{
+        .max_scrollback = 10_000,
+        .history_line_limit = 2_000,
+        .initial_client_size = .{ .columns = 50, .rows = 41 },
+    }) catch |err| {
+        testing.allocator.free(run.buffer);
+        return err;
+    };
+    defer run.deinit();
+    try run.settle();
+    try live.print("== {s}: window sizes", .{version});
+
+    var ok = true;
+    for (window_size_steps) |step| {
+        run.recaptured.clearRetainingCapacity();
+        const asked = if (step.window) |id|
+            run.client.setWindowSize(id, .{ .columns = 50, .rows = step.rows })
+        else
+            run.client.clearWindowSize();
+        asked catch |err| switch (err) {
+            error.Unsupported => {
+                // Only a tmux older than 3.3 may refuse it.
+                if (atLeastTmux33(version)) return err;
+                try live.print("tmux has no window size before 3.3", .{});
+                return true;
+            },
+            else => return err,
+        };
+        try run.settle();
+
+        const sizes = try live.output(&.{ "list-windows", "-t", "s", "-F", "#{window_id} #{window_width}x#{window_height}" });
+        defer testing.allocator.free(sizes);
+        const sizes_ok = std.mem.eql(u8, sizes, step.expected);
+
+        // The pane on the alternate screen follows every step in place.
+        const followed = !run.recaptured.contains(0) and !run.client.viewer.panes.get(0).?.stale;
+        if (!sizes_ok or !followed) ok = false;
+
+        // A hidden window's stale pane is recaptured when it's shown;
+        // recapture it now to keep comparing it.
+        var fallbacks: usize = 0;
+        for (0..pane_count) |id| {
+            const pane = run.client.viewer.panes.get(id).?;
+            if (!run.recaptured.contains(id) and !pane.stale) continue;
+            fallbacks += 1;
+            if (pane.stale) {
+                try run.client.refreshPane(id);
+                try run.settle();
+            }
+        }
+        std.mem.replaceScalar(u8, sizes, '\n', ',');
+        try live.print("{s}: tmux {s}{s}; pane %0 {s}; panes recaptured {d}", .{
+            step.name,
+            sizes,
+            if (sizes_ok) "" else "   <-- expected another size",
+            if (followed) "followed in place" else "RECAPTURED",
+            fallbacks,
+        });
+        for (0..pane_count) |id| try run.check(id, step.name);
+    }
+    try live.print("{s}", .{if (ok) "PASS" else "FAIL"});
+    if (!ok) live.mismatches += 1;
+    return ok;
+}
+
+/// Whether `tmux -V` output such as "tmux 3.5a" names 3.3 or later.
+fn atLeastTmux33(version: []const u8) bool {
+    var numbers = std.mem.tokenizeAny(u8, version, " -.abcdefghijklmnopqrstuvwxyz");
+    const major = std.fmt.parseInt(usize, numbers.next() orelse return false, 10) catch return false;
+    const minor = std.fmt.parseInt(usize, numbers.next() orelse return false, 10) catch return false;
+    return major > 3 or (major == 3 and minor >= 3);
+}
+
+test "tmux client window sizes change only their window and keep a real tmux's panes" {
+    const bin = env("REMUX_TMUX_LIVE_BIN") orelse return error.SkipZigTest;
+    const report_path = env("REMUX_TMUX_LIVE_WINDOW_SIZE_REPORT") orelse return error.SkipZigTest;
+
+    var live: Live = .{
+        .bin = bin,
+        .gen = "",
+        .dir = "",
+        .socket = "",
+        .env = .init(testing.allocator),
+        .report = try std.Io.Dir.createFileAbsolute(testing.io, report_path, .{}),
+    };
+    defer live.env.deinit();
+    defer live.report.close(testing.io);
+    try live.env.put("PATH", "/usr/bin:/bin");
+    try live.env.put("HOME", env("HOME") orelse "/");
+    try live.env.put("TERM", "xterm-256color");
+    try live.env.put("LANG", "en_US.UTF-8");
+    try live.env.put("SHELL", "/bin/sh");
+
+    const version_result = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ bin, "-V" } });
+    defer testing.allocator.free(version_result.stdout);
+    defer testing.allocator.free(version_result.stderr);
+    const version = std.mem.trim(u8, version_result.stdout, " \r\n");
+
+    _ = windowSizeRun(&live, version) catch |err| {
+        live.errors += 1;
+        try live.print("ERROR {s}: {s}", .{ version, @errorName(err) });
+    };
     try live.print("mismatches={d} errors={d}", .{ live.mismatches, live.errors });
     try testing.expectEqual(0, live.mismatches);
     try testing.expectEqual(0, live.errors);

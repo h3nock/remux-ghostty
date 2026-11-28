@@ -1308,6 +1308,7 @@ typedef enum {
   GHOSTTY_TMUX_RESULT_PANE_UNKNOWN,
   GHOSTTY_TMUX_RESULT_CALLBACK_ACTIVE,
   GHOSTTY_TMUX_RESULT_WINDOW_UNKNOWN,
+  GHOSTTY_TMUX_RESULT_UNSUPPORTED,
 } ghostty_tmux_result_e;
 
 typedef struct {
@@ -1659,8 +1660,9 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // borrowed only for the action callback. The callback may visit topology,
 // enqueue commands, send pane input, refresh a pane, read outbound bytes, or
 // retain a pane terminal.
-// It must not feed, consume, or free the client. Reentrant feed is rejected;
-// consume and free are rejected while a callback is active.
+// It must not feed, consume, or free the client, or set or clear a window
+// size. Reentrant feed is rejected; consume, free, set_window_size, and
+// clear_window_size are rejected while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
     const ghostty_tmux_client_config_s*,
@@ -1674,7 +1676,8 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_feed(
 
 // The returned outbound bytes are borrowed until the next feed, consume, or
 // free call, or the next call that queues commands or input: enqueue, pane
-// input, refresh_pane, refresh_window_pane_metadata, or set_client_size.
+// input, refresh_pane, refresh_window_pane_metadata, set_client_size,
+// set_window_size, or clear_window_size.
 // Outbound read inside an action callback is valid only for that callback and
 // is invalidated immediately by a callback enqueue; the active feed may also
 // enqueue after the callback returns. Hosts should
@@ -1790,6 +1793,32 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
     ghostty_tmux_client_t,
     uint16_t,
     uint16_t);
+
+// Sizes one window with refresh-client -C @window:columnsxrows, which tmux
+// keeps for that window until it is cleared, whatever the client's size.
+// One window is sized at a time: a size on another window is cleared in the
+// same write. Each resize is sampled and followed as set_client_size's is.
+// While a resize or recapture is in flight only the newest request is kept
+// and sent afterwards, after a pending client size. A request tmux refuses
+// is not sent again. NOT_READY means the client cannot accept commands or
+// the tmux version is not known yet; UNSUPPORTED means tmux is older than
+// 3.3, which has no window size; WINDOW_UNKNOWN means the window is not in
+// the current topology; INVALID_INPUT means a zero dimension; CALLBACK_ACTIVE
+// means it was called from inside a callback, where its commands could reach
+// tmux ahead of the client's own: call it after the callback returns. A
+// session change clears the size and forgets the request, so the host asks
+// again for a window of the new session.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_window_size(
+    ghostty_tmux_client_t,
+    uint64_t,
+    uint16_t,
+    uint16_t);
+
+// Clears the window size set_window_size set, by the window's id, also after
+// the client moved to another session. NOT_READY, UNSUPPORTED, and
+// CALLBACK_ACTIVE are as for set_window_size.
+GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_clear_window_size(
+    ghostty_tmux_client_t);
 
 // Refreshes current command and path metadata for every pane in one known
 // window using one list-panes command. Terminal contents, pane phases, and tmux

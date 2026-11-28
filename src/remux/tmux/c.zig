@@ -23,6 +23,7 @@ pub const Result = enum(c_int) {
     pane_unknown,
     callback_active,
     window_unknown,
+    unsupported,
 };
 
 pub const Bytes = extern struct {
@@ -496,6 +497,27 @@ export fn ghostty_tmux_client_set_client_size(
     return .ok;
 }
 
+export fn ghostty_tmux_client_set_window_size(
+    client: ?*Client,
+    window_id: u64,
+    columns: u16,
+    rows: u16,
+) Result {
+    const value = client orelse return .invalid_input;
+    if (value.callback_active) return .callback_active;
+    const id = std.math.cast(usize, window_id) orelse return .invalid_input;
+    value.control.setWindowSize(id, .{ .columns = columns, .rows = rows }) catch |err|
+        return mapClientError(err);
+    return .ok;
+}
+
+export fn ghostty_tmux_client_clear_window_size(client: ?*Client) Result {
+    const value = client orelse return .invalid_input;
+    if (value.callback_active) return .callback_active;
+    value.control.clearWindowSize() catch |err| return mapClientError(err);
+    return .ok;
+}
+
 export fn ghostty_tmux_client_refresh_window_pane_metadata(
     client: ?*Client,
     window_id: u64,
@@ -609,6 +631,7 @@ fn mapClientError(err: ControlClient.Error) Result {
         error.TokenExhausted => .token_exhausted,
         error.PaneUnknown => .pane_unknown,
         error.WindowUnknown => .window_unknown,
+        error.Unsupported => .unsupported,
     };
 }
 
@@ -631,6 +654,8 @@ const TestContext = struct {
     enqueue_in_callback: bool = false,
     callback_free_result: Result = .failed,
     callback_consume_result: Result = .failed,
+    callback_set_window_size_result: Result = .failed,
+    callback_clear_window_size_result: Result = .failed,
     callback_enqueue_result: Result = .failed,
     callback_token: u64 = 0,
     retain_pane_id: ?u64 = null,
@@ -679,6 +704,8 @@ const TestContext = struct {
                         0,
                     );
                     self.callback_free_result = ghostty_tmux_client_free(self.client);
+                    self.callback_set_window_size_result = ghostty_tmux_client_set_window_size(self.client, 0, 80, 24);
+                    self.callback_clear_window_size_result = ghostty_tmux_client_clear_window_size(self.client);
                 }
                 if (self.enqueue_in_callback) {
                     const command = "display-message -p callback";
@@ -813,6 +840,7 @@ test "tmux C client public ABI matches ghostty header" {
 
     try testing.expectEqual(@as(c_int, @intFromEnum(Result.ok)), @as(c_int, c.GHOSTTY_TMUX_RESULT_OK));
     try testing.expectEqual(@as(c_int, @intFromEnum(Result.callback_active)), @as(c_int, c.GHOSTTY_TMUX_RESULT_CALLBACK_ACTIVE));
+    try testing.expectEqual(@as(c_int, @intFromEnum(Result.unsupported)), @as(c_int, c.GHOSTTY_TMUX_RESULT_UNSUPPORTED));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.exit)), @as(c_int, c.GHOSTTY_TMUX_ACTION_EXIT));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.command_complete)), @as(c_int, c.GHOSTTY_TMUX_ACTION_COMMAND_COMPLETE));
     try testing.expectEqual(@as(c_int, @intFromEnum(ActionTag.input_failed)), @as(c_int, c.GHOSTTY_TMUX_ACTION_INPUT_FAILED));
@@ -966,6 +994,8 @@ test "tmux C client transport batching and callback contract" {
     try testing.expectEqualStrings("main", context.session_name[0..context.session_name_len]);
     try testing.expectEqual(Result.callback_active, context.callback_consume_result);
     try testing.expectEqual(Result.callback_active, context.callback_free_result);
+    try testing.expectEqual(Result.callback_active, context.callback_set_window_size_result);
+    try testing.expectEqual(Result.callback_active, context.callback_clear_window_size_result);
     try testing.expectEqual(Result.ok, context.callback_enqueue_result);
 
     try consumeAllTest(&client);
@@ -1352,6 +1382,25 @@ test "tmux C client window pane metadata refresh boundary" {
         Result.ok,
         ghostty_tmux_client_refresh_window_pane_metadata(&client, 0),
     );
+}
+
+test "tmux C client window size boundary" {
+    const testing = std.testing;
+    var context: TestContext = .{};
+    var client = try Client.init(testing.allocator, testConfig(&context));
+    defer client.deinit();
+    context.client = &client;
+
+    try testing.expectEqual(Result.invalid_input, ghostty_tmux_client_set_window_size(null, 0, 80, 24));
+    try testing.expectEqual(Result.invalid_input, ghostty_tmux_client_clear_window_size(null));
+    try testing.expectEqual(Result.not_ready, ghostty_tmux_client_set_window_size(&client, 0, 80, 24));
+    try testing.expectEqual(Result.not_ready, ghostty_tmux_client_clear_window_size(&client));
+    try testing.expectEqual(Result.invalid_input, ghostty_tmux_client_set_window_size(&client, 0, 0, 24));
+
+    // The test server is tmux 3.1.
+    try openPaneTestClient(&client);
+    try testing.expectEqual(Result.unsupported, ghostty_tmux_client_set_window_size(&client, 0, 80, 24));
+    try testing.expectEqual(Result.unsupported, ghostty_tmux_client_clear_window_size(&client));
 }
 
 test "tmux C client topology and retained terminal lifetime" {
