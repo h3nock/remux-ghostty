@@ -1660,8 +1660,9 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // borrowed only for the action callback. The callback may visit topology,
 // enqueue commands, send pane input, refresh a pane, read outbound bytes, or
 // retain a pane terminal.
-// It must not feed, consume, or free the client. Reentrant feed is rejected;
-// consume and free are rejected while a callback is active.
+// It must not feed, consume, or free the client, or set or clear a window
+// size. Reentrant feed is rejected; consume, free, set_window_size, and
+// clear_window_size are rejected while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
     const ghostty_tmux_client_config_s*,
@@ -1796,7 +1797,8 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
 // Sizes one window with refresh-client -C @window:columnsxrows, which tmux
 // keeps for that window until it is cleared, whatever the client's size.
 // One window is sized at a time: a size on another window is cleared in the
-// same write. Each resize is sampled and followed as set_client_size's is.
+// same write. tmux has no error for that clear; if it were refused, the old
+// window would keep its size. Each resize is sampled and followed as set_client_size's is.
 // While a resize or recapture is in flight only the newest request is kept
 // and sent afterwards, after a pending client size. A request tmux refuses
 // is not sent again. NOT_READY means the client cannot accept commands or
@@ -1814,7 +1816,8 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_window_size(
     uint16_t);
 
 // Clears the window size set_window_size set, by the window's id, also after
-// the client moved to another session. Results are as set_window_size's.
+// the client moved to another session. NOT_READY, UNSUPPORTED, and
+// CALLBACK_ACTIVE are as for set_window_size.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_clear_window_size(
     ghostty_tmux_client_t);
 
