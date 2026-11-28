@@ -1660,9 +1660,10 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // borrowed only for the action callback. The callback may visit topology,
 // enqueue commands, send pane input, refresh a pane, read outbound bytes, or
 // retain a pane terminal.
-// It must not feed, consume, or free the client, set the client or a window
-// size, or refresh a window's pane metadata. Reentrant feed is rejected; the
-// others are rejected with CALLBACK_ACTIVE while a callback is active.
+// It must not feed, consume, or free the client, set the client size, set or
+// clear a window size, or refresh a window's pane metadata. Reentrant feed is
+// rejected; the others are rejected with CALLBACK_ACTIVE while a callback is
+// active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
     const ghostty_tmux_client_config_s*,
