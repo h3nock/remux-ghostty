@@ -504,6 +504,7 @@ export fn ghostty_tmux_client_set_window_size(
     rows: u16,
 ) Result {
     const value = client orelse return .invalid_input;
+    if (value.callback_active) return .callback_active;
     const id = std.math.cast(usize, window_id) orelse return .invalid_input;
     value.control.setWindowSize(id, .{ .columns = columns, .rows = rows }) catch |err|
         return mapClientError(err);
@@ -512,6 +513,7 @@ export fn ghostty_tmux_client_set_window_size(
 
 export fn ghostty_tmux_client_clear_window_size(client: ?*Client) Result {
     const value = client orelse return .invalid_input;
+    if (value.callback_active) return .callback_active;
     value.control.clearWindowSize() catch |err| return mapClientError(err);
     return .ok;
 }
@@ -652,6 +654,8 @@ const TestContext = struct {
     enqueue_in_callback: bool = false,
     callback_free_result: Result = .failed,
     callback_consume_result: Result = .failed,
+    callback_set_window_size_result: Result = .failed,
+    callback_clear_window_size_result: Result = .failed,
     callback_enqueue_result: Result = .failed,
     callback_token: u64 = 0,
     retain_pane_id: ?u64 = null,
@@ -700,6 +704,8 @@ const TestContext = struct {
                         0,
                     );
                     self.callback_free_result = ghostty_tmux_client_free(self.client);
+                    self.callback_set_window_size_result = ghostty_tmux_client_set_window_size(self.client, 0, 80, 24);
+                    self.callback_clear_window_size_result = ghostty_tmux_client_clear_window_size(self.client);
                 }
                 if (self.enqueue_in_callback) {
                     const command = "display-message -p callback";
@@ -988,6 +994,8 @@ test "tmux C client transport batching and callback contract" {
     try testing.expectEqualStrings("main", context.session_name[0..context.session_name_len]);
     try testing.expectEqual(Result.callback_active, context.callback_consume_result);
     try testing.expectEqual(Result.callback_active, context.callback_free_result);
+    try testing.expectEqual(Result.callback_active, context.callback_set_window_size_result);
+    try testing.expectEqual(Result.callback_active, context.callback_clear_window_size_result);
     try testing.expectEqual(Result.ok, context.callback_enqueue_result);
 
     try consumeAllTest(&client);

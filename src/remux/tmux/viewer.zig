@@ -295,9 +295,9 @@ pub const Viewer = struct {
     /// Incomplete UTF-8 prefixes received before their pane is discovered.
     untracked_utf8: std.AutoArrayHashMapUnmanaged(usize, Utf8Carry),
 
-    /// The client resize waiting for its reply, and the newest size asked
-    /// for since. One resize at a time keeps each reply bracketing exactly
-    /// one tmux resize.
+    /// The resize group waiting for its reply, and the newest client size
+    /// asked for since. Each group's samples bracket exactly one tmux
+    /// resize.
     resize_inflight: ?ResizeInflight = null,
     resize_pending: ?ClientSize = null,
 
@@ -844,7 +844,7 @@ pub const Viewer = struct {
         if (pane.phase != .live) return error.NotReady;
 
         // A recapture pauses the pane's output, which would void the
-        // ordering a client resize relies on.
+        // ordering a resize group relies on.
         if (self.resize_inflight != null) return error.NotReady;
 
         // ControlClient submits every Viewer group synchronously. Refusing a
@@ -1046,7 +1046,7 @@ pub const Viewer = struct {
         };
     }
 
-    /// A client resize about to be sent. It captures the screen of the
+    /// A resize group about to be sent. It captures the screen of the
     /// current window's pane that tmux narrows to its layout cell and widens
     /// again, which rows can't follow. A hidden window's pane is recaptured
     /// when its window is shown instead: a hidden pane that prints during a
@@ -3735,8 +3735,8 @@ const Command = union(enum) {
     /// Report the initial control-client grid before querying topology.
     client_size: Viewer.ClientSize,
 
-    /// A client resize Remux applies itself: every pane sampled before and
-    /// after `refresh-client -C` in one command line, which tmux runs without
+    /// A resize Remux applies itself: every pane sampled before and after
+    /// `refresh-client -C` in one command line, which tmux runs without
     /// parsing pane output in between.
     resize_sample_before,
     resize_client: Viewer.ClientSize,

@@ -1146,6 +1146,8 @@ fn windowSizeRun(live: *Live, version: []const u8) !bool {
             run.client.clearWindowSize();
         asked catch |err| switch (err) {
             error.Unsupported => {
+                // Only a tmux older than 3.3 may refuse it.
+                if (atLeastTmux33(version)) return err;
                 try live.print("tmux has no window size before 3.3", .{});
                 return true;
             },
@@ -1186,6 +1188,14 @@ fn windowSizeRun(live: *Live, version: []const u8) !bool {
     try live.print("{s}", .{if (ok) "PASS" else "FAIL"});
     if (!ok) live.mismatches += 1;
     return ok;
+}
+
+/// Whether `tmux -V` output such as "tmux 3.5a" names 3.3 or later.
+fn atLeastTmux33(version: []const u8) bool {
+    var numbers = std.mem.tokenizeAny(u8, version, " -.abcdefghijklmnopqrstuvwxyz");
+    const major = std.fmt.parseInt(usize, numbers.next() orelse return false, 10) catch return false;
+    const minor = std.fmt.parseInt(usize, numbers.next() orelse return false, 10) catch return false;
+    return major > 3 or (major == 3 and minor >= 3);
 }
 
 test "tmux client window sizes change only their window and keep a real tmux's panes" {

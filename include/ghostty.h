@@ -1802,7 +1802,11 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
 // is not sent again. NOT_READY means the client cannot accept commands or
 // the tmux version is not known yet; UNSUPPORTED means tmux is older than
 // 3.3, which has no window size; WINDOW_UNKNOWN means the window is not in
-// the current topology; INVALID_INPUT means a zero dimension.
+// the current topology; INVALID_INPUT means a zero dimension; CALLBACK_ACTIVE
+// means it was called from inside a callback, where its commands could reach
+// tmux ahead of the client's own: call it after the callback returns. A
+// session change clears the size and forgets the request, so the host asks
+// again for a window of the new session.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_window_size(
     ghostty_tmux_client_t,
     uint64_t,
