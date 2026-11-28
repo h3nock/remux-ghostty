@@ -147,6 +147,10 @@ pub const InteractionState = struct {
     route: ScrollRoute,
     mouse_captured: bool,
     has_selection: bool,
+    /// Whether the terminal shows its alternate screen, as a full-screen
+    /// program does. Unlike `route`, mouse modes and scrolling settings don't
+    /// change it.
+    alternate_screen: bool,
 };
 
 pub const SelectionEndpoint = enum(c_int) {
@@ -660,6 +664,7 @@ fn normalizeAndSnapshotInteractionLocked(
     }
     const mouse_captured = self.mouse_reporting and
         term.flags.mouse_event != .none;
+    const alternate_screen = term.screens.active_key == .alternate;
 
     return .{
         .scrollbar = .{
@@ -670,7 +675,7 @@ fn normalizeAndSnapshotInteractionLocked(
         },
         .route = if (mouse_captured)
             .remote_mouse
-        else if (term.screens.active_key == .alternate and
+        else if (alternate_screen and
             term.flags.mouse_event == .none and
             term.modes.get(.mouse_alternate_scroll))
             .alternate_screen_cursor
@@ -678,6 +683,7 @@ fn normalizeAndSnapshotInteractionLocked(
             .viewport,
         .mouse_captured = mouse_captured,
         .has_selection = screen.selection != null,
+        .alternate_screen = alternate_screen,
     };
 }
 
@@ -2660,6 +2666,7 @@ test "terminal surface interaction state and position scrolling" {
     try testing.expectEqual(ScrollRoute.viewport, state.route);
     try testing.expect(!state.mouse_captured);
     try testing.expect(!state.has_selection);
+    try testing.expect(!state.alternate_screen);
 
     try surface.scrollToPosition(1, -0.25, &state);
     try testing.expectEqual(@as(usize, 0), state.scrollbar.offset);
@@ -2692,6 +2699,7 @@ test "terminal surface interaction state and position scrolling" {
     try testing.expectEqual(ScrollRoute.alternate_screen_cursor, state.route);
     try testing.expect(!state.mouse_captured);
     try testing.expect(state.has_selection);
+    try testing.expect(state.alternate_screen);
 
     shared.mutex.lockUncancelable(global.io());
     shared.terminal.flags.mouse_event = .normal;
@@ -2700,6 +2708,7 @@ test "terminal surface interaction state and position scrolling" {
     state = surface.interactionState();
     try testing.expectEqual(ScrollRoute.remote_mouse, state.route);
     try testing.expect(state.mouse_captured);
+    try testing.expect(state.alternate_screen);
     try testing.expectEqual(@as(f64, 0), state.scrollbar.cell_offset);
     {
         shared.mutex.lockUncancelable(global.io());
@@ -2714,6 +2723,17 @@ test "terminal surface interaction state and position scrolling" {
     state = surface.interactionState();
     try testing.expectEqual(ScrollRoute.viewport, state.route);
     try testing.expect(!state.mouse_captured);
+    try testing.expect(state.alternate_screen);
+
+    shared.mutex.lockUncancelable(global.io());
+    {
+        defer shared.mutex.unlock(global.io());
+        var stream = shared.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049l");
+    }
+    state = surface.interactionState();
+    try testing.expect(!state.alternate_screen);
 }
 
 test "terminal surface selection snapshot follows viewport and active screen" {

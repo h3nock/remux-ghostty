@@ -1503,6 +1503,9 @@ typedef struct {
   ghostty_terminal_surface_scroll_route_e route;
   bool mouse_captured;
   bool has_selection;
+  // Whether the terminal shows its alternate screen, as a full-screen program
+  // does. Unlike route, mouse modes and scrolling settings don't change it.
+  bool alternate_screen;
 } ghostty_terminal_surface_interaction_state_s;
 
 typedef enum {
@@ -1909,7 +1912,8 @@ GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_size(
     ghostty_surface_size_s*);
 
 // Returns one synchronized snapshot of scrollbar geometry, fractional top-row
-// presentation offset, input routing, effective mouse capture, and selection.
+// presentation offset, input routing, effective mouse capture, selection, and
+// whether the alternate screen is shown.
 GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_interaction_state(
     ghostty_terminal_surface_t,
