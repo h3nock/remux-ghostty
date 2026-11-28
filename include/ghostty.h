@@ -1575,6 +1575,14 @@ typedef struct {
   bool plain_legacy_keys;
   // With plain_legacy_keys, Shift+Enter sends LF instead of CR.
   bool shift_enter_line_feed;
+  // The terminal's grid is sized elsewhere, as tmux sizes a pane's, and the
+  // host resizes the view to follow it: the view's size is the grid times the
+  // cell size plus padding, give or take its last pixel. While the view holds
+  // another grid, as between a resize of the terminal and the matching resize
+  // of the view, the surface keeps its last frame instead of drawing the grid
+  // into a view of another size. Off, the surface draws whatever grid the
+  // terminal has into the view.
+  bool backend_sized_grid;
 } ghostty_terminal_surface_config_s;
 
 // Returns the default producer configuration: 80 columns, 24 rows, and 10,000
@@ -1873,9 +1881,13 @@ ghostty_terminal_surface_update_config(ghostty_terminal_surface_t);
 GHOSTTY_API void ghostty_terminal_surface_free(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_draw(
     ghostty_terminal_surface_t);
-// Asynchronously rebuild and publish a frame from the current terminal state.
-// This works while the surface is hidden and does not change visibility or
-// focus. Multiple requests queued before the renderer wakes may be coalesced.
+// Ask the render thread to draw and submit a frame of the terminal, built from
+// its current state or from cells that still fit the view. This works while
+// the surface is hidden and does not change visibility or focus. Multiple
+// requests queued before the renderer wakes may be coalesced. A request stands
+// until the render thread submits a frame for it; with backend_sized_grid it
+// waits while the view holds another grid than the cells. A submitted frame
+// can still be discarded if the view is resized before it reaches the layer.
 GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_request_frame(ghostty_terminal_surface_t);
 GHOSTTY_API ghostty_terminal_surface_result_e

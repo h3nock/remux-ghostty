@@ -188,6 +188,8 @@ pub const Options = struct {
     focused: bool = true,
     plain_legacy_keys: bool = false,
     shift_enter_line_feed: bool = false,
+    /// See `renderer.Options.backend_sized_grid`.
+    backend_sized_grid: bool = false,
 };
 
 pub const UpdateConfigOptions = struct {
@@ -253,6 +255,7 @@ pub fn init(self: *TerminalSurface, opts: Options) !font.Metrics {
         .event_sink = opts.event_sink,
         .visible = opts.visible,
         .focused = opts.focused,
+        .backend_sized_grid = opts.backend_sized_grid,
     });
     errdefer self.runtime.deinit();
 
@@ -335,9 +338,12 @@ pub fn requestFrame(self: *TerminalSurface) !void {
 
 /// Notify the renderer that canonical terminal state changed. This may be
 /// called by a terminal producer after publishing its changes under
-/// Shared.mutex.
+/// Shared.mutex. A hidden surface sleeps through changes, unless a frame it
+/// was asked for still stands, as while the drawable holds another grid: a
+/// change can bring what that frame needs.
 pub fn terminalChanged(self: *TerminalSurface) !void {
-    if (!self.visible.load(.monotonic)) return;
+    if (!self.visible.load(.monotonic) and
+        !self.runtime.renderer.frame_requested.load(.monotonic)) return;
     try self.runtime.thread.wakeup.notify();
 }
 
@@ -2023,6 +2029,7 @@ fn testSurface(
         .terminal = &shared.terminal,
         .mutex = &shared.mutex,
     };
+    result.runtime.renderer.frame_requested = .init(false);
     result.size = .{
         .screen = .{ .width = 100, .height = 60 },
         .cell = .{ .width = 10, .height = 20 },

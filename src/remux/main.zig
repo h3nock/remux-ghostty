@@ -5,6 +5,7 @@ pub const Runtime = @import("Runtime.zig");
 pub const Shared = @import("Shared.zig");
 pub const TerminalSurface = @import("TerminalSurface.zig");
 pub const frame_rows = @import("frame_rows.zig");
+pub const backend_sized_grid = @import("backend_sized_grid.zig");
 pub const link = @import("link.zig");
 pub const terminal_config = @import("terminal_config.zig");
 pub const tmux = @import("tmux.zig");

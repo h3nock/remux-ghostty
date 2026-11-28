@@ -19,6 +19,7 @@ const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const remux_frame_rows = @import("../remux/frame_rows.zig");
+const remux_grid = @import("../remux/backend_sized_grid.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -48,25 +49,6 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
-/// Return the grid represented by the current CPU cell contents, excluding
-/// the optional fractional-scroll row only when those contents are known to
-/// match the current render state. During an asynchronous resize, the cell
-/// contents remain the source of truth for padding geometry.
-fn visibleRenderGrid(
-    cells_size: renderer.GridSize,
-    state: *const terminal.RenderState,
-    render_rows: terminal.size.CellCountInt,
-) renderer.GridSize {
-    var result = cells_size;
-    if (result.columns == state.cols and
-        result.rows == render_rows and
-        render_rows > state.rows)
-    {
-        result.rows = state.rows;
-    }
-    return result;
-}
-
 const ScreenSizeUniformInputs = struct {
     screen: renderer.ScreenSize,
     padding: renderer.Padding,
@@ -74,17 +56,17 @@ const ScreenSizeUniformInputs = struct {
     visible_grid: renderer.GridSize,
 };
 
+/// During an asynchronous resize, the grid the cells hold, not the screen
+/// size, is the source of truth for padding geometry.
 fn screenSizeUniformInputs(
     size: renderer.Size,
-    cells_size: renderer.GridSize,
-    state: *const terminal.RenderState,
-    render_rows: terminal.size.CellCountInt,
+    cells_grid: renderer.GridSize,
 ) ScreenSizeUniformInputs {
     return .{
         .screen = size.screen,
         .padding = size.padding,
         .cell = size.cell,
-        .visible_grid = visibleRenderGrid(cells_size, state, render_rows),
+        .visible_grid = cells_grid,
     };
 }
 
@@ -352,6 +334,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The rows drawn from `terminal_state`: its viewport rows, plus
         /// its overscan row below while scrolled by part of a row.
         render_rows: terminal.size.CellCountInt = 0,
+
+        /// The grid the cells were last built for: the terminal's columns
+        /// and viewport rows, without the overscan row; empty before the
+        /// first build. Only the render thread's `updateFrame` writes it,
+        /// with the cells under the draw mutex, while it changes
+        /// `terminal_state` and `render_rows` before it takes that mutex, so
+        /// a draw reads this to know the grid its cells hold.
+        cells_grid: renderer.GridSize = .{},
+
+        /// See `renderer.Options.backend_sized_grid`.
+        backend_sized_grid: bool,
+
+        /// Remux: whether a frame was requested and no draw on the render
+        /// thread has submitted one since. While it stands, a hidden surface
+        /// draws and a draw submits even if nothing changed. Set and cleared
+        /// on the render thread; a terminal producer reads it to wake a
+        /// hidden surface whose request stands.
+        frame_requested: std.atomic.Value(bool) = .init(false),
 
         /// Remux: the cursor as of the cells last rebuilt (frame_rows.zig).
         remux_cursor: remux_frame_rows.Cursor = .{},
@@ -828,6 +828,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .event_sink = options.event_sink,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
+                .backend_sized_grid = options.backend_sized_grid,
                 .focused = true,
                 .visible = true,
                 .scrollbar = .zero,
@@ -1487,6 +1488,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
             };
 
+            // Whether a synchronized-output block keeps the last frame
+            // (remux/backend_sized_grid.zig). This may read the drawable's
+            // size, so it is asked before the terminal is locked.
+            const sync_keeps_frame = !self.backend_sized_grid or remux_grid.syncKeepsFrame(
+                &self.api,
+                self.frame_requested.load(.monotonic),
+                self.cells_grid,
+                self.size.padding,
+                self.size.cell,
+            );
+
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
                 // NOTE: This code needs be updated to 0.16.0 before you
@@ -1503,7 +1515,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer state.unlockDemand(global.io());
 
                 // If we're in a synchronized output state, we pause all rendering.
-                if (state.terminal.modes.get(.synchronized_output)) {
+                if (state.terminal.modes.get(.synchronized_output) and
+                    sync_keeps_frame)
+                {
                     log.debug("synchronized output started, skipping render", .{});
                     return;
                 }
@@ -1888,6 +1902,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread exits; displayRealized rebuilds the swap chain.
             if (!self.display_realized) return false;
 
+            // Where a backend sizes the grid, keep the last frame while the
+            // drawable holds another grid than the cells
+            // (remux/backend_sized_grid.zig). This comes before the draw
+            // consumes `cells_rebuilt` or a frame request, so the first draw
+            // that fits presents.
+            if (self.backend_sized_grid and !remux_grid.drawableHolds(
+                .{ .width = surface_size.width, .height = surface_size.height },
+                self.size.padding,
+                self.size.cell,
+                self.cells_grid,
+            )) return false;
+
             // Get our swap chain, rebuilding it if it was released
             // while we were hidden. Rebuilding is deferred to draw
             // time because resource creation must happen somewhere
@@ -1916,6 +1942,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.animationWake() != null or
+                self.frame_requested.load(.monotonic) or
                 sync;
 
             if (!needs_redraw) {
@@ -1968,12 +1995,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             if (!std.meta.eql(
                 self.screen_size_uniform_inputs,
-                screenSizeUniformInputs(
-                    self.size,
-                    self.cells.size,
-                    &self.terminal_state,
-                    self.render_rows,
-                ),
+                screenSizeUniformInputs(self.size, self.cells_grid),
             )) self.updateScreenSizeUniforms();
 
             // If this frame's target isn't the correct size, or the target
@@ -2036,6 +2058,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
+            // From here the frame is submitted, which answers a standing
+            // request. Only the render thread draws without `sync`.
+            if (!sync) self.frame_requested.store(false, .monotonic);
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -2400,12 +2425,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Caller must hold the draw mutex.
         fn updateScreenSizeUniforms(self: *Self) void {
-            const inputs = screenSizeUniformInputs(
-                self.size,
-                self.cells.size,
-                &self.terminal_state,
-                self.render_rows,
-            );
+            const inputs = screenSizeUniformInputs(self.size, self.cells_grid);
             const terminal_size = inputs.screen.subPadding(inputs.padding);
 
             // Blank space around the grid.
@@ -2785,6 +2805,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // our background cells will be out of place.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
+            self.cells_grid = .{ .columns = state.cols, .rows = state.rows };
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
@@ -3841,28 +3862,6 @@ inline fn emitScrollbar(
     if (event_sink.scrollbar(scrollbar)) dirty.* = false;
 }
 
-test "visible render grid preserves asynchronous cell geometry" {
-    const testing = std.testing;
-
-    var state: terminal.RenderState = .empty;
-    state.rows = 24;
-    state.cols = 80;
-
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 25 }, &state, 25),
-    );
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 100, .rows = 30 },
-        visibleRenderGrid(.{ .columns = 100, .rows = 30 }, &state, 25),
-    );
-
-    try testing.expectEqualDeep(
-        renderer.GridSize{ .columns = 80, .rows = 24 },
-        visibleRenderGrid(.{ .columns = 80, .rows = 24 }, &state, state.rows),
-    );
-}
-
 test "screen-size uniform inputs track asynchronous grid catch-up" {
     const testing = std.testing;
 
@@ -3871,16 +3870,9 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
         .cell = .{ .width = 10, .height = 20 },
         .padding = .{},
     };
-    var state: terminal.RenderState = .empty;
-    state.rows = 22;
-    state.cols = 80;
 
-    const before = screenSizeUniformInputs(
-        size,
-        .{ .columns = 80, .rows = 22 },
-        &state,
-        22,
-    );
+    // The screen grew to 36 rows; the cells still hold 22.
+    const before = screenSizeUniformInputs(size, .{ .columns = 80, .rows = 22 });
     const before_padding = before.screen.blankPadding(
         before.padding,
         before.visible_grid,
@@ -3888,13 +3880,8 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     );
     try testing.expectEqual(@as(u32, 280), before_padding.bottom);
 
-    state.rows = 36;
-    const after = screenSizeUniformInputs(
-        size,
-        .{ .columns = 80, .rows = 36 },
-        &state,
-        36,
-    );
+    // The cells caught up.
+    const after = screenSizeUniformInputs(size, .{ .columns = 80, .rows = 36 });
     const after_padding = after.screen.blankPadding(
         after.padding,
         after.visible_grid,
@@ -3902,25 +3889,6 @@ test "screen-size uniform inputs track asynchronous grid catch-up" {
     );
     try testing.expect(!std.meta.eql(before, after));
     try testing.expectEqual(@as(u32, 0), after_padding.bottom);
-
-    try testing.expect(std.meta.eql(
-        after,
-        screenSizeUniformInputs(
-            size,
-            .{ .columns = 80, .rows = 36 },
-            &state,
-            36,
-        ),
-    ));
-    try testing.expect(std.meta.eql(
-        after,
-        screenSizeUniformInputs(
-            size,
-            .{ .columns = 80, .rows = 37 },
-            &state,
-            37,
-        ),
-    ));
 }
 
 test "cursor in the overscan row below the viewport matches RenderState's" {

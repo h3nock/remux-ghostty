@@ -32,6 +32,8 @@ pub const Options = struct {
     event_sink: rendererpkg.EventSink,
     visible: bool = true,
     focused: bool = true,
+    /// See `rendererpkg.Options.backend_sized_grid`.
+    backend_sized_grid: bool = false,
 };
 
 /// Owned font-grid reference and the exact renderer geometry derived from it.
@@ -110,6 +112,7 @@ pub fn init(self: *Runtime, opts: Options) !font.Metrics {
             .config = derived,
             .font_grid = prepared.font_grid,
             .size = opts.size.*,
+            .backend_sized_grid = opts.backend_sized_grid,
             .event_sink = opts.event_sink,
             .rt_surface = opts.rt_surface,
             .thread = &self.thread,

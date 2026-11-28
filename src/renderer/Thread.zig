@@ -98,10 +98,6 @@ flags: packed struct {
     /// This is true when the view is focused. This defaults to true
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
-
-    /// This is true when a frame was requested since the last render. A
-    /// requested frame is rendered and drawn even while the view is hidden.
-    frame_requested: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -344,7 +340,7 @@ fn drainMailbox(self: *Thread) !void {
                 // check the visible state themselves to control their behavior.
             },
 
-            .request_frame => self.flags.frame_requested = true,
+            .request_frame => self.renderer.frame_requested.store(true, .monotonic),
 
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
@@ -588,9 +584,8 @@ fn renderCallback(
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.
     // Kitty graphics animations pause with us and resume on visibility.
-    // A requested frame is still rendered and drawn once.
-    const requested = t.flags.frame_requested;
-    t.flags.frame_requested = false;
+    // A requested frame is still rendered and drawn.
+    const requested = t.renderer.frame_requested.load(.monotonic);
     if (!t.flags.visible and !requested) return .disarm;
 
     // Update our frame data
@@ -603,7 +598,8 @@ fn renderCallback(
     // Draw. A requested frame draws now, even while hidden. A hidden
     // surface then releases the GPU resources the draw rebuilt, as hiding
     // it did; the layer keeps the published frame, whose surface the
-    // present retained.
+    // present retained. The request stands until a draw submits a frame,
+    // so it outlasts a draw that kept the last frame.
     if (requested) {
         t.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
