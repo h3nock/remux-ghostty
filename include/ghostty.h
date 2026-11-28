@@ -1660,9 +1660,9 @@ GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 // borrowed only for the action callback. The callback may visit topology,
 // enqueue commands, send pane input, refresh a pane, read outbound bytes, or
 // retain a pane terminal.
-// It must not feed, consume, or free the client, or set or clear a window
-// size. Reentrant feed is rejected; consume, free, set_window_size, and
-// clear_window_size are rejected while a callback is active.
+// It must not feed, consume, or free the client, set the client or a window
+// size, or refresh a window's pane metadata. Reentrant feed is rejected; the
+// others are rejected with CALLBACK_ACTIVE while a callback is active.
 GHOSTTY_API ghostty_tmux_client_config_s ghostty_tmux_client_config_new(void);
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_new(
     const ghostty_tmux_client_config_s*,
@@ -1788,7 +1788,9 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_refresh_pane(
 // tmux's resize with tmux's own row rules, and a pane it can't follow exactly
 // is recaptured from tmux. While a resize or recapture is in flight only the
 // newest size is kept and sent afterwards. NOT_READY means the client cannot
-// accept commands yet; INVALID_INPUT means a zero dimension.
+// accept commands yet; INVALID_INPUT means a zero dimension; CALLBACK_ACTIVE
+// means it was called from inside a callback, where its commands could reach
+// tmux ahead of the client's own: call it after the callback returns.
 GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
     ghostty_tmux_client_t,
     uint16_t,
@@ -1825,7 +1827,7 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_clear_window_size(
 // presentation are unchanged. Updated metadata is reported through TOPOLOGY
 // only when a value changed. A tmux-side failure is nonfatal and leaves the
 // last observed metadata intact. WINDOW_UNKNOWN means the window is not in the
-// current topology.
+// current topology; CALLBACK_ACTIVE is as for set_client_size.
 GHOSTTY_API ghostty_tmux_result_e
 ghostty_tmux_client_refresh_window_pane_metadata(
     ghostty_tmux_client_t,
