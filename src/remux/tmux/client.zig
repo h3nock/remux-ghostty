@@ -17,14 +17,11 @@ const Viewer = @import("viewer.zig").Viewer;
 /// contain `.command`; command groups are synchronously enqueued into Channel.
 /// Action payloads are borrowed only for the duration of the callback. The
 /// caller must serialize all access and must not call `feed` reentrantly.
-/// Commands may be submitted synchronously from an action callback, except a
-/// window size: `setWindowSize` and `clearWindowSize` must be called after the
-/// callback returns, because the Viewer may count commands as sent that are
-/// enqueued only then. A returned `feed` error is terminal. Command-admission
-/// errors leave logical state unchanged and the client usable, except that a
-/// window size moving to another window whose set can't be admitted leaves
-/// its clear queued. An `exit` action cancels every unresolved host token;
-/// later feeds are ignored and command submissions return `ChannelClosed`.
+/// Commands may be submitted synchronously from an action callback. A returned
+/// `feed` error is terminal. Command-admission errors leave logical state
+/// unchanged and the client usable. An `exit` action cancels every unresolved
+/// host token; later feeds are ignored and command submissions return
+/// `ChannelClosed`.
 pub const ControlClient = struct {
     channel: channel_pkg.Channel,
     viewer: Viewer,

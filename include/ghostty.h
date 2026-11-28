@@ -1797,8 +1797,7 @@ GHOSTTY_API ghostty_tmux_result_e ghostty_tmux_client_set_client_size(
 // Sizes one window with refresh-client -C @window:columnsxrows, which tmux
 // keeps for that window until it is cleared, whatever the client's size.
 // One window is sized at a time: a size on another window is cleared in the
-// same write. tmux has no error for that clear; if it were refused, the old
-// window would keep its size. Each resize is sampled and followed as set_client_size's is.
+// same write. Each resize is sampled and followed as set_client_size's is.
 // While a resize or recapture is in flight only the newest request is kept
 // and sent afterwards, after a pending client size. A request tmux refuses
 // is not sent again. NOT_READY means the client cannot accept commands or
