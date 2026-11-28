@@ -664,6 +664,7 @@ fn normalizeAndSnapshotInteractionLocked(
     }
     const mouse_captured = self.mouse_reporting and
         term.flags.mouse_event != .none;
+    const alternate_screen = term.screens.active_key == .alternate;
 
     return .{
         .scrollbar = .{
@@ -674,7 +675,7 @@ fn normalizeAndSnapshotInteractionLocked(
         },
         .route = if (mouse_captured)
             .remote_mouse
-        else if (term.screens.active_key == .alternate and
+        else if (alternate_screen and
             term.flags.mouse_event == .none and
             term.modes.get(.mouse_alternate_scroll))
             .alternate_screen_cursor
@@ -682,7 +683,7 @@ fn normalizeAndSnapshotInteractionLocked(
             .viewport,
         .mouse_captured = mouse_captured,
         .has_selection = screen.selection != null,
-        .alternate_screen = term.screens.active_key == .alternate,
+        .alternate_screen = alternate_screen,
     };
 }
 

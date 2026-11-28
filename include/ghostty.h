@@ -1912,7 +1912,8 @@ GHOSTTY_API ghostty_terminal_surface_result_e ghostty_terminal_surface_size(
     ghostty_surface_size_s*);
 
 // Returns one synchronized snapshot of scrollbar geometry, fractional top-row
-// presentation offset, input routing, effective mouse capture, and selection.
+// presentation offset, input routing, effective mouse capture, selection, and
+// whether the alternate screen is shown.
 GHOSTTY_API ghostty_terminal_surface_result_e
 ghostty_terminal_surface_interaction_state(
     ghostty_terminal_surface_t,
